@@ -44,6 +44,12 @@ EVT_BTN_RELEASE = "<" + "ButtonRelease-1" + ">"
 EVT_ADMIN_EXIT_UP = "<" + "Control-Alt-Shift-KeyPress-Q" + ">"
 EVT_ADMIN_EXIT_LOW = "<" + "Control-Alt-Shift-KeyPress-q" + ">"
 
+EVT_MOUSEWHEEL = "<" + "MouseWheel" + ">"
+EVT_BTN4 = "<" + "Button-4" + ">"
+EVT_BTN5 = "<" + "Button-5" + ">"
+EVT_ENTER = "<" + "Enter" + ">"
+EVT_LEAVE = "<" + "Leave" + ">"
+
 LOCKDOWN_KEYS = [
     "<" + "Alt-F4" + ">",
     "<" + "Alt-KeyPress-F4" + ">",
@@ -549,6 +555,7 @@ class ANPRViewerApp:
         self.main_body = tk.Frame(self.root, bg="#0d0d11")
         self.main_body.pack(fill=tk.BOTH, expand=True)
 
+        # Бокова панель
         self.side_panel = tk.Frame(self.main_body, bg="#1e1e24", width=360)
         self.side_panel.pack_propagate(False)
 
@@ -595,6 +602,11 @@ class ANPRViewerApp:
         self.plates_tree.bind(EVT_TREE_SELECT, self._on_plate_selected)
         self.plates_tree.bind(EVT_DOUBLE_CLICK, self._on_plate_double_clicked)
 
+        # Прив'язка скролу коліщатком миші над списком номерів
+        for w in (self.plates_tree, scrollbar, tree_frame):
+            w.bind(EVT_ENTER, self._bind_tree_mousewheel)
+            w.bind(EVT_LEAVE, self._unbind_tree_mousewheel)
+
         self.preview_container = tk.Frame(self.side_panel, bg="#14141a", pady=6, padx=8)
         self.preview_container.pack(fill=tk.X, side=tk.BOTTOM)
 
@@ -612,6 +624,11 @@ class ANPRViewerApp:
         self.screen_canvas.bind(EVT_BTN_PRESS, self._on_screen_canvas_press)
         self.screen_canvas.bind(EVT_B1_MOTION, self._on_screen_canvas_motion)
         self.screen_canvas.bind(EVT_BTN_RELEASE, self._on_screen_canvas_release)
+
+        # Прив'язка коліщатка над областю попереднього перегляду для швидкого перемикання номерів
+        for pw in (self.preview_container, self.preview_label, self.screen_canvas):
+            pw.bind(EVT_ENTER, self._bind_preview_mousewheel)
+            pw.bind(EVT_LEAVE, self._unbind_preview_mousewheel)
 
         self.video_container = tk.Frame(self.main_body, bg="#0d0d11")
         self.video_container.pack(fill=tk.BOTH, expand=True)
@@ -645,6 +662,84 @@ class ANPRViewerApp:
         self.roi_resize_grip.bind(EVT_BTN_PRESS, self._on_roi_resize_start)
         self.roi_resize_grip.bind(EVT_B1_MOTION, self._on_roi_resize_motion)
         self.roi_resize_grip.bind(EVT_BTN_RELEASE, self._on_roi_resize_release)
+
+    # ------------------ Обробники скролу коліщатком миші ------------------
+
+    def _bind_tree_mousewheel(self, event=None):
+        self.root.bind_all(EVT_MOUSEWHEEL, self._on_tree_mousewheel)
+        self.root.bind_all(EVT_BTN4, self._on_tree_mousewheel)
+        self.root.bind_all(EVT_BTN5, self._on_tree_mousewheel)
+
+    def _unbind_tree_mousewheel(self, event=None):
+        self.root.unbind_all(EVT_MOUSEWHEEL)
+        self.root.unbind_all(EVT_BTN4)
+        self.root.unbind_all(EVT_BTN5)
+
+    def _on_tree_mousewheel(self, event):
+        if event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        elif event.delta:
+            delta = int(-1 * (event.delta / 120))
+        else:
+            delta = 0
+
+        # Якщо затиснуто Shift — гортаємо список, інакше перемикаємо вибір конкретних номерів
+        if getattr(event, "state", 0) & 0x0001:
+            self.plates_tree.yview_scroll(delta * 2, "units")
+        else:
+            self._navigate_plates(delta)
+        return "break"
+
+    def _bind_preview_mousewheel(self, event=None):
+        self.root.bind_all(EVT_MOUSEWHEEL, self._on_preview_mousewheel)
+        self.root.bind_all(EVT_BTN4, self._on_preview_mousewheel)
+        self.root.bind_all(EVT_BTN5, self._on_preview_mousewheel)
+
+    def _unbind_preview_mousewheel(self, event=None):
+        self.root.unbind_all(EVT_MOUSEWHEEL)
+        self.root.unbind_all(EVT_BTN4)
+        self.root.unbind_all(EVT_BTN5)
+
+    def _on_preview_mousewheel(self, event):
+        if event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        elif event.delta:
+            delta = int(-1 * (event.delta / 120))
+        else:
+            delta = 0
+
+        if delta != 0:
+            self._navigate_plates(delta)
+        return "break"
+
+    def _navigate_plates(self, direction):
+        """Перемикання на наступний / попередній номер у дереві та оновлення перегляду."""
+        all_items = []
+        for day in self.plates_tree.get_children():
+            for child in self.plates_tree.get_children(day):
+                if child in self.tree_item_map:
+                    all_items.append(child)
+        if not all_items:
+            return
+
+        sel = self.plates_tree.selection()
+        if sel and sel[0] in all_items:
+            curr_idx = all_items.index(sel[0])
+            new_idx = max(0, min(len(all_items) - 1, curr_idx + direction))
+        else:
+            new_idx = 0 if direction > 0 else len(all_items) - 1
+
+        target = all_items[new_idx]
+        self.plates_tree.selection_set(target)
+        self.plates_tree.focus(target)
+        self.plates_tree.see(target)
+        self._on_plate_selected(None)
+
+    # ----------------------------------------------------------------------
 
     def _on_video_area_click(self, event=None):
         if hasattr(self, "roi_panel") and self.roi_panel.winfo_ismapped():
