@@ -3,12 +3,14 @@
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
 # Environments
 .env
 .venv
+**/.venv/
 env/
 venv/
 ENV/
@@ -17,3 +19,11 @@ ENV/
 dist/
 build/
 *.egg-info/
+
+# Project specific ignores
+_VIDEO_/
+**/_VIDEO_/
+plates/
+**/plates/
+faces/
+**/faces/

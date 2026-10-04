@@ -1,11 +1,8 @@
 import os
 import sys
-import re
 import time
-import math
 import configparser
 import threading
-from collections import Counter
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -13,10 +10,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-# Локальный OCR-модуль CCT
-from fast_alpr.default_ocr import DefaultOCR
+from plates import PlateEngine
+from faces import FaceEngine
 
-# Базовая папка приложения
+# Базова папка додатку
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
@@ -24,19 +21,13 @@ else:
 
 os.chdir(BASE_DIR)
 
-# Системный реестр Windows
+# Системний реєстр Windows
 try:
     import winreg
 except ImportError:
     winreg = None
 
-YOLO_IMGSZ = 640
-
-# Пропорции пластин номерных знаков
-PLATE_ASPECT_RATIO_STANDARD = 520.0 / 112.0
-PLATE_ASPECT_RATIO_SQUARE = 300.0 / 150.0
-
-# Безопасное определение названий событий Tkinter
+# Безпечне визначення назв подій Tkinter
 EVT_MOTION = "<" + "Motion" + ">"
 EVT_TREE_SELECT = "<<" + "TreeviewSelect" + ">>"
 EVT_DOUBLE_CLICK = "<" + "Double-1" + ">"
@@ -64,349 +55,10 @@ LOCKDOWN_KEYS = [
 ]
 
 
-def async_write_image(path, img):
-    """Асинхронная запись изображения на диск без блокировки видеопотока."""
-    def _worker():
-        try:
-            cv2.imwrite(path, img)
-        except Exception:
-            pass
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def async_write_text(path, content):
-    """Асинхронная запись дебаг-лога на диск."""
-    def _worker():
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception:
-            pass
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def calculate_sharpness(img):
-    """Расчет дисперсии Лапласиана для оценки резкости кадра."""
-    if img is None or img.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def evaluate_plate_quality(crop_bgr, text, conf, sharpness):
-    """Комплексная оценка качества кадра."""
-    text_len = len(text)
-    if text_len < 4 or text == "UNKNOWN":
-        return 0.0
-
-    if text_len >= 7:
-        len_mult = 1.0
-    elif text_len == 6:
-        len_mult = 0.82
-    elif text_len == 5:
-        len_mult = 0.65
-    else:
-        len_mult = 0.45
-
-    sharp_norm = min(1.0, max(0.0, (sharpness - 80.0) / 720.0))
-    h, w = crop_bgr.shape[:2]
-    area_norm = min(1.0, (w * h) / (160.0 * 40.0))
-
-    return (conf * 0.40 + sharp_norm * 0.40 + area_norm * 0.20) * len_mult
-
-
-def compute_iou(boxA, boxB):
-    """Расчет пересечения рамок (IoU)."""
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    union = areaA + areaB - inter
-    return inter / union if union > 0 else 0.0
-
-
-def box_centroid_dist(b1, b2):
-    """Евклидово расстояние между центрами рамок."""
-    c1x, c1y = (b1[0] + b1[2]) / 2.0, (b1[1] + b1[3]) / 2.0
-    c2x, c2y = (b2[0] + b2[2]) / 2.0, (b2[1] + b2[3]) / 2.0
-    return math.hypot(c1x - c2x, c1y - c2y)
-
-
-def are_plates_similar(p1, p2, max_diff=1):
-    """Проверка схожести номеров для фильтрации дубликатов с погрешностью в 1 символ."""
-    if p1 == p2:
-        return True
-    if abs(len(p1) - len(p2)) > max_diff:
-        return False
-
-    if len(p1) == len(p2):
-        diffs = sum(1 for a, b in zip(p1, p2) if a != b)
-        return diffs <= max_diff
-
-    s_short, s_long = (p1, p2) if len(p1) < len(p2) else (p2, p1)
-    for i in range(len(s_long)):
-        if s_long[:i] + s_long[i+1:] == s_short:
-            return True
-    return False
-
-
-class PlateTrack:
-    """Объект трекинга номера с защитой от UNKNOWN и ведением истории."""
-    def __init__(self, track_id, bbox, plate_img, frame, text, conf, sharpness):
-        self.track_id = track_id
-        self.bbox = bbox
-        self.last_seen = time.time()
-        self.first_seen = self.last_seen
-        self.saved = False
-
-        self.best_plate_img = plate_img
-        self.best_frame = frame
-        self.best_sharpness = sharpness
-        self.best_conf = conf if text != "UNKNOWN" else 0.0
-        self.best_text = text
-
-        self.history_records = []
-        self.text_history = []
-        self.conf_history = []
-
-        initial_score = evaluate_plate_quality(plate_img, text, conf, sharpness)
-        self.best_score = initial_score
-        self.frames_tracked = 0
-
-        self.append_record(bbox, plate_img, frame, text, conf, sharpness, initial_score)
-
-    def append_record(self, bbox, plate_img, frame, text, conf, sharpness, score):
-        self.frames_tracked += 1
-        t_rel = round(time.time() - self.first_seen, 3)
-        self.history_records.append({
-            "rel_time": t_rel,
-            "text": text,
-            "conf": round(conf * 100, 1),
-            "sharpness": round(sharpness, 1),
-            "score": round(score, 3),
-            "bbox": bbox
-        })
-        if text != "UNKNOWN" and len(text) >= 4:
-            self.text_history.append(text)
-            self.conf_history.append(conf)
-
-    def update(self, bbox, plate_img, frame, text, conf, sharpness):
-        self.bbox = bbox
-        self.last_seen = time.time()
-        current_score = evaluate_plate_quality(plate_img, text, conf, sharpness)
-
-        self.append_record(bbox, plate_img, frame, text, conf, sharpness, current_score)
-
-        if current_score > self.best_score and text != "UNKNOWN":
-            self.best_score = current_score
-            self.best_plate_img = plate_img
-            self.best_frame = frame
-            self.best_sharpness = sharpness
-            self.best_conf = conf
-            self.best_text = text
-
-    def get_consensus_text_and_conf(self):
-        """Определение наиболее вероятного номера методом Majority Voting."""
-        if not self.text_history:
-            return "UNKNOWN", 0.0
-
-        counter = Counter(self.text_history)
-        most_common = counter.most_common()
-
-        if len(most_common) == 1 or most_common[0][1] > most_common[1][1]:
-            final_text = most_common[0][0]
-        else:
-            final_text = self.best_text if self.best_text in self.text_history else most_common[0][0]
-
-        matched_confs = [c for t, c in zip(self.text_history, self.conf_history) if t == final_text]
-        final_conf = float(np.mean(matched_confs)) if matched_confs else 0.0
-
-        return final_text, final_conf
-
-
-class ONNXDetector:
-    """Высокопроизводительный детектор ONNX (best.onnx)."""
-    def __init__(self, model_path):
-        self.model_path = model_path
-        self.use_ort = False
-
-        try:
-            import onnxruntime as ort
-            opts = ort.SessionOptions()
-            opts.log_severity_level = 3
-            cpu_cnt = os.cpu_count() or 4
-            opts.intra_op_num_threads = max(1, min(2, cpu_cnt - 1))
-            opts.inter_op_num_threads = 1
-            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-            self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_names = [o.name for o in self.session.get_outputs()]
-            self.use_ort = True
-        except Exception:
-            self.net = cv2.dnn.readNetFromONNX(model_path)
-            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-            self.use_ort = False
-
-    def predict(self, frame, conf_thresh=0.22, imgsz=480):
-        h_orig, w_orig = frame.shape[:2]
-
-        r = min(imgsz / h_orig, imgsz / w_orig)
-        nw, nh = int(round(w_orig * r)), int(round(h_orig * r))
-        dw, dh = (imgsz - nw) / 2.0, (imgsz - nh) / 2.0
-
-        if (w_orig, h_orig) != (nw, nh):
-            resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        else:
-            resized = frame
-
-        canvas = np.full((imgsz, imgsz, 3), 114, dtype=np.uint8)
-        top, left = int(round(dh - 0.1)), int(round(dw - 0.1))
-        canvas[top:top + nh, left:left + nw] = resized
-
-        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
-
-        if self.use_ort:
-            raw = self.session.run(self.output_names, {self.input_name: blob})[0]
-        else:
-            self.net.setInput(blob)
-            raw = self.net.forward()
-
-        preds = np.squeeze(raw)
-        if preds.ndim != 2:
-            return []
-
-        if preds.shape[0] < preds.shape[1]:
-            preds = preds.T
-
-        channels = preds.shape[1]
-        if channels < 5:
-            return []
-
-        cx = preds[:, 0]
-        cy = preds[:, 1]
-        w = preds[:, 2]
-        h = preds[:, 3]
-
-        if channels == 5:
-            scores = preds[:, 4]
-        elif channels == 6:
-            scores = preds[:, 4] * preds[:, 5]
-        else:
-            scores = np.max(preds[:, 4:], axis=1)
-
-        mask = scores >= conf_thresh
-        if not np.any(mask):
-            return []
-
-        cx, cy, w, h, scores = cx[mask], cy[mask], w[mask], h[mask], scores[mask]
-
-        x1 = (cx - w / 2.0 - dw) / r
-        y1 = (cy - h / 2.0 - dh) / r
-        x2 = (cx + w / 2.0 - dw) / r
-        y2 = (cy + h / 2.0 - dh) / r
-
-        boxes_for_nms = []
-        scores_list = []
-        for i in range(len(scores)):
-            bx1 = max(0, min(w_orig - 1, int(x1[i])))
-            by1 = max(0, min(h_orig - 1, int(y1[i])))
-            bx2 = max(0, min(w_orig, int(x2[i])))
-            by2 = max(0, min(h_orig, int(y2[i])))
-            bw = bx2 - bx1
-            bh = by2 - by1
-            if bw > 25 and bh > 10:
-                boxes_for_nms.append([bx1, by1, bw, bh])
-                scores_list.append(float(scores[i]))
-
-        if not boxes_for_nms:
-            return []
-
-        indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores_list, conf_thresh, 0.45)
-        final_boxes = []
-        if len(indices) > 0:
-            for idx in indices.flatten():
-                bx, by, bw, bh = boxes_for_nms[idx]
-                final_boxes.append((bx, by, bx + bw, by + bh))
-
-        return final_boxes
-
-
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def rectify_and_enhance(plate_crop):
-    """Выравнивание перспективы по 4 точкам и оптимизация контраста."""
-    h, w = plate_crop.shape[:2]
-    if h < 12 or w < 24:
-        return None, 0, 0
-
-    aspect_ratio = w / float(h)
-    if aspect_ratio < 3.0:
-        target_w = 520
-        target_h = int(target_w / PLATE_ASPECT_RATIO_SQUARE)
-    else:
-        target_w = 520
-        target_h = int(target_w / PLATE_ASPECT_RATIO_STANDARD)
-
-    lab = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l_channel)
-    contrast_crop = cv2.cvtColor(cv2.merge((cl, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
-
-    gray = cv2.cvtColor(contrast_crop, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 40, 180)
-
-    contours, _ = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-
-    plate_quad = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-        if len(approx) == 4 and cv2.contourArea(c) > (w * h * 0.25):
-            plate_quad = approx.reshape(4, 2)
-            break
-
-    dst = np.array([
-        [0, 0],
-        [target_w - 1, 0],
-        [target_w - 1, target_h - 1],
-        [0, target_h - 1]
-    ], dtype="float32")
-
-    if plate_quad is not None:
-        rect = order_points(plate_quad)
-        M = cv2.getPerspectiveTransform(rect, dst)
-        rectified = cv2.warpPerspective(contrast_crop, M, (target_w, target_h))
-    else:
-        rectified = cv2.resize(contrast_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-
-    gaussian = cv2.GaussianBlur(rectified, (0, 0), 1.8)
-    enhanced = cv2.addWeighted(rectified, 1.4, gaussian, -0.4, 0)
-    return enhanced, target_w, target_h
-
-
 class ANPRViewerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ANPR Video Monitor (best.onnx + CCT OCR)")
+        self.root.title("ANPR & Face Video Monitor")
         self.root.configure(bg="#0d0d11")
 
         self.root.attributes("-fullscreen", True)
@@ -415,6 +67,9 @@ class ANPRViewerApp:
 
         self.config_ini_path = os.path.join(BASE_DIR, "config.ini")
         self.config = self._load_config()
+
+        self.plates_on = bool(self.config.get("plates_on", True))
+        self.faces_on = bool(self.config.get("faces_on", True))
         self.is_autostart_active = bool(self.config.get("autostart_os_and_play", False))
         self.view_plate_time = float(self.config.get("view_plate_time", 30))
         self.delete_older_days = float(self.config.get("delete_older_days", 1))
@@ -428,39 +83,24 @@ class ANPRViewerApp:
         self.roi_user_width = int(self.config.get("rect_scale_user_width", 360))
         self.roi_user_height = int(self.config.get("rect_scale_user_height", 240))
 
-        self.plates_dir = os.path.join(BASE_DIR, "plates")
-        os.makedirs(self.plates_dir, exist_ok=True)
-
         self._sync_windows_startup(self.is_autostart_active)
 
-        # 1. Детектор
-        model_path = os.path.join(BASE_DIR, "model", "best.onnx")
-        if not os.path.exists(model_path):
-            messagebox.showerror("Ошибка модели", f"Файл детектора не найден:\n{model_path}")
-            sys.exit(1)
-        self.detector = ONNXDetector(model_path)
+        # 1. Ініціалізація автономних рушіїв
+        self.plate_engine = None
+        if self.plates_on:
+            try:
+                self.plate_engine = PlateEngine(BASE_DIR, self.config, on_saved_callback=self._on_plate_saved)
+            except Exception as e:
+                messagebox.showerror("Помилка модуля номерів", f"Не вдалося ініціалізувати PlateEngine:\n{e}")
 
-        # 2. OCR
-        ocr_model_path = os.path.join(BASE_DIR, "model", "cct_xs_v2_global.onnx")
-        ocr_config_path = os.path.join(BASE_DIR, "model", "cct_xs_v2_global_plate_config.yaml")
+        self.face_engine = None
+        if self.faces_on:
+            try:
+                self.face_engine = FaceEngine(BASE_DIR, self.config, on_saved_callback=self._on_face_saved)
+            except Exception as e:
+                messagebox.showerror("Помилка модуля облич", f"Не вдалося ініціалізувати FaceEngine:\n{e}")
 
-        if not os.path.exists(ocr_model_path) or not os.path.exists(ocr_config_path):
-            messagebox.showerror("Ошибка OCR", "Файлы cct_xs_v2_global.onnx или config.yaml отсутствуют в model/")
-            sys.exit(1)
-
-        try:
-            self.ocr = DefaultOCR(
-                hub_ocr_model=None,
-                device="cpu",
-                model_path=ocr_model_path,
-                config_path=ocr_config_path
-            )
-            print("[OCR] Модель CCT успешно загружена.")
-        except Exception as e:
-            messagebox.showerror("Ошибка OCR", f"Не удалось инициализировать OCR:\n{e}")
-            sys.exit(1)
-
-        # Синхронизация потоков
+        # Синхронізація потоків
         self.is_running = False
         self.video_thread = None
         self.ai_thread = None
@@ -474,20 +114,17 @@ class ANPRViewerApp:
         self.ai_lock = threading.Lock()
         self.is_ai_busy = False
 
-        self.cached_boxes = []
+        # Кеш кадрів для відображення
+        self.cached_plate_boxes = []
+        self.cached_face_boxes = []
         self.last_plate_img = None
         self.last_plate_dims = (0, 0)
         self.last_plate_text = ""
         self.last_plate_conf = 0.0
         self.last_plate_time = 0.0
 
-        # Трекер и реестр дубликатов
-        self.active_tracks = {}
-        self.next_track_id = 1
-        self.track_timeout = 1.0
-        self.recently_saved_plates = {}
-
         self.sidebar_visible = False
+        self.sidebar_mode = "plates" if self.plates_on else "faces"
         self.preview_photo_tk = None
         self.screen_photo_tk = None
         self.roi_photo_tk = None
@@ -558,6 +195,10 @@ class ANPRViewerApp:
         defaults = {
             "source": "0",
             "autostart_os_and_play": False,
+            "plates_on": True,
+            "faces_on": True,
+            "face_min_similarity": 0.7,
+            "face_det_thresh": 0.45,
             "view_plate_time": 30,
             "delete_older_days": 1,
             "min_percent_to_save": 80,
@@ -584,6 +225,10 @@ class ANPRViewerApp:
                 cfg = {
                     "source": parser.get("SETTINGS", "source", fallback="0").strip().strip('\'"'),
                     "autostart_os_and_play": parser.getboolean("SETTINGS", "autostart_os_and_play", fallback=False),
+                    "plates_on": parser.getboolean("SETTINGS", "plates_on", fallback=True),
+                    "faces_on": parser.getboolean("SETTINGS", "faces_on", fallback=True),
+                    "face_min_similarity": parser.getfloat("SETTINGS", "face_min_similarity", fallback=0.7),
+                    "face_det_thresh": parser.getfloat("SETTINGS", "face_det_thresh", fallback=0.45),
                     "view_plate_time": parser.getint("SETTINGS", "view_plate_time", fallback=30),
                     "delete_older_days": parser.getfloat("SETTINGS", "delete_older_days", fallback=1.0),
                     "min_percent_to_save": parser.getint("SETTINGS", "min_percent_to_save", fallback=80),
@@ -608,6 +253,10 @@ class ANPRViewerApp:
         parser["SETTINGS"] = {
             "source": str(data.get("source", "0")),
             "autostart_os_and_play": str(data.get("autostart_os_and_play", False)).lower(),
+            "plates_on": str(data.get("plates_on", True)).lower(),
+            "faces_on": str(data.get("faces_on", True)).lower(),
+            "face_min_similarity": str(data.get("face_min_similarity", 0.7)),
+            "face_det_thresh": str(data.get("face_det_thresh", 0.45)),
             "view_plate_time": str(data.get("view_plate_time", 30)),
             "delete_older_days": str(data.get("delete_older_days", 1)),
             "min_percent_to_save": str(data.get("min_percent_to_save", 80)),
@@ -620,7 +269,11 @@ class ANPRViewerApp:
         }
         try:
             with open(self.config_ini_path, "w", encoding="utf-8") as f:
-                f.write("; ANPR Video Monitor Configuration\n")
+                f.write("; ANPR & Face Video Monitor Configuration\n")
+                f.write("; plates_on: true / false (фіксація номерних знаків)\n")
+                f.write("; faces_on: true / false (фіксація облич)\n")
+                f.write("; face_min_similarity: поріг схожості векторів облич (0.7 = 70%)\n")
+                f.write("; face_det_thresh: поріг детекції облич\n")
                 f.write("; source: 0, rtsp://... або d:\\video.mp4\n")
                 f.write("; autostart_os_and_play: true / false\n")
                 f.write("; view_plate_time: час збереження номера на екрані (с)\n")
@@ -642,21 +295,32 @@ class ANPRViewerApp:
 
     def _check_and_delete_old_files(self):
         try:
-            if self.delete_older_days > 0 and os.path.exists(self.plates_dir):
+            if self.delete_older_days > 0:
                 cutoff = time.time() - (self.delete_older_days * 86400.0)
-                for root_dir, dirs, files in os.walk(self.plates_dir, topdown=False):
-                    for fname in files:
-                        fpath = os.path.join(root_dir, fname)
-                        if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                dirs_to_clean = []
+                if self.plate_engine:
+                    dirs_to_clean.append(self.plate_engine.plates_dir)
+                if self.face_engine:
+                    dirs_to_clean.append(self.face_engine.faces_dir)
+
+                for base_d in dirs_to_clean:
+                    if not os.path.exists(base_d):
+                        continue
+                    for root_dir, dirs, files in os.walk(base_d, topdown=False):
+                        for fname in files:
+                            if fname == "faces.txt":
+                                continue
+                            fpath = os.path.join(root_dir, fname)
+                            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                                try:
+                                    os.remove(fpath)
+                                except Exception:
+                                    pass
+                        if root_dir != base_d and not os.listdir(root_dir):
                             try:
-                                os.remove(fpath)
+                                os.rmdir(root_dir)
                             except Exception:
                                 pass
-                    if root_dir != self.plates_dir and not os.listdir(root_dir):
-                        try:
-                            os.rmdir(root_dir)
-                        except Exception:
-                            pass
         except Exception:
             pass
         self.root.after(1800000, self._check_and_delete_old_files)
@@ -669,13 +333,39 @@ class ANPRViewerApp:
         tk.Button(self.ctrl_frame, text="?", command=self._show_help, bg="#3a3a46", fg="#00ffff", font=("Segoe UI", 9, "bold"), width=2, relief=tk.FLAT).pack(side=tk.LEFT, padx=(0, 8))
 
         self.source_var = tk.StringVar(value=str(self.config.get("source", "0")))
-        ttk.Entry(self.ctrl_frame, width=38, textvariable=self.source_var, state="readonly").pack(side=tk.LEFT, padx=3)
+        ttk.Entry(self.ctrl_frame, width=34, textvariable=self.source_var, state="readonly").pack(side=tk.LEFT, padx=3)
 
         self.autostart_var = tk.BooleanVar(value=self.is_autostart_active)
-        tk.Checkbutton(self.ctrl_frame, text="Автозапуск", variable=self.autostart_var, state=tk.DISABLED, disabledforeground="#ffffff", bg="#1e1e24", selectcolor="#2b2b36", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=12)
+        tk.Checkbutton(self.ctrl_frame, text="Автозапуск", variable=self.autostart_var, state=tk.DISABLED, disabledforeground="#ffffff", bg="#1e1e24", selectcolor="#2b2b36", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=8)
 
-        self.btn_saved = tk.Button(self.ctrl_frame, text="Збережені", command=self.toggle_side_panel, bg="#3a3a46", fg="#ffffff", font=("Segoe UI", 10, "bold"), width=11, relief=tk.FLAT, cursor="hand2")
-        self.btn_saved.pack(side=tk.LEFT, padx=8)
+        # Кнопки перегляду бази: пакуються тільки якщо відповідний модуль активовано
+        self.btn_saved_plates = tk.Button(
+            self.ctrl_frame,
+            text="🚘 Номери",
+            command=lambda: self.toggle_side_panel("plates"),
+            bg="#3a3a46",
+            fg="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            width=10,
+            relief=tk.FLAT,
+            cursor="hand2"
+        )
+        if self.plates_on:
+            self.btn_saved_plates.pack(side=tk.LEFT, padx=4)
+
+        self.btn_saved_faces = tk.Button(
+            self.ctrl_frame,
+            text="👤 Обличчя",
+            command=lambda: self.toggle_side_panel("faces"),
+            bg="#3a3a46",
+            fg="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            width=10,
+            relief=tk.FLAT,
+            cursor="hand2"
+        )
+        if self.faces_on:
+            self.btn_saved_faces.pack(side=tk.LEFT, padx=4)
 
         if self.is_autostart_active:
             self.btn_toggle = tk.Button(self.ctrl_frame, text="Працює", command=self.toggle_stream, state=tk.DISABLED, disabledforeground="#75e08b", bg="#1b3822", font=("Segoe UI", 10, "bold"), width=10, relief=tk.FLAT)
@@ -689,13 +379,14 @@ class ANPRViewerApp:
         self.main_body = tk.Frame(self.root, bg="#0d0d11")
         self.main_body.pack(fill=tk.BOTH, expand=True)
 
-        # Боковая панель
+        # Бічна панель
         self.side_panel = tk.Frame(self.main_body, bg="#1e1e24", width=360)
         self.side_panel.pack_propagate(False)
 
         side_header = tk.Frame(self.side_panel, bg="#282832", padx=10, pady=6)
         side_header.pack(fill=tk.X, side=tk.TOP)
-        tk.Label(side_header, text="Історія номерів", fg="#00e5ff", bg="#282832", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.side_header_lbl = tk.Label(side_header, text="Історія номерів", fg="#00e5ff", bg="#282832", font=("Segoe UI", 10, "bold"))
+        self.side_header_lbl.pack(side=tk.LEFT)
         tk.Button(side_header, text="↻", command=self.refresh_saved_list, bg="#3a3a48", fg="white", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), width=3, cursor="hand2").pack(side=tk.RIGHT)
 
         search_frame = tk.Frame(self.side_panel, bg="#22222c", padx=6, pady=6)
@@ -723,30 +414,30 @@ class ANPRViewerApp:
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure("PlatesDark.Treeview", background="#16161d", foreground="#ffffff", fieldbackground="#16161d", font=("Segoe UI", 10), rowheight=26, borderwidth=0)
-        style.map("PlatesDark.Treeview", background=[("selected", "#007acc")], foreground=[("selected", "#ffffff")])
+        style.configure("ProDark.Treeview", background="#16161d", foreground="#ffffff", fieldbackground="#16161d", font=("Segoe UI", 10), rowheight=26, borderwidth=0)
+        style.map("ProDark.Treeview", background=[("selected", "#007acc")], foreground=[("selected", "#ffffff")])
 
-        self.plates_tree = ttk.Treeview(tree_frame, style="PlatesDark.Treeview", show="tree", selectmode="browse", yscrollcommand=scrollbar.set)
-        self.plates_tree.column("#0", width=330, stretch=True)
-        self.plates_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.plates_tree.yview)
+        self.items_tree = ttk.Treeview(tree_frame, style="ProDark.Treeview", show="tree", selectmode="browse", yscrollcommand=scrollbar.set)
+        self.items_tree.column("#0", width=330, stretch=True)
+        self.items_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.items_tree.yview)
 
-        self.plates_tree.tag_configure("day_tag", font=("Segoe UI", 10, "bold"), foreground="#00e5ff")
-        self.plates_tree.tag_configure("plate_tag", font=("Consolas", 10, "bold"), foreground="#75e08b")
-        self.plates_tree.bind(EVT_TREE_SELECT, self._on_plate_selected)
-        self.plates_tree.bind(EVT_DOUBLE_CLICK, self._on_plate_double_clicked)
+        self.items_tree.tag_configure("day_tag", font=("Segoe UI", 10, "bold"), foreground="#00e5ff")
+        self.items_tree.tag_configure("item_tag", font=("Consolas", 10, "bold"), foreground="#75e08b")
+        self.items_tree.bind(EVT_TREE_SELECT, self._on_item_selected)
+        self.items_tree.bind(EVT_DOUBLE_CLICK, self._on_item_double_clicked)
 
-        for w in (self.plates_tree, scrollbar, tree_frame):
+        for w in (self.items_tree, scrollbar, tree_frame):
             w.bind(EVT_ENTER, self._bind_tree_mousewheel)
             w.bind(EVT_LEAVE, self._unbind_tree_mousewheel)
 
         self.preview_container = tk.Frame(self.side_panel, bg="#14141a", pady=6, padx=8)
         self.preview_container.pack(fill=tk.X, side=tk.BOTTOM)
 
-        self.preview_info_lbl = tk.Label(self.preview_container, text="Фото номера:", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9))
+        self.preview_info_lbl = tk.Label(self.preview_container, text="Знімок об'єкта:", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9))
         self.preview_info_lbl.pack(anchor=tk.W, pady=(0, 2))
 
-        self.preview_label = tk.Label(self.preview_container, bg="#1a1a22", text="[Виберіть номер зі списку]", fg="#707080", font=("Segoe UI", 9), pady=10, relief=tk.SOLID, borderwidth=1)
+        self.preview_label = tk.Label(self.preview_container, bg="#1a1a22", text="[Виберіть запис зі списку]", fg="#707080", font=("Segoe UI", 9), pady=10, relief=tk.SOLID, borderwidth=1)
         self.preview_label.pack(fill=tk.X)
 
         self.screen_info_lbl = tk.Label(self.preview_container, text="Фото скріну (виділіть область мишкою):", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9))
@@ -770,6 +461,7 @@ class ANPRViewerApp:
         self.main_video_label.bind(EVT_BTN_PRESS, self._on_video_area_click)
         self.video_container.bind(EVT_BTN_PRESS, self._on_video_area_click)
 
+        # Інтерактивне вікно ROI
         self.roi_panel = tk.Frame(self.video_container, bg="#16161e", bd=2, relief=tk.SOLID, highlightbackground="#00ff00", highlightthickness=1)
         
         self.roi_header = tk.Frame(self.roi_panel, bg="#20202c", padx=6, pady=3, cursor="fleur")
@@ -816,9 +508,9 @@ class ANPRViewerApp:
             delta = 0
 
         if getattr(event, "state", 0) & 0x0001:
-            self.plates_tree.yview_scroll(delta * 2, "units")
+            self.items_tree.yview_scroll(delta * 2, "units")
         else:
-            self._navigate_plates(delta)
+            self._navigate_items(delta)
         return "break"
 
     def _bind_preview_mousewheel(self, event=None):
@@ -842,19 +534,19 @@ class ANPRViewerApp:
             delta = 0
 
         if delta != 0:
-            self._navigate_plates(delta)
+            self._navigate_items(delta)
         return "break"
 
-    def _navigate_plates(self, direction):
+    def _navigate_items(self, direction):
         all_items = []
-        for day in self.plates_tree.get_children():
-            for child in self.plates_tree.get_children(day):
+        for day in self.items_tree.get_children():
+            for child in self.items_tree.get_children(day):
                 if child in self.tree_item_map:
                     all_items.append(child)
         if not all_items:
             return
 
-        sel = self.plates_tree.selection()
+        sel = self.items_tree.selection()
         if sel and sel[0] in all_items:
             curr_idx = all_items.index(sel[0])
             new_idx = max(0, min(len(all_items) - 1, curr_idx + direction))
@@ -862,10 +554,10 @@ class ANPRViewerApp:
             new_idx = 0 if direction > 0 else len(all_items) - 1
 
         target = all_items[new_idx]
-        self.plates_tree.selection_set(target)
-        self.plates_tree.focus(target)
-        self.plates_tree.see(target)
-        self._on_plate_selected(None)
+        self.items_tree.selection_set(target)
+        self.items_tree.focus(target)
+        self.items_tree.see(target)
+        self._on_item_selected(None)
 
     def _on_video_area_click(self, event=None):
         if hasattr(self, "roi_panel") and self.roi_panel.winfo_ismapped():
@@ -904,19 +596,36 @@ class ANPRViewerApp:
     def _on_roi_resize_release(self, event):
         self._save_roi_geometry_to_config()
 
-    def toggle_side_panel(self):
-        if self.sidebar_visible:
+    def toggle_side_panel(self, mode="plates"):
+        if self.sidebar_visible and self.sidebar_mode == mode:
             self.side_panel.pack_forget()
             self.video_container.pack_forget()
             self.video_container.pack(fill=tk.BOTH, expand=True)
             self.sidebar_visible = False
-            self.btn_saved.configure(bg="#3a3a46")
+            if self.plates_on:
+                self.btn_saved_plates.configure(bg="#3a3a46")
+            if self.faces_on:
+                self.btn_saved_faces.configure(bg="#3a3a46")
         else:
+            self.sidebar_mode = mode
             self.video_container.pack_forget()
             self.side_panel.pack(side=tk.LEFT, fill=tk.Y)
             self.video_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.sidebar_visible = True
-            self.btn_saved.configure(bg="#007acc")
+
+            if mode == "plates":
+                if self.plates_on:
+                    self.btn_saved_plates.configure(bg="#007acc")
+                if self.faces_on:
+                    self.btn_saved_faces.configure(bg="#3a3a46")
+                self.side_header_lbl.configure(text="Історія номерів")
+            else:
+                if self.faces_on:
+                    self.btn_saved_faces.configure(bg="#007acc")
+                if self.plates_on:
+                    self.btn_saved_plates.configure(bg="#3a3a46")
+                self.side_header_lbl.configure(text="Історія облич")
+
             self.refresh_saved_list()
 
     def _clear_search(self):
@@ -929,55 +638,52 @@ class ANPRViewerApp:
         elif self.sort_mode == 1:
             self.btn_sort.configure(text="▲ Час")
         else:
-            self.btn_sort.configure(text="🔤 Номер")
+            self.btn_sort.configure(text="🔤 Назва")
         self._apply_search_and_sort()
 
     def refresh_saved_list(self):
         self.raw_records.clear()
-        if not os.path.exists(self.plates_dir):
+        target_dir = None
+        if self.sidebar_mode == "plates" and self.plate_engine:
+            target_dir = self.plate_engine.plates_dir
+        elif self.sidebar_mode == "faces" and self.face_engine:
+            target_dir = self.face_engine.faces_dir
+
+        if not target_dir or not os.path.exists(target_dir):
             self._apply_search_and_sort()
             return
 
-        for root_dir, dirs, files in os.walk(self.plates_dir):
+        for root_dir, dirs, files in os.walk(target_dir):
             for fname in files:
                 if not fname.lower().endswith((".jpg", ".png", ".jpeg")):
                     continue
-                if "_full" in fname.lower():
+                if "_full" in fname.lower() or fname.endswith("_debug.txt"):
                     continue
 
                 fpath = os.path.join(root_dir, fname)
                 base_name, _ = os.path.splitext(fname)
-                rel_dir = os.path.relpath(root_dir, self.plates_dir)
+                rel_dir = os.path.relpath(root_dir, target_dir)
 
-                if rel_dir != ".":
-                    day_key = rel_dir
-                else:
-                    day_key = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d")
+                day_key = rel_dir if rel_dir != "." else datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d")
 
                 if "_plate_" in base_name:
                     parts = base_name.split("_plate_")
-                    time_part = parts[0]
-                    rest = parts[1]
-                    time_disp = ":".join(time_part.split("-")[:3])
-                    rest_parts = rest.rsplit("_", 1)
-                    plate_num = rest_parts[0] if len(rest_parts) == 2 else rest
-                elif base_name.startswith("plate_"):
-                    clean_name = base_name.replace("plate_", "", 1)
-                    parts = clean_name.split("_")
-                    if len(parts) >= 4:
-                        time_disp = ":".join(parts[0].split("-")[:3])
-                        plate_num = parts[2]
-                    else:
-                        time_disp = "--:--:--"
-                        plate_num = clean_name
+                    time_disp = ":".join(parts[0].split("-")[:3])
+                    rest = parts[1].rsplit("_", 1)
+                    item_name = rest[0] if len(rest) == 2 else parts[1]
+                elif "_face_" in base_name:
+                    parts = base_name.split("_face_")
+                    time_disp = ":".join(parts[0].split("-")[:3])
+                    rest = parts[1].rsplit("_", 1)
+                    item_name = rest[0] if len(rest) == 2 else parts[1]
                 else:
                     time_disp = "--:--:--"
-                    plate_num = base_name
+                    item_name = base_name
 
                 self.raw_records.append({
                     "day": day_key,
                     "time": time_disp,
-                    "plate": plate_num,
+                    "name": item_name,
                     "fpath": fpath,
                     "mtime": os.path.getmtime(fpath)
                 })
@@ -985,7 +691,7 @@ class ANPRViewerApp:
         self._apply_search_and_sort()
 
     def _apply_search_and_sort(self):
-        self.plates_tree.delete(*self.plates_tree.get_children())
+        self.items_tree.delete(*self.items_tree.get_children())
         self.tree_item_map.clear()
 
         query = self.search_var.get().strip().upper()
@@ -993,7 +699,7 @@ class ANPRViewerApp:
         filtered = []
         for r in self.raw_records:
             if query:
-                if (query not in r["plate"].upper()) and (query not in r["time"]) and (query not in r["day"]):
+                if (query not in r["name"].upper()) and (query not in r["time"]) and (query not in r["day"]):
                     continue
             filtered.append(r)
 
@@ -1002,7 +708,7 @@ class ANPRViewerApp:
         elif self.sort_mode == 1:
             filtered.sort(key=lambda x: x["mtime"], reverse=False)
         else:
-            filtered.sort(key=lambda x: x["plate"].upper())
+            filtered.sort(key=lambda x: x["name"].upper())
 
         grouped = {}
         for r in filtered:
@@ -1011,24 +717,23 @@ class ANPRViewerApp:
                 grouped[d] = []
             grouped[d].append(r)
 
+        icon = "🚘" if self.sidebar_mode == "plates" else "👤"
         for idx, day_str in enumerate(sorted(grouped.keys(), reverse=(self.sort_mode != 1))):
-            day_node = self.plates_tree.insert("", "end", text=f"📁 {day_str}", tags=("day_tag",), open=(idx == 0))
+            day_node = self.items_tree.insert("", "end", text=f"📁 {day_str}", tags=("day_tag",), open=(idx == 0))
             for rec in grouped[day_str]:
-                disp_str = f"🕒 {rec['time']}   🚘 {rec['plate']}"
-                item_id = self.plates_tree.insert(day_node, "end", text=f"  {disp_str}", tags=("plate_tag",))
+                disp_str = f"🕒 {rec['time']}   {icon} {rec['name']}"
+                item_id = self.items_tree.insert(day_node, "end", text=f"  {disp_str}", tags=("item_tag",))
                 self.tree_item_map[item_id] = rec["fpath"]
 
-    def _insert_single_plate_to_tree(self, day_str, time_str, plate_str, fpath):
-        self.raw_records.append({
-            "day": day_str,
-            "time": time_str,
-            "plate": plate_str,
-            "fpath": fpath,
-            "mtime": time.time()
-        })
-        self._apply_search_and_sort()
+    def _on_plate_saved(self, day_str, time_str, plate_str, fpath):
+        if self.sidebar_visible and self.sidebar_mode == "plates":
+            self.root.after(0, self.refresh_saved_list)
 
-    def _show_plate_in_preview(self, fpath):
+    def _on_face_saved(self, day_str, time_str, face_name, fpath):
+        if self.sidebar_visible and self.sidebar_mode == "faces":
+            self.root.after(0, self.refresh_saved_list)
+
+    def _show_item_in_preview(self, fpath):
         if not fpath or not os.path.exists(fpath):
             return
         try:
@@ -1039,7 +744,8 @@ class ANPRViewerApp:
             pil_img = pil_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
             self.preview_photo_tk = ImageTk.PhotoImage(pil_img)
             base = os.path.basename(fpath).replace(".jpg", "")
-            self.preview_info_lbl.configure(text=f"Фото номера: {base}")
+            lbl_type = "Фото номера:" if self.sidebar_mode == "plates" else "Фото обличчя:"
+            self.preview_info_lbl.configure(text=f"{lbl_type} {base}")
             self.preview_label.configure(image=self.preview_photo_tk, text="", pady=0)
         except Exception:
             pass
@@ -1076,35 +782,26 @@ class ANPRViewerApp:
         except Exception as e:
             print(f"[Screenshot preview error]: {e}")
 
-    def _on_plate_selected(self, event):
-        sel = self.plates_tree.selection()
+    def _on_item_selected(self, event):
+        sel = self.items_tree.selection()
         if not sel:
             return
         fpath = self.tree_item_map.get(sel[0])
         if not fpath:
             return
 
-        self._show_plate_in_preview(fpath)
+        self._show_item_in_preview(fpath)
 
-        plate_dir = os.path.dirname(fpath)
+        item_dir = os.path.dirname(fpath)
         base_name = os.path.basename(fpath)
-
-        screen_path = None
-        if "_plate_" in base_name:
-            time_prefix = base_name.split("_plate_")[0]
-            candidate = os.path.join(plate_dir, f"{time_prefix}_full.jpg")
-            if os.path.exists(candidate):
-                screen_path = candidate
-        else:
-            time_prefix = base_name.split("_")[0]
-            candidate = os.path.join(plate_dir, f"{time_prefix}_full.jpg")
-            if os.path.exists(candidate):
-                screen_path = candidate
+        time_prefix = base_name.split("_")[0]
+        candidate = os.path.join(item_dir, f"{time_prefix}_full.jpg")
+        screen_path = candidate if os.path.exists(candidate) else None
 
         self._show_screenshot_in_canvas(screen_path)
 
-    def _on_plate_double_clicked(self, event):
-        sel = self.plates_tree.selection()
+    def _on_item_double_clicked(self, event):
+        sel = self.items_tree.selection()
         if not sel:
             return
         fpath = self.tree_item_map.get(sel[0])
@@ -1230,19 +927,18 @@ class ANPRViewerApp:
 
     def _show_help(self):
         help_text = (
-            "ANPR Video Monitor (best.onnx + CCT OCR + Pro Tracker + Debug Log)\n\n"
-            "• Детекція: best.onnx (640x640)\n"
-            "• Трекінг: IoU + Centroid з консенсусом номера\n"
-            "• Оцінка кадру: Laplacian Sharpness + OCR + Розмір\n"
-            f"• Фільтрація збереження: точність >= {self.min_percent_to_save}%\n"
-            f"• Ігнорування дублікатів авто: {self.sleep_time_after_save} с\n"
+            "ANPR & Face Video Monitor (Modular Architecture)\n\n"
+            f"• Фіксація номерів (plates_ON): {self.plates_on}\n"
+            f"• Фіксація облич (faces_ON): {self.faces_on}\n"
+            "• Детекція номерів: best.onnx (640x640) + CCT OCR\n"
+            "• Детекція облич: SCRFD / InsightFace + AdaFace/MBF (112x112)\n"
+            f"• Поріг збереження номерів: >= {self.min_percent_to_save}%\n"
+            f"• Поріг схожості облич: >= {int(self.config.get('face_min_similarity', 0.7) * 100)}%\n"
+            f"• Ігнорування повторів авто: {self.sleep_time_after_save} с\n"
             f"• Відображення номера на екрані: {self.view_plate_time} с\n"
-            "• Збереження трійки (номер + скрін + дебаг-лог):\n"
-            "  /plates/yyyy-MM-dd/hh-mm-ss_plate_OCRNAME_percent.jpg\n"
-            "  /plates/yyyy-MM-dd/hh-mm-ss_full.jpg\n"
-            "  /plates/yyyy-MM-dd/hh-mm-ss_plate_OCRNAME_percent_debug.txt\n"
-            f"• rect_scale_plate: {self.rect_scale_plate}\n"
-            f"• Автоочищення: старше {self.delete_older_days} днів\n\n"
+            "• Збереження номерів: /plates/YYYY-MM-DD/HH-MM-SS_plate_...jpg\n"
+            "• Збереження облич: /faces/YYYY-MM-DD/HH-MM-SS_face__Percent%.jpg\n"
+            "• База облич: /faces/faces.txt (UniqueFaceID, FaceName, Vector)\n\n"
             "Гарячий вихід: Ctrl + Alt + Shift + Q"
         )
         messagebox.showinfo("Довідка", help_text)
@@ -1258,7 +954,7 @@ class ANPRViewerApp:
             else:
                 self.btn_toggle.configure(text="Працює", state=tk.DISABLED, disabledforeground="#75e08b", bg="#1b3822")
 
-            self.status_lbl.configure(text="Статус: Активний (Трекінг з логуванням)", fg="#28a745")
+            self.status_lbl.configure(text="Статус: Активний (Потоки ШІ запущені)", fg="#28a745")
 
             self.ai_thread = threading.Thread(target=self._ai_worker, daemon=True)
             self.ai_thread.start()
@@ -1281,67 +977,8 @@ class ANPRViewerApp:
         self._cancel_hide_timer()
         self._show_panel()
 
-    def _save_tracked_plate(self, track: PlateTrack, reason="track_exit"):
-        """Збереження найкращого за якістю кадру треку з детальним дебаг-файлом."""
-        text, conf = track.get_consensus_text_and_conf()
-        conf_pct = int(round(conf * 100))
-
-        # 1. Відсікаємо порожні або занадто короткі результати
-        if track.best_plate_img is None or text == "UNKNOWN" or len(text) < 4:
-            return
-
-        # 2. Фільтр фізичної різкості: відсікаємо змазані в русі кадри
-        if track.best_sharpness < 30.0:
-            print(f"[ВІДХИЛЕНО] {text}: низька різкість ({track.best_sharpness:.1f} < 30.0)")
-            return
-
-        # 3. Фільтр мінімальної точності
-        if conf_pct < self.min_percent_to_save:
-            return
-
-        now = time.time()
-        # Очищення застарілих записів реєстру дублікатів
-        self.recently_saved_plates = {
-            p: t for p, t in self.recently_saved_plates.items()
-            if (now - t) < self.sleep_time_after_save
-        }
-
-        # 4. Fuzzy Matching: блокуємо номери з відхиленням <= 1 символ
-        for saved_text in self.recently_saved_plates:
-            if are_plates_similar(text, saved_text, max_diff=1):
-                return
-
-        self.recently_saved_plates[text] = now
-
-        now_dt = datetime.now()
-        day_folder = now_dt.strftime("%Y-%m-%d")
-        time_prefix = now_dt.strftime("%H-%M-%S")
-
-        day_dir = os.path.join(self.plates_dir, day_folder)
-        os.makedirs(day_dir, exist_ok=True)
-
-        base_name = f"{time_prefix}_plate_{text}_{conf_pct}%"
-        plate_filename = f"{base_name}.jpg"
-        full_filename = f"{time_prefix}_full.jpg"
-
-        plate_path = os.path.join(day_dir, plate_filename)
-        full_path = os.path.join(day_dir, full_filename)
-
-        async_write_image(plate_path, track.best_plate_img)
-        async_write_image(full_path, track.best_frame)
-
-        track_dur = round(now - track.first_seen, 2)
-        counter = Counter(track.text_history)
-        voting_summary = ", ".join([f"{txt}: {cnt}" for txt, cnt in counter.most_common()])
-
-        print(f"[BEST-SHOT ЗБЕРЕЖЕНО] {text} ({conf_pct}%), різкість: {track.best_sharpness:.1f}, кадрів: {track.frames_tracked}")
-
-        if self.sidebar_visible:
-            time_display = now_dt.strftime("%H:%M:%S")
-            self.root.after(0, lambda d=day_folder, t=time_display, p=text, f=plate_path: self._insert_single_plate_to_tree(d, t, p, f))
-
     def _ai_worker(self):
-        """ШІ-потік з безперервною детекцією та розширеним радіусом трекінгу."""
+        """Паралельний ШІ-потік опитування обох активних модулів."""
         while self.is_running:
             self.ai_event.wait(timeout=0.2)
             if not self.is_running:
@@ -1356,146 +993,24 @@ class ANPRViewerApp:
                 continue
 
             try:
-                frame_h, frame_w = frame_to_process.shape[:2]
-                total_area = frame_h * frame_w
-                current_detections = []
-                detected_boxes = self.detector.predict(frame_to_process, conf_thresh=0.25, imgsz=YOLO_IMGSZ)
+                plate_boxes = []
+                overlay_info = None
+                if self.plates_on and self.plate_engine is not None:
+                    plate_boxes, overlay_info = self.plate_engine.process_frame(frame_to_process)
 
-                for (x1, y1, x2, y2) in detected_boxes:
-                    bw = x2 - x1
-                    bh = y2 - y1
-
-                    if (bw * bh > total_area * 0.35) or (bh > frame_h * 0.45):
-                        continue
-                    if bw < 45 or bh < 14:
-                        continue
-
-                    pad_x = int(bw * 0.06)
-                    pad_y = int(bh * 0.06)
-                    crop = frame_to_process[max(0, y1 - pad_y):min(frame_h, y2 + pad_y),
-                                            max(0, x1 - pad_x):min(frame_w, x2 + pad_x)]
-
-                    enhanced, ov_w, ov_h = rectify_and_enhance(crop)
-                    if enhanced is None:
-                        continue
-
-                    plate_str = ""
-                    plate_conf = 0.0
-                    try:
-                        res = self.ocr.predict(enhanced)
-                        if res is not None:
-                            raw_txt = getattr(res, "text", "")
-                            raw_conf = getattr(res, "confidence", 0.0)
-
-                            if isinstance(raw_conf, (list, tuple, np.ndarray)):
-                                plate_conf = float(np.mean(raw_conf)) if len(raw_conf) > 0 else 0.0
-                            else:
-                                plate_conf = float(raw_conf)
-
-                            clean_txt = re.sub(r'[^A-Z0-9]', '', str(raw_txt).strip().upper())
-                            if len(clean_txt) >= 3:
-                                plate_str = clean_txt
-                    except Exception as ocr_err:
-                        print(f"[OCR Error]: {ocr_err}")
-
-                    sharpness = calculate_sharpness(enhanced)
-                    
-                    if plate_str:
-                        text_res = plate_str
-                        conf_res = plate_conf
-                    else:
-                        text_res = "UNKNOWN"
-                        conf_res = 0.0
-
-                    current_detections.append({
-                        "box": (x1, y1, x2, y2),
-                        "plate_img": enhanced,
-                        "dims": (ov_w, ov_h),
-                        "text": text_res,
-                        "conf": conf_res,
-                        "sharpness": sharpness
-                    })
-
-                now = time.time()
-                unmatched_detections = list(range(len(current_detections)))
-
-                # Сопоставление рамок трекера с радиусом 220 px
-                for t_id, track in list(self.active_tracks.items()):
-                    best_match_idx = -1
-                    min_distance = float("inf")
-
-                    for idx in unmatched_detections:
-                        det = current_detections[idx]
-                        iou = compute_iou(track.bbox, det["box"])
-                        dist = box_centroid_dist(track.bbox, det["box"])
-
-                        if (iou >= 0.15 or dist < 220.0) and dist < min_distance:
-                            min_distance = dist
-                            best_match_idx = idx
-
-                    if best_match_idx != -1:
-                        det = current_detections[best_match_idx]
-                        track.update(
-                            det["box"],
-                            det["plate_img"],
-                            frame_to_process.copy(),
-                            det["text"],
-                            det["conf"],
-                            det["sharpness"]
-                        )
-                        unmatched_detections.remove(best_match_idx)
-
-                        # Экстренное сохранение: номер чёткий (>=96%), резкость >= 45, длина >= 8, минимум 3 кадра
-                        if (not track.saved and 
-                            track.best_conf >= 0.96 and 
-                            track.best_sharpness >= 45.0 and 
-                            hasattr(track, "best_text") and 
-                            len(track.best_text) >= 8 and 
-                            track.frames_tracked >= 3):
-                            
-                            self._save_tracked_plate(track, reason="high_confidence_peak")
-                            track.saved = True
-
-                # Регистрация новых треков
-                for idx in unmatched_detections:
-                    det = current_detections[idx]
-                    t_id = self.next_track_id
-                    self.next_track_id += 1
-                    new_track = PlateTrack(
-                        track_id=t_id,
-                        bbox=det["box"],
-                        plate_img=det["plate_img"],
-                        frame=frame_to_process.copy(),
-                        text=det["text"],
-                        conf=det["conf"],
-                        sharpness=det["sharpness"]
-                    )
-                    self.active_tracks[t_id] = new_track
-
-                # Закрытие треков, покинувших кадр
-                for t_id, track in list(self.active_tracks.items()):
-                    if (now - track.last_seen) > self.track_timeout:
-                        if not track.saved:
-                            self._save_tracked_plate(track, reason="track_exit")
-                        del self.active_tracks[t_id]
-
-                # Обновление оверлея живого просмотра
-                display_boxes = [d["box"] for d in current_detections]
-                best_active = None
-                for track in self.active_tracks.values():
-                    if track.best_plate_img is not None and track.text_history:
-                        if best_active is None or track.best_score > best_active.best_score:
-                            best_active = track
+                face_boxes = []
+                if self.faces_on and self.face_engine is not None:
+                    face_boxes = self.face_engine.process_frame(frame_to_process)
 
                 with self.frame_lock:
-                    self.cached_boxes = display_boxes
-                    if best_active is not None:
-                        c_text, c_conf = best_active.get_consensus_text_and_conf()
-                        self.last_plate_img = best_active.best_plate_img
-                        self.last_plate_dims = (best_active.best_plate_img.shape[1], best_active.best_plate_img.shape[0])
-                        self.last_plate_text = c_text
-                        self.last_plate_conf = c_conf
-                        self.last_plate_time = now
+                    self.cached_plate_boxes = plate_boxes
+                    self.cached_face_boxes = face_boxes
+                    if overlay_info is not None:
+                        self.last_plate_img = overlay_info["img"]
+                        self.last_plate_dims = overlay_info["dims"]
+                        self.last_plate_text = overlay_info["text"]
+                        self.last_plate_conf = overlay_info["conf"]
+                        self.last_plate_time = overlay_info["time"]
 
             except Exception as e:
                 print(f"[AI Loop Error]: {e}")
@@ -1507,7 +1022,7 @@ class ANPRViewerApp:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
-            self.root.after(0, lambda: self.status_lbl.configure(text="Ошибка источника!", fg="#ff4444"))
+            self.root.after(0, lambda: self.status_lbl.configure(text="Помилка джерела!", fg="#ff4444"))
             self.is_running = False
             return
 
@@ -1539,14 +1054,32 @@ class ANPRViewerApp:
                 self.ai_event.set()
 
             with self.frame_lock:
-                boxes_to_draw = list(self.cached_boxes)
+                plate_boxes_to_draw = list(self.cached_plate_boxes)
+                face_boxes_to_draw = list(self.cached_face_boxes)
                 plate_img = self.last_plate_img
                 plate_dims = self.last_plate_dims
                 plate_time = self.last_plate_time
 
-            for (bx1, by1, bx2, by2) in boxes_to_draw:
+            # Зелені рамки номерних знаків
+            for (bx1, by1, bx2, by2) in plate_boxes_to_draw:
                 cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
 
+            # Блакитні рамки облич з підписом
+            for ((fx1, fy1, fx2, fy2), f_name, f_pct) in face_boxes_to_draw:
+                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 200, 0), 2)
+                
+                # Безпечна обробка: f_pct може бути 'NEW', '64%', числовим значенням або ''
+                pct_str = str(f_pct).strip()
+                if pct_str == "NEW":
+                    tag = f"{f_name} [NEW]"
+                elif pct_str:
+                    tag = f"{f_name} {pct_str}" if pct_str.endswith("%") else f"{f_name} {pct_str}%"
+                else:
+                    tag = f"{f_name}"
+                
+                cv2.putText(frame, tag, (fx1, max(18, fy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+
+            # Оверлей останнього зафіксованого номера у правому верхньому кутку
             if plate_img is not None and (now - plate_time < self.view_plate_time):
                 margin = 20
                 cur_w, cur_h = plate_dims
