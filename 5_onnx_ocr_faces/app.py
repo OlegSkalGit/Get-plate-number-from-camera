@@ -197,6 +197,7 @@ class ANPRViewerApp:
             "autostart_os_and_play": False,
             "plates_on": True,
             "faces_on": True,
+            "plates_debug": False,          # <--- ДОДАНО
             "face_min_similarity": 0.7,
             "face_det_thresh": 0.45,
             "view_plate_time": 30,
@@ -227,6 +228,7 @@ class ANPRViewerApp:
                     "autostart_os_and_play": parser.getboolean("SETTINGS", "autostart_os_and_play", fallback=False),
                     "plates_on": parser.getboolean("SETTINGS", "plates_on", fallback=True),
                     "faces_on": parser.getboolean("SETTINGS", "faces_on", fallback=True),
+                    "plates_debug": parser.getboolean("SETTINGS", "plates_debug", fallback=False),  # <--- ДОДАНО
                     "face_min_similarity": parser.getfloat("SETTINGS", "face_min_similarity", fallback=0.7),
                     "face_det_thresh": parser.getfloat("SETTINGS", "face_det_thresh", fallback=0.45),
                     "view_plate_time": parser.getint("SETTINGS", "view_plate_time", fallback=30),
@@ -255,6 +257,7 @@ class ANPRViewerApp:
             "autostart_os_and_play": str(data.get("autostart_os_and_play", False)).lower(),
             "plates_on": str(data.get("plates_on", True)).lower(),
             "faces_on": str(data.get("faces_on", True)).lower(),
+            "plates_debug": str(data.get("plates_debug", False)).lower(),   # <--- ДОДАНО
             "face_min_similarity": str(data.get("face_min_similarity", 0.7)),
             "face_det_thresh": str(data.get("face_det_thresh", 0.45)),
             "view_plate_time": str(data.get("view_plate_time", 30)),
@@ -272,6 +275,7 @@ class ANPRViewerApp:
                 f.write("; ANPR & Face Video Monitor Configuration\n")
                 f.write("; plates_on: true / false (фіксація номерних знаків)\n")
                 f.write("; faces_on: true / false (фіксація облич)\n")
+                f.write("; plates_debug: true / false (збереження дебаг-логів)\n")  # <--- ДОДАНО
                 f.write("; face_min_similarity: поріг схожості векторів облич (0.7 = 70%)\n")
                 f.write("; face_det_thresh: поріг детекції облич\n")
                 f.write("; source: 0, rtsp://... або d:\\video.mp4\n")

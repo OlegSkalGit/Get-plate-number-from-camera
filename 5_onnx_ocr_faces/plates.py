@@ -583,30 +583,37 @@ class PlateEngine:
         async_write_image(plate_path, track.best_plate_img)
         async_write_image(full_path, track.best_frame)
 
-        track_dur = round(now - track.first_seen, 2)
-        counter = Counter(track.text_history)
-        voting_summary = ", ".join([f"{txt}: {cnt}" for txt, cnt in counter.most_common()])
+        # Перевірка налаштування plates_debug
+        save_debug = self.config.get("plates_debug", False)
+        if isinstance(save_debug, str):
+            save_debug = save_debug.strip().lower() in ("true", "1", "yes")
 
-        debug_content = (
-            f"=== ANPR Track Debug Log ===\n"
-            f"Track ID: {track.track_id}\n"
-            f"Saved Reason: {reason}\n"
-            f"Duration: {track_dur}s\n"
-            f"Frames Tracked: {track.frames_tracked}\n"
-            f"Final Text: {text}\n"
-            f"Consensus Confidence: {conf_pct}%\n"
-            f"Best Sharpness: {track.best_sharpness:.1f}\n"
-            f"Best Score: {track.best_score:.3f}\n"
-            f"Voting Summary: {voting_summary}\n\n"
-            f"--- Frame-by-Frame History ---\n"
-        )
-        for rec in track.history_records:
-            debug_content += (
-                f"+{rec['rel_time']}s | Text: {rec['text']} | Conf: {rec['conf']}% | "
-                f"Sharp: {rec['sharpness']} | Score: {rec['score']} | Box: {rec['bbox']}\n"
+        if save_debug:
+            track_dur = round(now - track.first_seen, 2)
+            counter = Counter(track.text_history)
+            voting_summary = ", ".join([f"{txt}: {cnt}" for txt, cnt in counter.most_common()])
+
+            debug_content = (
+                f"=== ANPR Track Debug Log ===\n"
+                f"Track ID: {track.track_id}\n"
+                f"Saved Reason: {reason}\n"
+                f"Duration: {track_dur}s\n"
+                f"Frames Tracked: {track.frames_tracked}\n"
+                f"Final Text: {text}\n"
+                f"Consensus Confidence: {conf_pct}%\n"
+                f"Best Sharpness: {track.best_sharpness:.1f}\n"
+                f"Best Score: {track.best_score:.3f}\n"
+                f"Voting Summary: {voting_summary}\n\n"
+                f"--- Frame-by-Frame History ---\n"
             )
+            for rec in track.history_records:
+                debug_content += (
+                    f"+{rec['rel_time']}s | Text: {rec['text']} | Conf: {rec['conf']}% | "
+                    f"Sharp: {rec['sharpness']} | Score: {rec['score']} | Box: {rec['bbox']}\n"
+                )
 
-        async_write_text(debug_path, debug_content)
+            async_write_text(debug_path, debug_content)
+
         print(f"[BEST-SHOT НОМЕР] {text} ({conf_pct}%), різкість: {track.best_sharpness:.1f}, кадрів: {track.frames_tracked}")
 
         if self.on_saved_callback:
