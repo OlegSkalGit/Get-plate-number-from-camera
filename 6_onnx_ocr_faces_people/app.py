@@ -89,9 +89,11 @@ class ANPRViewerApp:
         self.face_min_similarity = float(self.config.get("faces_min_similarity", self.config.get("face_min_similarity", 0.7)))
         self.face_det_thresh = float(self.config.get("faces_det_thresh", self.config.get("face_det_thresh", 0.45)))
 
-        # Модуль людей (people_)
+        # Модуль людей та транспорту (people_)
         self.people_det_thresh = float(self.config.get("people_det_thresh", self.config.get("person_det_thresh", 0.45)))
         self.people_timer_ms = int(self.config.get("people_timer_ms", self.config.get("person_timer_ms", 1000)))
+        val_veh = str(self.config.get("people_detect_vehicles", self.config.get("people_vehicles_on", self.config.get("people_vehicles", "false")))).strip().lower()
+        self.people_detect_vehicles = val_veh in ("true", "1", "yes", "on")
 
         self._sync_windows_startup(self.is_autostart_active)
 
@@ -232,6 +234,7 @@ class ANPRViewerApp:
             "faces_det_thresh": 0.45,
             # people_
             "people_on": True,
+            "people_detect_vehicles": True,
             "people_det_thresh": 0.45,
             "people_timer_ms": 1000
         }
@@ -287,11 +290,13 @@ class ANPRViewerApp:
 
                     # people_
                     "people_on": _get_bool("people_on", None, True),
+                    "people_detect_vehicles": _get_bool("people_detect_vehicles", "people_vehicles_on", False),
                     "people_det_thresh": _get_float("people_det_thresh", "person_det_thresh", 0.45),
                     "people_timer_ms": _get_int("people_timer_ms", "person_timer_ms", 1000)
                 }
 
                 # Забезпечення сумісності зі старими назвами
+                cfg["people_vehicles_on"] = cfg["people_detect_vehicles"]
                 cfg["min_percent_to_save"] = cfg["plates_min_percent_to_save"]
                 cfg["sleep_time_after_save"] = cfg["plates_sleep_time_after_save"]
                 cfg["view_plate_time"] = cfg["plates_view_time"]
@@ -469,14 +474,15 @@ class ANPRViewerApp:
         if self.faces_on:
             self.btn_saved_faces.pack(side=tk.LEFT, padx=4)
 
+        btn_people_text = "🚶🚗 Люди/Авто" if self.people_detect_vehicles else "🚶 Люди"
         self.btn_saved_people = tk.Button(
             self.ctrl_frame,
-            text="🚶 Люди",
+            text=btn_people_text,
             command=lambda: self.toggle_side_panel("people"),
             bg="#3a3a46",
             fg="#ffffff",
             font=("Segoe UI", 10, "bold"),
-            width=10,
+            width=13 if self.people_detect_vehicles else 10,
             relief=tk.FLAT,
             cursor="hand2"
         )
@@ -743,7 +749,8 @@ class ANPRViewerApp:
             elif mode == "faces":
                 self.side_header_lbl.configure(text="Історія облич")
             else:
-                self.side_header_lbl.configure(text="Історія: Люди (скріншоти)")
+                side_title = "Історія: Люди та Авто (скріншоти)" if self.people_detect_vehicles else "Історія: Люди (скріншоти)"
+                self.side_header_lbl.configure(text=side_title)
 
             self.refresh_saved_list()
 
@@ -800,7 +807,11 @@ class ANPRViewerApp:
                 elif self.sidebar_mode == "people":
                     time_parts = base_name.split("_")[0].split("-")
                     time_disp = ":".join(time_parts[:3])
-                    item_name = "Людина в кадрі"
+                    parts = base_name.split("_")
+                    if len(parts) >= 2 and not parts[1].isdigit():
+                        item_name = parts[1].replace("-", ", ")
+                    else:
+                        item_name = "Людина в кадрі"
                 else:
                     time_disp = "--:--:--"
                     item_name = base_name
@@ -884,7 +895,7 @@ class ANPRViewerApp:
             elif self.sidebar_mode == "faces":
                 lbl_type = "Фото обличчя:"
             else:
-                lbl_type = "Скріншот людини:"
+                lbl_type = "Скріншот об'єкта:"
             self.preview_info_lbl.configure(text=f"{lbl_type} {base}")
             self.preview_label.configure(image=self.preview_photo_tk, text="", pady=0)
         except Exception:
@@ -1073,14 +1084,14 @@ class ANPRViewerApp:
             "ANPR, Face & People Video Monitor (Modular Architecture)\n\n"
             f"• Фіксація номерів (plates_ON): {self.plates_on}\n"
             f"• Фіксація облич (faces_ON): {self.faces_on}\n"
-            f"• Фіксація людей (people_ON): {self.people_on}\n"
+            f"• Фіксація людей/транспорту (people_ON): {self.people_on} (авто: {self.people_detect_vehicles})\n"
             "• Детекція номерів: best.onnx (640x640) + CCT OCR\n"
             "• Детекція облич: SCRFD / InsightFace + AdaFace/MBF (112x112)\n"
-            "• Детекція людей: yolo11n.onnx (640x640)\n"
+            "• Детекція людей та авто: yolo11n.onnx (640x640)\n"
             f"• Поріг збереження номерів: >= {self.min_percent_to_save}%\n"
             f"• Поріг схожості облич: >= {int(self.face_min_similarity * 100)}%\n"
-            f"• Поріг детекції людей: >= {int(self.people_det_thresh * 100)}%\n"
-            f"• Інтервал скріншотів людей: {self.people_timer_ms} мс\n"
+            f"• Поріг детекції людей/авто: >= {int(self.people_det_thresh * 100)}%\n"
+            f"• Інтервал скріншотів людей/авто: {self.people_timer_ms} мс\n"
             f"• Ігнорування повторів авто: {self.sleep_time_after_save} с\n"
             f"• Відображення номера на екрані: {self.view_plate_time} с\n"
             "• Збереження номерів: /plates/YYYY-MM-DD/HH-MM-SS_plate_...jpg\n"
@@ -1218,11 +1229,20 @@ class ANPRViewerApp:
             for (bx1, by1, bx2, by2) in plate_boxes_to_draw:
                 cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
 
-            # Помаранчеві рамки виявлених людей
-            for ((px1, py1, px2, py2), p_pct) in person_boxes_to_draw:
-                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 165, 255), 2)
-                p_tag = f"Person {p_pct}%"
-                cv2.putText(frame, p_tag, (px1, max(18, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            # Рамки виявлених людей та транспорту
+            for item in person_boxes_to_draw:
+                if len(item) == 3:
+                    (px1, py1, px2, py2), p_pct, p_label = item
+                else:
+                    (px1, py1, px2, py2), p_pct = item
+                    p_label = "Person"
+
+                is_person = p_label.lower() == "person"
+                # Помаранчевий для людей, золотистий/жовтий для авто й транспорту
+                box_color = (0, 165, 255) if is_person else (0, 215, 255)
+                cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, 2)
+                p_tag = f"{p_label} {p_pct}%"
+                cv2.putText(frame, p_tag, (px1, max(18, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
             # Блакитні рамки облич з підписом
             for ((fx1, fy1, fx2, fy2), f_name, f_pct) in face_boxes_to_draw:
