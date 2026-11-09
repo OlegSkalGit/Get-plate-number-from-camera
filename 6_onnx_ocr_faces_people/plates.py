@@ -48,7 +48,7 @@ def calculate_sharpness(img):
 
 
 def evaluate_plate_quality(crop_bgr, text, conf, sharpness):
-    """Комплексна оцінка якості кадру."""
+    """Комплексна оцінка якості кадру з пріоритетом чіткості над розміром."""
     text_len = len(text)
     if text_len < 4 or text == "UNKNOWN":
         return 0.0
@@ -56,17 +56,19 @@ def evaluate_plate_quality(crop_bgr, text, conf, sharpness):
     if text_len >= 7:
         len_mult = 1.0
     elif text_len == 6:
-        len_mult = 0.82
+        len_mult = 0.85
     elif text_len == 5:
-        len_mult = 0.65
+        len_mult = 0.70
     else:
-        len_mult = 0.45
+        len_mult = 0.50
 
-    sharp_norm = min(1.0, max(0.0, (sharpness - 80.0) / 720.0))
+    # Плавна нормалізація різкості без мертвої зони < 80:
+    sharp_norm = min(1.0, max(0.0, sharpness / 150.0))
     h, w = crop_bgr.shape[:2]
-    area_norm = min(1.0, (w * h) / (160.0 * 40.0))
+    area_norm = min(1.0, (w * h) / (180.0 * 45.0))
 
-    return (conf * 0.40 + sharp_norm * 0.40 + area_norm * 0.20) * len_mult
+    # Високий пріоритет чіткості та OCR (90%), менший вплив наближення камери (10%)
+    return (conf * 0.45 + sharp_norm * 0.45 + area_norm * 0.10) * len_mult
 
 
 def compute_iou(boxA, boxB):
@@ -147,12 +149,16 @@ def rectify_and_enhance(plate_crop):
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
 
     plate_quad = None
+    crop_area = float(w * h)
     for c in contours:
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
-        if len(approx) == 4 and cv2.contourArea(c) > (w * h * 0.25):
-            plate_quad = approx.reshape(4, 2)
-            break
+        approx = cv2.approxPolyDP(c, 0.035 * peri, True)
+        if len(approx) == 4:
+            c_area = cv2.contourArea(approx)
+            # Тільки якщо знайдений чотирикутник займає більшу частину рамки (>= 65%)
+            if c_area >= crop_area * 0.65 and cv2.isContourConvex(approx):
+                plate_quad = approx.reshape(4, 2)
+                break
 
     dst = np.array([
         [0, 0],
@@ -195,6 +201,7 @@ class PlateTrack:
         initial_score = evaluate_plate_quality(plate_img, text, conf, sharpness)
         self.best_score = initial_score
         self.frames_tracked = 0
+        self.frame_buffer = []
 
         self.append_record(bbox, plate_img, frame, text, conf, sharpness, initial_score)
 
@@ -212,6 +219,17 @@ class PlateTrack:
         if text != "UNKNOWN" and len(text) >= 4:
             self.text_history.append(text)
             self.conf_history.append(conf)
+            self.frame_buffer.append({
+                "plate_img": plate_img,
+                "frame": frame,
+                "text": text,
+                "conf": conf,
+                "sharpness": sharpness,
+                "score": score
+            })
+            if len(self.frame_buffer) > 20:
+                self.frame_buffer.sort(key=lambda x: x["sharpness"], reverse=True)
+                self.frame_buffer = self.frame_buffer[:15]
 
     def update(self, bbox, plate_img, frame, text, conf, sharpness):
         self.bbox = bbox
@@ -227,6 +245,21 @@ class PlateTrack:
             self.best_sharpness = sharpness
             self.best_conf = conf
             self.best_text = text
+
+    def get_best_candidate(self, consensus_text=None):
+        """Знаходить абсолютно найчіткіший збережений кадр для узгодженого номера."""
+        if not self.frame_buffer:
+            return self.best_plate_img, self.best_frame, self.best_sharpness, self.best_conf
+
+        target_text = consensus_text or self.best_text
+        matching = [item for item in self.frame_buffer if item["text"] == target_text]
+        if not matching:
+            matching = [item for item in self.frame_buffer if are_plates_similar(item["text"], target_text, max_diff=1)]
+        if not matching:
+            matching = self.frame_buffer
+
+        best_item = max(matching, key=lambda x: x["sharpness"])
+        return best_item["plate_img"], best_item["frame"], best_item["sharpness"], best_item["conf"]
 
     def get_consensus_text_and_conf(self):
         """Визначення найбільш ймовірного номера методом Majority Voting."""
@@ -387,27 +420,28 @@ class PlateEngine:
 
         self.active_tracks = {}
         self.next_track_id = 1
-        self.track_timeout = 1.0
+        self.track_timeout = 1.2
         self.recently_saved_plates = {}
+        self.plates_det_thresh = float(self.config.get("plates_det_thresh", 0.18))
 
     def process_frame(self, frame):
         """Обробка кадру з детекцією, OCR, трекінгом та поверненням даних для оверлею."""
         frame_h, frame_w = frame.shape[:2]
         total_area = frame_h * frame_w
         current_detections = []
-        detected_boxes = self.detector.predict(frame, conf_thresh=0.25, imgsz=YOLO_IMGSZ)
+        detected_boxes = self.detector.predict(frame, conf_thresh=self.plates_det_thresh, imgsz=YOLO_IMGSZ)
 
         for (x1, y1, x2, y2) in detected_boxes:
             bw = x2 - x1
             bh = y2 - y1
 
-            if (bw * bh > total_area * 0.35) or (bh > frame_h * 0.45):
+            if (bw * bh > total_area * 0.40) or (bh > frame_h * 0.50):
                 continue
-            if bw < 45 or bh < 14:
+            if bw < 26 or bh < 8:
                 continue
 
-            pad_x = int(bw * 0.06)
-            pad_y = int(bh * 0.06)
+            pad_x = int(bw * 0.12)
+            pad_y = int(bh * 0.14)
             crop = frame[max(0, y1 - pad_y):min(frame_h, y2 + pad_y),
                          max(0, x1 - pad_x):min(frame_w, x2 + pad_x)]
 
@@ -540,11 +574,16 @@ class PlateEngine:
         text, conf = track.get_consensus_text_and_conf()
         conf_pct = int(round(conf * 100))
 
-        if track.best_plate_img is None or text == "UNKNOWN" or len(text) < 4:
+        if text == "UNKNOWN" or len(text) < 4:
             return
 
-        if track.best_sharpness < 30.0:
-            print(f"[ВІДХИЛЕНО НОМЕР] {text}: низька різкість ({track.best_sharpness:.1f} < 30.0)")
+        best_plate_img, best_frame, best_sharpness, best_conf = track.get_best_candidate(text)
+        if best_plate_img is None:
+            return
+
+        # Захист від змазаних номерів
+        if best_sharpness < 28.0:
+            print(f"[ВІДХИЛЕНО НОМЕР] {text}: низька різкість ({best_sharpness:.1f} < 28.0)")
             return
 
         min_pct = int(self.config.get("plates_min_percent_to_save", self.config.get("min_percent_to_save", 80)))
@@ -580,8 +619,8 @@ class PlateEngine:
         full_path = os.path.join(day_dir, full_filename)
         debug_path = os.path.join(day_dir, debug_filename)
 
-        async_write_image(plate_path, track.best_plate_img)
-        async_write_image(full_path, track.best_frame)
+        async_write_image(plate_path, best_plate_img)
+        async_write_image(full_path, best_frame)
 
         # Перевірка налаштування plates_debug
         save_debug = self.config.get("plates_debug", False)

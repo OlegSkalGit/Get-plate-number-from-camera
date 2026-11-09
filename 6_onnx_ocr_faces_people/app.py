@@ -92,8 +92,15 @@ class ANPRViewerApp:
         # Модуль людей та транспорту (people_)
         self.people_det_thresh = float(self.config.get("people_det_thresh", self.config.get("person_det_thresh", 0.45)))
         self.people_timer_ms = int(self.config.get("people_timer_ms", self.config.get("person_timer_ms", 1000)))
-        val_veh = str(self.config.get("people_detect_vehicles", self.config.get("people_vehicles_on", self.config.get("people_vehicles", "false")))).strip().lower()
-        self.people_detect_vehicles = val_veh in ("true", "1", "yes", "on")
+        val_veh = str(self.config.get(
+            "people_detect_transport",
+            self.config.get(
+                "people_detect_vehicles",
+                self.config.get("people_vehicles_on", self.config.get("people_vehicles", "false"))
+            )
+        )).strip().lower()
+        self.people_detect_transport = val_veh in ("true", "1", "yes", "on")
+        self.people_detect_vehicles = self.people_detect_transport
 
         self._sync_windows_startup(self.is_autostart_active)
 
@@ -234,6 +241,7 @@ class ANPRViewerApp:
             "faces_det_thresh": 0.45,
             # people_
             "people_on": True,
+            "people_detect_transport": True,
             "people_detect_vehicles": True,
             "people_det_thresh": 0.45,
             "people_timer_ms": 1000
@@ -290,13 +298,15 @@ class ANPRViewerApp:
 
                     # people_
                     "people_on": _get_bool("people_on", None, True),
-                    "people_detect_vehicles": _get_bool("people_detect_vehicles", "people_vehicles_on", False),
+                    "people_detect_transport": _get_bool("people_detect_transport", "people_detect_vehicles", False),
+                    "people_detect_vehicles": _get_bool("people_detect_transport", "people_detect_vehicles", False),
                     "people_det_thresh": _get_float("people_det_thresh", "person_det_thresh", 0.45),
                     "people_timer_ms": _get_int("people_timer_ms", "person_timer_ms", 1000)
                 }
 
                 # Забезпечення сумісності зі старими назвами
-                cfg["people_vehicles_on"] = cfg["people_detect_vehicles"]
+                cfg["people_vehicles_on"] = cfg["people_detect_transport"]
+                cfg["people_detect_vehicles"] = cfg["people_detect_transport"]
                 cfg["min_percent_to_save"] = cfg["plates_min_percent_to_save"]
                 cfg["sleep_time_after_save"] = cfg["plates_sleep_time_after_save"]
                 cfg["view_plate_time"] = cfg["plates_view_time"]
@@ -474,7 +484,7 @@ class ANPRViewerApp:
         if self.faces_on:
             self.btn_saved_faces.pack(side=tk.LEFT, padx=4)
 
-        btn_people_text = "🚶🚗 Люди/Авто" if self.people_detect_vehicles else "🚶 Люди"
+        btn_people_text = "🚶🚗 Люди/Транспорт" if self.people_detect_transport else "🚶 Люди"
         self.btn_saved_people = tk.Button(
             self.ctrl_frame,
             text=btn_people_text,
@@ -482,7 +492,7 @@ class ANPRViewerApp:
             bg="#3a3a46",
             fg="#ffffff",
             font=("Segoe UI", 10, "bold"),
-            width=13 if self.people_detect_vehicles else 10,
+            width=16 if self.people_detect_transport else 10,
             relief=tk.FLAT,
             cursor="hand2"
         )
@@ -749,7 +759,7 @@ class ANPRViewerApp:
             elif mode == "faces":
                 self.side_header_lbl.configure(text="Історія облич")
             else:
-                side_title = "Історія: Люди та Авто (скріншоти)" if self.people_detect_vehicles else "Історія: Люди (скріншоти)"
+                side_title = "Історія: Люди та Транспорт (скріншоти)" if self.people_detect_transport else "Історія: Люди (скріншоти)"
                 self.side_header_lbl.configure(text=side_title)
 
             self.refresh_saved_list()
@@ -1084,14 +1094,14 @@ class ANPRViewerApp:
             "ANPR, Face & People Video Monitor (Modular Architecture)\n\n"
             f"• Фіксація номерів (plates_ON): {self.plates_on}\n"
             f"• Фіксація облич (faces_ON): {self.faces_on}\n"
-            f"• Фіксація людей/транспорту (people_ON): {self.people_on} (авто: {self.people_detect_vehicles})\n"
+            f"• Фіксація людей/транспорту (people_ON): {self.people_on} (транспорт: {self.people_detect_transport})\n"
             "• Детекція номерів: best.onnx (640x640) + CCT OCR\n"
             "• Детекція облич: SCRFD / InsightFace + AdaFace/MBF (112x112)\n"
-            "• Детекція людей та авто: yolo11n.onnx (640x640)\n"
+            "• Детекція людей та транспорту: yolo11n.onnx (640x640)\n"
             f"• Поріг збереження номерів: >= {self.min_percent_to_save}%\n"
             f"• Поріг схожості облич: >= {int(self.face_min_similarity * 100)}%\n"
-            f"• Поріг детекції людей/авто: >= {int(self.people_det_thresh * 100)}%\n"
-            f"• Інтервал скріншотів людей/авто: {self.people_timer_ms} мс\n"
+            f"• Поріг детекції людей/транспорту: >= {int(self.people_det_thresh * 100)}%\n"
+            f"• Інтервал скріншотів людей/транспорту: {self.people_timer_ms} мс\n"
             f"• Ігнорування повторів авто: {self.sleep_time_after_save} с\n"
             f"• Відображення номера на екрані: {self.view_plate_time} с\n"
             "• Збереження номерів: /plates/YYYY-MM-DD/HH-MM-SS_plate_...jpg\n"

@@ -308,11 +308,13 @@ class FaceRecognizer:
 
                 vec = np.fromstring(vec_str, sep=" ", dtype=np.float32)
                 norm = np.linalg.norm(vec)
+                norm_vec = vec / (norm + 1e-10)
                 self.known_templates.append({
                     "id": u_id,
                     "name": name,
                     "ignore": ignore_flag,
-                    "vector": vec / (norm + 1e-10)
+                    "vector": norm_vec,
+                    "gallery": [norm_vec]
                 })
 
     def _save_all_database(self):
@@ -335,10 +337,10 @@ class FaceRecognizer:
         norm = np.linalg.norm(emb)
         return emb / (norm + 1e-10)
 
-    def identify_or_register(self, fused_embedding, current_sharpness=0.0, min_similarity=0.50):
+    def identify_or_register(self, fused_embedding, current_sharpness=0.0, min_similarity=0.45):
         """
-        Порівнює з базою:
-        - Якщо особа впізнана: перевіряє умову перезапису на чіткіший вектор (In-place).
+        Порівнює з мульти-шаблонною галереєю:
+        - Якщо особа впізнана: адаптивно оновлює або додає новий стабільний ракурс у галерею.
         - Якщо особа нова: створює рівно один запис із Ignore=False.
         Повертає: (UniqueFaceID, FaceName, status_tag, is_ignored: bool)
         """
@@ -348,7 +350,8 @@ class FaceRecognizer:
         best_sim = -1.0
 
         for idx, record in enumerate(self.known_templates):
-            sim = float(np.dot(norm_emb, record["vector"]))
+            gallery = record.get("gallery", [record["vector"]])
+            sim = max(float(np.dot(norm_emb, v)) for v in gallery)
             if sim > best_sim:
                 best_sim = sim
                 best_idx = idx
@@ -359,11 +362,24 @@ class FaceRecognizer:
             sim_pct_val = int(round(best_sim * 100))
             sim_tag = f"{sim_pct_val}%"
 
-            # Самовдосконалення: якщо схожість висока (>= 82%) і чіткість відмінна (>= 45.0)
-            if best_sim >= 0.82 and current_sharpness >= 45.0:
-                rec["vector"] = norm_emb
+            if "gallery" not in rec:
+                rec["gallery"] = [rec["vector"]]
+
+            # Адаптація та мульти-ракурсне запам'ятовування:
+            if current_sharpness >= 28.0:
+                if best_sim >= 0.82:
+                    # Плавне збагачення найближчого ракурсу (EMA)
+                    best_v_idx = int(np.argmax([float(np.dot(norm_emb, v)) for v in rec["gallery"]]))
+                    rec["gallery"][best_v_idx] = 0.85 * rec["gallery"][best_v_idx] + 0.15 * norm_emb
+                    rec["gallery"][best_v_idx] /= (np.linalg.norm(rec["gallery"][best_v_idx]) + 1e-10)
+                elif len(rec["gallery"]) < 4:
+                    # Новий якісний ракурс (поворот/нахил голови) тієї самої людини!
+                    rec["gallery"].append(norm_emb)
+
+                # Перерахунок головного центроїда для файлу faces.txt
+                mean_v = np.mean(rec["gallery"], axis=0)
+                rec["vector"] = mean_v / (np.linalg.norm(mean_v) + 1e-10)
                 self._save_all_database()
-                print(f"[FaceEngine] Оновлено еталонний вектор для {rec['name']} ({rec['id']}) на чіткіший (різкість {current_sharpness:.1f})")
 
             return rec["id"], rec["name"], sim_tag, rec.get("ignore", False)
 
@@ -377,7 +393,8 @@ class FaceRecognizer:
             "id": new_id,
             "name": new_name,
             "ignore": ignore_flag,
-            "vector": norm_emb
+            "vector": norm_emb,
+            "gallery": [norm_emb]
         }
         self.known_templates.append(new_record)
 
@@ -433,7 +450,7 @@ class FaceEngine:
         self.config = config
         self.on_saved_callback = on_saved_callback
 
-        self.face_min_similarity = float(self.config.get("faces_min_similarity", self.config.get("face_min_similarity", 0.50)))
+        self.face_min_similarity = float(self.config.get("faces_min_similarity", self.config.get("face_min_similarity", 0.45)))
         self.face_det_thresh = float(self.config.get("faces_det_thresh", self.config.get("face_det_thresh", 0.40)))
         self.face_min_size = int(self.config.get("faces_min_size", self.config.get("face_min_size", 20)))
 
@@ -470,7 +487,7 @@ class FaceEngine:
 
         self.active_tracks = {}
         self.next_track_id = 1
-        self.track_timeout = 1.2
+        self.track_timeout = 2.0
         self.recently_saved = {}
 
     def process_frame(self, frame):
@@ -501,7 +518,10 @@ class FaceEngine:
                 c1x, c1y = (f_track.bbox[0] + f_track.bbox[2]) / 2.0, (f_track.bbox[1] + f_track.bbox[3]) / 2.0
                 c2x, c2y = (det["box"][0] + det["box"][2]) / 2.0, (det["box"][1] + det["box"][3]) / 2.0
                 dist = math.hypot(c1x - c2x, c1y - c2y)
-                if dist < 140.0 and dist < min_dist:
+                bw = max(10, det["box"][2] - det["box"][0])
+                bh = max(10, det["box"][3] - det["box"][1])
+                max_track_dist = max(40.0, max(bw, bh) * 2.0)
+                if dist < max_track_dist and dist < min_dist:
                     min_dist = dist
                     best_idx = idx
 

@@ -203,7 +203,13 @@ class PersonEngine:
         self.timer_ms = int(self.config.get("people_timer_ms", self.config.get("person_timer_ms", 1000)))
         self.interval_sec = max(0.1, float(self.timer_ms) / 1000.0)
 
-        val_veh = str(self.config.get("people_detect_vehicles", self.config.get("people_vehicles_on", self.config.get("people_vehicles", "false")))).strip().lower()
+        val_veh = str(self.config.get(
+            "people_detect_transport",
+            self.config.get(
+                "people_detect_vehicles",
+                self.config.get("people_vehicles_on", self.config.get("people_vehicles", "false"))
+            )
+        )).strip().lower()
         self.detect_vehicles = val_veh in ("true", "1", "yes", "on")
 
         model_path = os.path.join(base_dir, "model", "yolo11n.onnx")
@@ -213,15 +219,16 @@ class PersonEngine:
         self.detector = PersonDetector(model_path, detect_vehicles=self.detect_vehicles)
         self.last_shot_time = 0.0
 
-    def update_settings(self, conf_thresh: float = None, timer_ms: int = None, detect_vehicles: bool = None):
+    def update_settings(self, conf_thresh: float = None, timer_ms: int = None, detect_transport: bool = None, detect_vehicles: bool = None):
         """Динамічне оновлення налаштувань детектора та таймера."""
         if conf_thresh is not None:
             self.conf_thresh = float(conf_thresh)
         if timer_ms is not None:
             self.timer_ms = int(timer_ms)
             self.interval_sec = max(0.1, float(self.timer_ms) / 1000.0)
-        if detect_vehicles is not None:
-            self.detect_vehicles = bool(detect_vehicles)
+        target_veh = detect_transport if detect_transport is not None else detect_vehicles
+        if target_veh is not None:
+            self.detect_vehicles = bool(target_veh)
             self.detector.detect_vehicles = self.detect_vehicles
             self.detector._update_target_classes()
 
