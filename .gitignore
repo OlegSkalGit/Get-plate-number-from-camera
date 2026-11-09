@@ -27,3 +27,9 @@ plates/
 **/plates/
 faces/
 **/faces/
+people/
+**/people/
+
+# Video files
+video_2026-11-06_11-04-07.mp4
+*.mp4
