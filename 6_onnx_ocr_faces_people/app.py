@@ -70,8 +70,11 @@ class ANPRViewerApp:
         self.config = self._load_config()
 
         self.plates_on = bool(self.config.get("plates_on", True))
+        self.plates_show_boxes = bool(self.config.get("plates_show_boxes", True))
         self.faces_on = bool(self.config.get("faces_on", True))
+        self.faces_show_boxes = bool(self.config.get("faces_show_boxes", True))
         self.people_on = bool(self.config.get("people_on", True))
+        self.people_show_boxes = bool(self.config.get("people_show_boxes", True))
         self.is_autostart_active = bool(self.config.get("autostart_os_and_play", False))
         self.delete_older_days = float(self.config.get("delete_older_days", 1))
 
@@ -86,7 +89,7 @@ class ANPRViewerApp:
         self.roi_user_height = int(self.config.get("plates_rect_user_height", self.config.get("rect_scale_user_height", 240)))
 
         # Модуль облич (faces_)
-        self.face_min_similarity = float(self.config.get("faces_min_similarity", self.config.get("face_min_similarity", 0.7)))
+        self.face_min_similarity = float(self.config.get("faces_min_similarity", self.config.get("face_min_similarity", 0.48)))
         self.face_det_thresh = float(self.config.get("faces_det_thresh", self.config.get("face_det_thresh", 0.45)))
 
         # Модуль людей та транспорту (people_)
@@ -223,10 +226,12 @@ class ANPRViewerApp:
         defaults = {
             "source": "0",
             "autostart_os_and_play": False,
-            "delete_older_days": 1,
+            "delete_older_days": 5.0,
             # plates_
             "plates_on": True,
+            "plates_show_boxes": True,
             "plates_debug": False,
+            "plates_det_thresh": 0.18,
             "plates_min_percent_to_save": 80,
             "plates_sleep_time_after_save": 5.0,
             "plates_view_time": 30,
@@ -237,12 +242,14 @@ class ANPRViewerApp:
             "plates_rect_user_height": 240,
             # faces_
             "faces_on": True,
-            "faces_min_similarity": 0.7,
+            "faces_show_boxes": True,
+            "faces_min_similarity": 0.48,
             "faces_det_thresh": 0.45,
+            "faces_min_size": 20,
             # people_
             "people_on": True,
+            "people_show_boxes": True,
             "people_detect_transport": True,
-            "people_detect_vehicles": True,
             "people_det_thresh": 0.45,
             "people_timer_ms": 1000
         }
@@ -256,8 +263,11 @@ class ANPRViewerApp:
                 def _get_bool(key, old_key, def_val):
                     if parser.has_option("SETTINGS", key):
                         return parser.getboolean("SETTINGS", key, fallback=def_val)
-                    if old_key and parser.has_option("SETTINGS", old_key):
-                        return parser.getboolean("SETTINGS", old_key, fallback=def_val)
+                    if old_key:
+                        old_keys = [old_key] if isinstance(old_key, str) else old_key
+                        for ok in old_keys:
+                            if parser.has_option("SETTINGS", ok):
+                                return parser.getboolean("SETTINGS", ok, fallback=def_val)
                     return def_val
 
                 def _get_float(key, old_key, def_val):
@@ -277,11 +287,13 @@ class ANPRViewerApp:
                 cfg = {
                     "source": parser.get("SETTINGS", "source", fallback="0").strip().strip('\'"'),
                     "autostart_os_and_play": _get_bool("autostart_os_and_play", None, False),
-                    "delete_older_days": _get_float("delete_older_days", None, 1.0),
+                    "delete_older_days": _get_float("delete_older_days", None, 5.0),
 
                     # plates_
                     "plates_on": _get_bool("plates_on", None, True),
+                    "plates_show_boxes": _get_bool("plates_show_boxes", None, True),
                     "plates_debug": _get_bool("plates_debug", None, False),
+                    "plates_det_thresh": _get_float("plates_det_thresh", None, 0.18),
                     "plates_min_percent_to_save": _get_int("plates_min_percent_to_save", "min_percent_to_save", 80),
                     "plates_sleep_time_after_save": _get_float("plates_sleep_time_after_save", "sleep_time_after_save", 5.0),
                     "plates_view_time": _get_int("plates_view_time", "view_plate_time", 30),
@@ -293,13 +305,15 @@ class ANPRViewerApp:
 
                     # faces_
                     "faces_on": _get_bool("faces_on", None, True),
-                    "faces_min_similarity": _get_float("faces_min_similarity", "face_min_similarity", 0.7),
+                    "faces_show_boxes": _get_bool("faces_show_boxes", None, True),
+                    "faces_min_similarity": _get_float("faces_min_similarity", "face_min_similarity", 0.48),
                     "faces_det_thresh": _get_float("faces_det_thresh", "face_det_thresh", 0.45),
+                    "faces_min_size": _get_int("faces_min_size", "face_min_size", 20),
 
                     # people_
                     "people_on": _get_bool("people_on", None, True),
-                    "people_detect_transport": _get_bool("people_detect_transport", "people_detect_vehicles", False),
-                    "people_detect_vehicles": _get_bool("people_detect_transport", "people_detect_vehicles", False),
+                    "people_show_boxes": _get_bool("people_show_boxes", None, True),
+                    "people_detect_transport": _get_bool("people_detect_transport", ["people_detect_vehicles", "people_vehicles_on"], True),
                     "people_det_thresh": _get_float("people_det_thresh", "person_det_thresh", 0.45),
                     "people_timer_ms": _get_int("people_timer_ms", "person_timer_ms", 1000)
                 }
@@ -317,14 +331,15 @@ class ANPRViewerApp:
                 cfg["rect_scale_user_height"] = cfg["plates_rect_user_height"]
                 cfg["face_min_similarity"] = cfg["faces_min_similarity"]
                 cfg["face_det_thresh"] = cfg["faces_det_thresh"]
+                cfg["face_min_size"] = cfg["faces_min_size"]
                 cfg["person_det_thresh"] = cfg["people_det_thresh"]
                 cfg["person_timer_ms"] = cfg["people_timer_ms"]
 
                 needs_saving = False
                 for key, val in defaults.items():
                     if not parser.has_option("SETTINGS", key):
-                        parser.set("SETTINGS", key, str(cfg.get(key, val)).lower() if isinstance(val, bool) else str(cfg.get(key, val)))
                         needs_saving = True
+                        break
 
                 if needs_saving:
                     self._save_config_ini(cfg)
@@ -340,11 +355,13 @@ class ANPRViewerApp:
         parser["SETTINGS"] = {
             "source": str(data.get("source", "0")),
             "autostart_os_and_play": str(data.get("autostart_os_and_play", False)).lower(),
-            "delete_older_days": str(data.get("delete_older_days", 1)),
+            "delete_older_days": str(data.get("delete_older_days", 5.0)),
 
             # plates_
             "plates_on": str(data.get("plates_on", True)).lower(),
+            "plates_show_boxes": str(data.get("plates_show_boxes", True)).lower(),
             "plates_debug": str(data.get("plates_debug", False)).lower(),
+            "plates_det_thresh": str(data.get("plates_det_thresh", 0.18)),
             "plates_min_percent_to_save": str(data.get("plates_min_percent_to_save", data.get("min_percent_to_save", 80))),
             "plates_sleep_time_after_save": str(data.get("plates_sleep_time_after_save", data.get("sleep_time_after_save", 5.0))),
             "plates_view_time": str(data.get("plates_view_time", data.get("view_plate_time", 30))),
@@ -356,16 +373,20 @@ class ANPRViewerApp:
 
             # faces_
             "faces_on": str(data.get("faces_on", True)).lower(),
-            "faces_min_similarity": str(data.get("faces_min_similarity", data.get("face_min_similarity", 0.7))),
+            "faces_show_boxes": str(data.get("faces_show_boxes", True)).lower(),
+            "faces_min_similarity": str(data.get("faces_min_similarity", data.get("face_min_similarity", 0.48))),
             "faces_det_thresh": str(data.get("faces_det_thresh", data.get("face_det_thresh", 0.45))),
+            "faces_min_size": str(int(data.get("faces_min_size", data.get("face_min_size", 20)))),
 
             # people_
             "people_on": str(data.get("people_on", True)).lower(),
+            "people_show_boxes": str(data.get("people_show_boxes", True)).lower(),
+            "people_detect_transport": str(data.get("people_detect_transport", data.get("people_detect_vehicles", True))).lower(),
             "people_det_thresh": str(data.get("people_det_thresh", data.get("person_det_thresh", 0.45))),
             "people_timer_ms": str(int(data.get("people_timer_ms", data.get("person_timer_ms", 1000))))
         }
         try:
-            with open(self.config_ini_path, "w", encoding="utf-8") as f:
+            with open(self.config_ini_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write("; ANPR, Face & People Video Monitor Configuration\n")
                 f.write("; -------------------------------------------------------------\n")
                 f.write("; ЗАГАЛЬНІ НАЛАШТУВАННЯ:\n")
@@ -375,7 +396,9 @@ class ANPRViewerApp:
                 f.write(";\n")
                 f.write("; МОДУЛЬ НОМЕРІВ (plates_):\n")
                 f.write("; plates_on: true / false (фіксація номерних знаків)\n")
+                f.write("; plates_show_boxes: true / false (відображення рамок номерів на відео)\n")
                 f.write("; plates_debug: true / false (збереження текстових дебаг-логів)\n")
+                f.write("; plates_det_thresh: поріг детекції номерів (0.18)\n")
                 f.write("; plates_min_percent_to_save: мінімальна точність розпізнавання для збереження (%)\n")
                 f.write("; plates_sleep_time_after_save: таймаут ігнорування дублікатів того самого номера (с)\n")
                 f.write("; plates_view_time: час збереження номера на екрані (с)\n")
@@ -384,13 +407,17 @@ class ANPRViewerApp:
                 f.write(";\n")
                 f.write("; МОДУЛЬ ОБЛИЧ (faces_):\n")
                 f.write("; faces_on: true / false (фіксація облич)\n")
-                f.write("; faces_min_similarity: поріг схожості векторів облич (0.7 = 70%)\n")
+                f.write("; faces_show_boxes: true / false (відображення рамок та підписів облич на відео)\n")
+                f.write("; faces_min_similarity: поріг схожості векторів облич (0.48 = 48%, оптимально 0.45-0.50 для різних ракурсів)\n")
                 f.write("; faces_det_thresh: поріг детекції облич\n")
+                f.write("; faces_min_size: мінімальний розмір обличчя в пікселях (20 для віддалених камер, 45 стандарт)\n")
                 f.write(";\n")
-                f.write("; МОДУЛЬ ЛЮДЕЙ (people_):\n")
-                f.write("; people_on: true / false (фіксація людей та скріншоти)\n")
-                f.write("; people_det_thresh: поріг детекції людей (0.45)\n")
-                f.write("; people_timer_ms: інтервал створення скріншотів людей (мс, за замовчуванням 1000)\n")
+                f.write("; МОДУЛЬ ЛЮДЕЙ ТА ТРАНСПОРТУ (people_):\n")
+                f.write("; people_on: true / false (фіксація людей/транспорту та скріншоти)\n")
+                f.write("; people_show_boxes: true / false (відображення рамок людей та транспорту на відео)\n")
+                f.write("; people_detect_transport: true / false (детекція транспортних засобів: авто, автобуси, вантажівки, мотоцикли тощо)\n")
+                f.write("; people_det_thresh: поріг детекції людей та транспорту (0.45)\n")
+                f.write("; people_timer_ms: інтервал створення скріншотів (мс, за замовчуванням 1000)\n")
                 f.write("; -------------------------------------------------------------\n\n")
                 parser.write(f)
         except Exception:
@@ -401,7 +428,7 @@ class ANPRViewerApp:
         self.config["plates_rect_user_left"] = self.roi_user_left
         self.config["plates_rect_user_width"] = self.roi_user_width
         self.config["plates_rect_user_height"] = self.roi_user_height
-        self._save_config_ini(self.config)
+        self.config["rect_scale_user_top"] = self.roi_user_top
         self.config["rect_scale_user_left"] = self.roi_user_left
         self.config["rect_scale_user_width"] = self.roi_user_width
         self.config["rect_scale_user_height"] = self.roi_user_height
@@ -1092,9 +1119,9 @@ class ANPRViewerApp:
     def _show_help(self):
         help_text = (
             "ANPR, Face & People Video Monitor (Modular Architecture)\n\n"
-            f"• Фіксація номерів (plates_ON): {self.plates_on}\n"
-            f"• Фіксація облич (faces_ON): {self.faces_on}\n"
-            f"• Фіксація людей/транспорту (people_ON): {self.people_on} (транспорт: {self.people_detect_transport})\n"
+            f"• Фіксація номерів (plates_ON): {self.plates_on} (рамки: {self.plates_show_boxes})\n"
+            f"• Фіксація облич (faces_ON): {self.faces_on} (рамки: {self.faces_show_boxes})\n"
+            f"• Фіксація людей/транспорту (people_ON): {self.people_on} (транспорт: {self.people_detect_transport}, рамки: {self.people_show_boxes})\n"
             "• Детекція номерів: best.onnx (640x640) + CCT OCR\n"
             "• Детекція облич: SCRFD / InsightFace + AdaFace/MBF (112x112)\n"
             "• Детекція людей та транспорту: yolo11n.onnx (640x640)\n"
@@ -1236,38 +1263,41 @@ class ANPRViewerApp:
                 plate_time = self.last_plate_time
 
             # Зелені рамки номерних знаків
-            for (bx1, by1, bx2, by2) in plate_boxes_to_draw:
-                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+            if self.plates_show_boxes:
+                for (bx1, by1, bx2, by2) in plate_boxes_to_draw:
+                    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 1)
 
             # Рамки виявлених людей та транспорту
-            for item in person_boxes_to_draw:
-                if len(item) == 3:
-                    (px1, py1, px2, py2), p_pct, p_label = item
-                else:
-                    (px1, py1, px2, py2), p_pct = item
-                    p_label = "Person"
+            if self.people_show_boxes:
+                for item in person_boxes_to_draw:
+                    if len(item) == 3:
+                        (px1, py1, px2, py2), p_pct, p_label = item
+                    else:
+                        (px1, py1, px2, py2), p_pct = item
+                        p_label = "Person"
 
-                is_person = p_label.lower() == "person"
-                # Помаранчевий для людей, золотистий/жовтий для авто й транспорту
-                box_color = (0, 165, 255) if is_person else (0, 215, 255)
-                cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, 2)
-                p_tag = f"{p_label} {p_pct}%"
-                cv2.putText(frame, p_tag, (px1, max(18, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+                    is_person = p_label.lower() == "person"
+                    # Помаранчевий для людей, золотистий/жовтий для авто й транспорту
+                    box_color = (0, 165, 255) if is_person else (0, 215, 255)
+                    cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, 1)
+                    p_tag = f"{p_label} {p_pct}%"
+                    cv2.putText(frame, p_tag, (px1, max(18, py1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
             # Блакитні рамки облич з підписом
-            for ((fx1, fy1, fx2, fy2), f_name, f_pct) in face_boxes_to_draw:
-                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 200, 0), 2)
-                
-                # Безпечна обробка: f_pct може бути 'NEW', '64%', числовим значенням або ''
-                pct_str = str(f_pct).strip()
-                if pct_str == "NEW":
-                    tag = f"{f_name} [NEW]"
-                elif pct_str:
-                    tag = f"{f_name} {pct_str}" if pct_str.endswith("%") else f"{f_name} {pct_str}%"
-                else:
-                    tag = f"{f_name}"
-                
-                cv2.putText(frame, tag, (fx1, max(18, fy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+            if self.faces_show_boxes:
+                for ((fx1, fy1, fx2, fy2), f_name, f_pct) in face_boxes_to_draw:
+                    cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 200, 0), 1)
+                    
+                    # Безпечна обробка: f_pct може бути 'NEW', '64%', числовим значенням або ''
+                    pct_str = str(f_pct).strip()
+                    if pct_str == "NEW":
+                        tag = f"{f_name} [NEW]"
+                    elif pct_str:
+                        tag = f"{f_name} {pct_str}" if pct_str.endswith("%") else f"{f_name} {pct_str}%"
+                    else:
+                        tag = f"{f_name}"
+                    
+                    cv2.putText(frame, tag, (fx1, max(18, fy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
 
             # Оверлей останнього зафіксованого номера у правому верхньому кутку
             if plate_img is not None and (now - plate_time < self.view_plate_time):
@@ -1286,14 +1316,14 @@ class ANPRViewerApp:
 
                     display_img = cv2.resize(plate_img, (target_ov_w, target_ov_h), interpolation=cv2.INTER_LINEAR)
                     dw, dh = display_img.shape[1], display_img.shape[0]
-                    border = 3
+                    border = 2
                     x2_ov = frame_w - margin
                     x1_ov = x2_ov - dw
                     y1_ov = margin
                     y2_ov = y1_ov + dh
 
                     if x1_ov > 0 and y2_ov < frame_h:
-                        cv2.rectangle(frame, (x1_ov - border, y1_ov - border), (x2_ov + border, y2_ov + border), (0, 255, 0), 2)
+                        cv2.rectangle(frame, (x1_ov - border, y1_ov - border), (x2_ov + border, y2_ov + border), (0, 255, 0), 1)
                         frame[y1_ov:y2_ov, x1_ov:x2_ov] = display_img
 
             with self.frame_lock:
