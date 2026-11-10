@@ -227,6 +227,10 @@ class ANPRViewerApp:
         self.arch_speed = 1
         self.arch_after_id = None
         self.arch_seeking = False
+        self._arch_click_after_id = None
+        self._ignore_release_tag = None
+        self._ignore_release_ts = 0.0
+        self.roi_visible = False
 
         # Повноекранне вікно перегляду (на поточному моніторі)
         self.fs_win = None
@@ -285,11 +289,39 @@ class ANPRViewerApp:
         s_to = d_to.strftime("%Y-%m-%d") if d_to else "..."
         return f"{s_from} → {s_to}"
 
+    def _get_virtual_screen_bounds(self):
+        """Повертає (x, y, w, h) віртуального робочого столу через усі підключені монітори."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                u32 = ctypes.windll.user32
+                vx = int(u32.GetSystemMetrics(76))  # SM_XVIRTUALSCREEN
+                vy = int(u32.GetSystemMetrics(77))  # SM_YVIRTUALSCREEN
+                vw = int(u32.GetSystemMetrics(78))  # SM_CXVIRTUALSCREEN
+                vh = int(u32.GetSystemMetrics(79))  # SM_CYVIRTUALSCREEN
+                if vw > 0 and vh > 0:
+                    return vx, vy, vw, vh
+            except Exception:
+                pass
+        return 0, 0, max(640, self.root.winfo_screenwidth()), max(480, self.root.winfo_screenheight())
+
+    def _clamp_roi_to_virtual_screen(self):
+        """Коригує координати вікна кропу лише якщо воно повністю за межами усіх моніторів."""
+        vx, vy, vw, vh = self._get_virtual_screen_bounds()
+        min_x = vx - max(0, self.roi_user_width - 80)
+        max_x = vx + vw - 80
+        min_y = vy
+        max_y = vy + vh - 40
+        if self.roi_user_left < min_x or self.roi_user_left > max_x:
+            self.roi_user_left = max(vx, min(self.roi_user_left, vx + vw - self.roi_user_width))
+        if self.roi_user_top < min_y or self.roi_user_top > max_y:
+            self.roi_user_top = max(vy, min(self.roi_user_top, vy + vh - self.roi_user_height))
+
     def _get_current_monitor_geometry(self, widget=None):
         """Визначає (x, y, width, height) саме того монітора, на якому знаходиться вікно/віджет."""
         target = widget if widget is not None else self.root
         try:
-            self.root.update_idletasks()
+            target.update_idletasks()
         except Exception:
             pass
 
@@ -315,8 +347,28 @@ class ANPRViewerApp:
                     ]
 
                 user32 = ctypes.windll.user32
-                hwnd = target.winfo_id()
-                hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+                hmon = 0
+                try:
+                    if target is self.roi_panel and self.roi_visible:
+                        rx = int(target.winfo_x())
+                        ry = int(target.winfo_y())
+                        rw = max(1, int(target.winfo_width()))
+                        rh = max(1, int(target.winfo_height()))
+                    else:
+                        rx = int(target.winfo_rootx())
+                        ry = int(target.winfo_rooty())
+                        rw = int(target.winfo_width())
+                        rh = int(target.winfo_height())
+                    if rw > 1 and rh > 1:
+                        rc_target = RECT(rx, ry, rx + rw, ry + rh)
+                        hmon = user32.MonitorFromRect(ctypes.byref(rc_target), 2)
+                except Exception:
+                    hmon = 0
+
+                if not hmon:
+                    hwnd = target.winfo_id()
+                    hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+
                 if hmon:
                     mi = MONITORINFO()
                     mi.cbSize = ctypes.sizeof(MONITORINFO)
@@ -549,6 +601,21 @@ class ANPRViewerApp:
             ";",
             "; ---------------------------------------------------------------------",
             "; 1. МОДУЛЬ НОМЕРІВ (plates_):",
+            ";   Призначення : автоматичне виявлення автомобільних номерних знаків у кадрі,",
+            ";                 розпізнавання тексту (OCR) та формування фотоархіву проїздів.",
+            ";   Що робить   : знаходить номери, вирівнює перспективу, розпізнає символи,",
+            ";                 веде трекінг між кадрами, обирає найрізкіший кадр з узгодженим",
+            ";                 текстом (Majority Voting) і показує збільшений номер у кутку відео.",
+            ";                 Зберігає у plates/YYYY-MM-DD/: кроп номера (*_plate_ТЕКСТ_ХХ%.jpg),",
+            ";                 повний кадр (*_full.jpg) та опційно детальний лог (*_debug.txt).",
+            ";   Коли робить : працює під час відеопотоку (у межах дат plates_date_from..to).",
+            ";                 Збереження виконується у 3 випадках (при різкості >= 28):",
+            ";                 1) пікове розпізнавання (точність >= 96%, різкість >= 45, >= 8 символів, >= 3 кадри);",
+            ";                 2) виїзд авто з кадру (відсутність у треку > 1.2 сек);",
+            ";                 3) натискання 'Стоп', закриття програми або завершення періоду дат.",
+            ";                 Повтори того самого номера ігноруються протягом plates_sleep_time_after_save.",
+            ";",
+            ";   Параметри:",
             ";   plates_on                    : true / false (увімкнути розпізнавання номерних знаків)",
             ";   plates_show_boxes            : true / false (показувати зелені рамки навколо номерів)",
             ";   plates_debug                 : true / false (збереження текстових логів *_debug.txt)",
@@ -563,6 +630,20 @@ class ANPRViewerApp:
             ";",
             "; ---------------------------------------------------------------------",
             "; 2. МОДУЛЬ ОБЛИЧ (faces_):",
+            ";   Призначення : виявлення облич людей у кадрі, біометричне розпізнавання",
+            ";                 (ідентифікація) та ведення бази відомих персон.",
+            ";   Що робить   : знаходить фронтальні обличчя, вирівнює їх, об'єднує вектори",
+            ";                 найкращих кадрів (Multi-Shot Fusion) і звіряє з базою faces/faces.txt",
+            ";                 (або реєструє нову особу ID_XXXX). Зберігає у faces/YYYY-MM-DD/",
+            ";                 кроп обличчя (*_face_*.jpg) та повний кадр (*_full.jpg). Якщо особі",
+            ";                 в інтерфейсі встановлено 'Ігнорувати', фото на диск не зберігаються.",
+            ";   Коли робить : працює під час відеопотоку (у межах дат faces_date_from..to).",
+            ";                 Фіксація і збереження виконуються у 3 випадках (при різкості >= 25):",
+            ";                 1) пікова якість (різкість >= 40 та >= 6 кадрів у треку);",
+            ";                 2) вихід людини з кадру (відсутність > 2.0 сек);",
+            ";                 3) натискання 'Стоп', закриття програми або завершення періоду дат.",
+            ";",
+            ";   Параметри:",
             ";   faces_on                     : true / false (увімкнути розпізнавання облич)",
             ";   faces_show_boxes             : true / false (показувати блакитні рамки та підписи облич)",
             ";   faces_min_similarity         : поріг схожості векторів облич (0.48 = 48%, оптимально 0.45-0.50)",
@@ -573,6 +654,16 @@ class ANPRViewerApp:
             ";",
             "; ---------------------------------------------------------------------",
             "; 3. МОДУЛЬ ЛЮДЕЙ ТА ТРАНСПОРТУ (people_):",
+            ";   Призначення : контроль появи людей і (опційно) транспорту в полі зору камери",
+            ";                 з регулярною зйомкою чистих скріншотів без рамок.",
+            ";   Що робить   : детектує людей (Person) та транспорт (Car, Bus, Truck, Motorcycle)",
+            ";                 моделлю YOLO11n, показує рамки (якщо people_show_boxes = true) та",
+            ";                 зберігає чисті повнорозмірні скріншоти в папку people/YYYY-MM-DD/.",
+            ";   Коли робить : перевіряє кожен AI-кадр під час потоку (у межах people_date_from..to).",
+            ";                 Скріншот записується на диск, коли в кадрі є хоча б один шуканий",
+            ";                 об'єкт і з попереднього знімка минуло >= people_timer_ms мілісекунд.",
+            ";",
+            ";   Параметри:",
             ";   people_on                    : true / false (увімкнути детекцію людей/транспорту та скріншоти)",
             ";   people_show_boxes            : true / false (показувати рамки людей та транспорту на відео)",
             ";   people_detect_transport      : true / false (також фіксувати авто, автобуси, вантажівки, мото)",
@@ -583,6 +674,17 @@ class ANPRViewerApp:
             ";",
             "; ---------------------------------------------------------------------",
             "; 4. МОДУЛЬ ВІДЕОЗАПИСУ (video_):",
+            ";   Призначення : безперервний фоновий відеоархів потоку з камери у форматі MP4",
+            ";                 без накладених рамок детекції та підписів.",
+            ";   Що робить   : у фоновому потоці кодує чисті кадри через imageio-ffmpeg (libx264,",
+            ";                 preset ultrafast) або резервний mp4v із заданою частотою кадрів та",
+            ";                 зберігає файли у video/YYYY-MM-DD/HH-MM-SS.mp4 (час старту запису).",
+            ";   Коли робить : записує безперервно під час активного потоку (у межах video_date_from..to).",
+            ";                 Кожні video_duration_min хвилин автоматично завершує поточний файл",
+            ";                 і починає наступний; також коректно фіналізує активний фрагмент",
+            ";                 при натисканні 'Стоп', виході з програми або завершенні періоду дат.",
+            ";",
+            ";   Параметри:",
             ";   video_on                     : true / false (увімкнути фоновий запис чистого відео без рамок)",
             ";   video_duration_min           : тривалість одного відеофайлу-фрагмента у хвилинах (за замовч. 5)",
             ";   video_fps                    : частота кадрів запису (за замовч. 15 к/с)",
@@ -871,7 +973,7 @@ class ANPRViewerApp:
         self.screen_canvas.bind(EVT_BTN_PRESS, self._on_screen_canvas_press)
         self.screen_canvas.bind(EVT_B1_MOTION, self._on_screen_canvas_motion)
         self.screen_canvas.bind(EVT_BTN_RELEASE, self._on_screen_canvas_release)
-        self.screen_canvas.bind(EVT_DOUBLE_CLICK, lambda e: self._open_fullscreen_preview(crop_mode=False, source_widget=self.screen_canvas))
+        self.screen_canvas.bind(EVT_DOUBLE_CLICK, self._on_screen_canvas_double_click)
 
         # Панель керування вбудованим відеоплеєром (показується лише у вкладці "Відео")
         self.video_controls_frame = tk.Frame(self.preview_container, bg="#1b1b26", padx=4, pady=4)
@@ -941,10 +1043,17 @@ class ANPRViewerApp:
         self.main_video_label.bind(EVT_BTN_PRESS, self._on_video_area_click)
         self.video_container.bind(EVT_BTN_PRESS, self._on_video_area_click)
 
-        # Інтерактивне вікно ROI (кроп зі скрінів або живий кроп відео)
-        self.roi_panel = tk.Frame(self.video_container, bg="#16161e", bd=2, relief=tk.SOLID, highlightbackground="#00ff00", highlightthickness=1)
+        # Інтерактивне плаваюче вікно ROI (можна вільно переносити поверх елементів і на інший монітор)
+        self.roi_panel = tk.Toplevel(self.root, bg="#00ff00")
+        self.roi_panel.overrideredirect(True)
+        self.roi_panel.transient(self.root)
+        self.roi_panel.protocol("WM_DELETE_WINDOW", self._hide_roi_panel)
+        self.roi_panel.withdraw()
 
-        self.roi_header = tk.Frame(self.roi_panel, bg="#20202c", padx=6, pady=3, cursor="fleur")
+        self.roi_inner = tk.Frame(self.roi_panel, bg="#16161e")
+        self.roi_inner.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        self.roi_header = tk.Frame(self.roi_inner, bg="#20202c", padx=6, pady=3, cursor="fleur")
         self.roi_header.pack(fill=tk.X, side=tk.TOP)
 
         self.roi_title_lbl = tk.Label(self.roi_header, text="Виділена область", fg="#00e5ff", bg="#20202c", font=("Segoe UI", 9, "bold"), cursor="fleur")
@@ -972,11 +1081,12 @@ class ANPRViewerApp:
             w.bind(EVT_B1_MOTION, self._on_roi_drag_motion)
             w.bind(EVT_BTN_RELEASE, self._on_roi_drag_release)
 
-        self.roi_img_label = tk.Label(self.roi_panel, bg="#0d0d11", cursor="hand2")
+        self.roi_img_label = tk.Label(self.roi_inner, bg="#0d0d11", cursor="hand2")
         self.roi_img_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.roi_img_label.bind(EVT_DOUBLE_CLICK, lambda e: self._open_fullscreen_preview(crop_mode=True, source_widget=self.roi_panel))
+        self.roi_img_label.bind(EVT_BTN_RELEASE, self._on_roi_img_click)
+        self.roi_img_label.bind(EVT_DOUBLE_CLICK, self._on_roi_img_double_click)
 
-        self.roi_resize_grip = tk.Label(self.roi_panel, text="◢", fg="#00e5ff", bg="#16161e", font=("Segoe UI", 10, "bold"), cursor="sizing")
+        self.roi_resize_grip = tk.Label(self.roi_inner, text="◢", fg="#00e5ff", bg="#16161e", font=("Segoe UI", 10, "bold"), cursor="sizing")
         self.roi_resize_grip.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-1, y=-1)
         self.roi_resize_grip.bind(EVT_BTN_PRESS, self._on_roi_resize_start)
         self.roi_resize_grip.bind(EVT_B1_MOTION, self._on_roi_resize_motion)
@@ -1054,22 +1164,81 @@ class ANPRViewerApp:
         self.items_tree.see(target)
         self._on_item_selected(None)
 
+    def _cancel_single_click_play_toggle(self):
+        if getattr(self, "_arch_click_after_id", None) is not None:
+            try:
+                self.root.after_cancel(self._arch_click_after_id)
+            except Exception:
+                pass
+            self._arch_click_after_id = None
+
+    def _mark_double_click(self, tag=None):
+        self._cancel_single_click_play_toggle()
+        if tag:
+            self._ignore_release_tag = tag
+            self._ignore_release_ts = time.time()
+
+    def _schedule_single_click_play_toggle(self, tag=None):
+        self._cancel_single_click_play_toggle()
+        if self.sidebar_mode != "video" or self.arch_cap is None:
+            return
+        if tag and getattr(self, "_ignore_release_tag", None) == tag and (time.time() - getattr(self, "_ignore_release_ts", 0.0)) < 0.35:
+            self._ignore_release_tag = None
+            return
+        self._arch_click_after_id = self.root.after(220, self._run_single_click_play_toggle)
+
+    def _run_single_click_play_toggle(self):
+        self._arch_click_after_id = None
+        if self.sidebar_mode == "video" and self.arch_cap is not None:
+            self._toggle_arch_play()
+
+    def _on_screen_canvas_double_click(self, event=None):
+        self._mark_double_click("screen_canvas")
+        self._open_fullscreen_preview(crop_mode=False, source_widget=self.screen_canvas)
+
+    def _on_roi_img_click(self, event=None):
+        self._schedule_single_click_play_toggle("roi_img")
+
+    def _on_roi_img_double_click(self, event=None):
+        self._mark_double_click("roi_img")
+        self._open_fullscreen_preview(crop_mode=True, source_widget=self.roi_panel)
+
     def _on_video_area_click(self, event=None):
-        if hasattr(self, "roi_panel") and self.roi_panel.winfo_ismapped():
-            self._hide_roi_panel()
+        if not self.roi_visible:
+            return
+        # Не закриваємо плаваюче вікно кропу, якщо його перенесли на інший монітор або за межі зони основного відео
+        try:
+            vx = self.video_container.winfo_rootx()
+            vy = self.video_container.winfo_rooty()
+            vw = self.video_container.winfo_width()
+            vh = self.video_container.winfo_height()
+            rx = self.roi_panel.winfo_x()
+            ry = self.roi_panel.winfo_y()
+            rw = self.roi_panel.winfo_width()
+            rh = self.roi_panel.winfo_height()
+            cx = rx + rw // 2
+            cy = ry + rh // 2
+            if vx <= cx <= (vx + vw) and vy <= cy <= (vy + vh):
+                self._hide_roi_panel()
+        except Exception:
+            pass
 
     def _on_roi_drag_start(self, event):
         self._drag_start_x = event.x_root
         self._drag_start_y = event.y_root
-        self._orig_left = self.roi_user_left
-        self._orig_top = self.roi_user_top
+        try:
+            self._orig_left = int(self.roi_panel.winfo_x())
+            self._orig_top = int(self.roi_panel.winfo_y())
+        except Exception:
+            self._orig_left = self.roi_user_left
+            self._orig_top = self.roi_user_top
 
     def _on_roi_drag_motion(self, event):
         dx = event.x_root - self._drag_start_x
         dy = event.y_root - self._drag_start_y
-        self.roi_user_left = max(0, self._orig_left + dx)
-        self.roi_user_top = max(0, self._orig_top + dy)
-        self.roi_panel.place(x=self.roi_user_left, y=self.roi_user_top, width=self.roi_user_width, height=self.roi_user_height)
+        self.roi_user_left = int(self._orig_left + dx)
+        self.roi_user_top = int(self._orig_top + dy)
+        self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
 
     def _on_roi_drag_release(self, event):
         self._save_roi_geometry_to_config()
@@ -1085,7 +1254,7 @@ class ANPRViewerApp:
         dy = event.y_root - self._resize_start_y
         self.roi_user_width = max(180, self._orig_w + dx)
         self.roi_user_height = max(120, self._orig_h + dy)
-        self.roi_panel.place(x=self.roi_user_left, y=self.roi_user_top, width=self.roi_user_width, height=self.roi_user_height)
+        self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
         self._render_current_roi_crop()
 
     def _on_roi_resize_release(self, event):
@@ -1437,7 +1606,7 @@ class ANPRViewerApp:
                 crop_bgr = self._extract_roi_bgr(cv_img, self.current_roi_coords)
                 if crop_bgr is not None:
                     self.last_roi_crop_bgr = crop_bgr
-                    if self.roi_panel.winfo_ismapped():
+                    if self.roi_visible or self.roi_panel.winfo_ismapped():
                         self._render_current_roi_crop()
             else:
                 self.screen_canvas.delete("roi_rect")
@@ -1465,7 +1634,7 @@ class ANPRViewerApp:
             cv_img = cv2.imread(screen_path)
             if cv_img is None:
                 return
-            keep = bool(self.current_roi_coords is not None and (self.roi_panel.winfo_ismapped() or (self.fs_win is not None and self.fs_win.winfo_exists())))
+            keep = bool(self.current_roi_coords is not None and (self.roi_visible or self.roi_panel.winfo_ismapped() or (self.fs_win is not None and self.fs_win.winfo_exists())))
             if not keep:
                 self._hide_roi_panel(clear_coords=True)
             self._display_cv_in_screen_canvas(cv_img, keep_roi=keep)
@@ -1509,6 +1678,7 @@ class ANPRViewerApp:
             self.fs_btn_play.configure(text=icon, bg=bg)
 
     def _stop_archive_player(self):
+        self._cancel_single_click_play_toggle()
         self.arch_playing = False
         if self.arch_after_id is not None:
             try:
@@ -1577,7 +1747,7 @@ class ANPRViewerApp:
 
         ret, frame = cap.read()
         if ret and frame is not None:
-            keep = bool(self.current_roi_coords is not None and (self.roi_panel.winfo_ismapped() or (self.fs_win is not None and self.fs_win.winfo_exists())))
+            keep = bool(self.current_roi_coords is not None and (self.roi_visible or self.roi_panel.winfo_ismapped() or (self.fs_win is not None and self.fs_win.winfo_exists())))
             self._display_cv_in_screen_canvas(frame, keep_roi=keep)
         else:
             cap.release()
@@ -1783,6 +1953,7 @@ class ANPRViewerApp:
         sel_w = x2 - x1
         sel_h = y2 - y1
         if not was_dragged or sel_w < 4 or sel_h < 4:
+            self._schedule_single_click_play_toggle("screen_canvas")
             return
 
         orig_h, orig_w = self.current_screen_img_cv.shape[:2]
@@ -1803,8 +1974,14 @@ class ANPRViewerApp:
         self.last_roi_crop_bgr = crop_bgr
         self._draw_roi_rect_on_screen_canvas()
         if open_panel:
-            self.roi_panel.place(x=self.roi_user_left, y=self.roi_user_top, width=self.roi_user_width, height=self.roi_user_height)
+            self._clamp_roi_to_virtual_screen()
+            self.roi_visible = True
+            self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
+            self.roi_panel.deiconify()
             self.roi_panel.lift()
+            if self.fs_win is not None and self.fs_win.winfo_exists():
+                self.fs_win.lift()
+            self.roi_panel.update_idletasks()
             self._render_current_roi_crop()
         if self.fs_win is not None and self.fs_win.winfo_exists():
             self._sync_fs_controls_visibility()
@@ -1832,7 +2009,11 @@ class ANPRViewerApp:
         self.roi_title_lbl.configure(text=f"{prefix} ({w}x{h})")
 
     def _hide_roi_panel(self, clear_coords=True):
-        self.roi_panel.place_forget()
+        self.roi_visible = False
+        try:
+            self.roi_panel.withdraw()
+        except Exception:
+            pass
         if clear_coords:
             self.current_roi_coords = None
             self.last_roi_crop_bgr = None
@@ -1865,7 +2046,7 @@ class ANPRViewerApp:
         win = tk.Toplevel(self.root)
         win.configure(bg="#0a0a0e")
         win.overrideredirect(True)
-        win.geometry(f"{mw}x{mh}{mx:+d}{my:+d}")
+        win.geometry(f"{mw}x{mh}+{mx}+{my}")
         win.transient(self.root)
         win.lift()
         win.focus_force()
@@ -2020,7 +2201,7 @@ class ANPRViewerApp:
         self.fs_canvas.bind(EVT_BTN_PRESS, self._on_fs_canvas_press)
         self.fs_canvas.bind(EVT_B1_MOTION, self._on_fs_canvas_motion)
         self.fs_canvas.bind(EVT_BTN_RELEASE, self._on_fs_canvas_release)
-        self.fs_canvas.bind(EVT_DOUBLE_CLICK, lambda e: self._close_fullscreen_preview())
+        self.fs_canvas.bind(EVT_DOUBLE_CLICK, self._on_fs_canvas_double_click)
         self.fs_canvas.bind(EVT_MOUSEWHEEL, self._on_preview_mousewheel)
         self.fs_canvas.bind(EVT_BTN4, self._on_preview_mousewheel)
         self.fs_canvas.bind(EVT_BTN5, self._on_preview_mousewheel)
@@ -2043,6 +2224,9 @@ class ANPRViewerApp:
         else:
             self.fs_btn_crop_mode.pack_forget()
             self.fs_btn_clear_crop.pack_forget()
+
+        if self.fs_canvas is not None:
+            self.fs_canvas.configure(cursor="hand2" if self.fs_crop_mode else "cross")
 
         if self.sidebar_mode == "video" and self.arch_cap is not None:
             if not self.fs_controls.winfo_ismapped():
@@ -2129,8 +2313,17 @@ class ANPRViewerApp:
         self._sync_fs_controls_visibility()
         self._render_fullscreen_content()
 
+    def _on_fs_canvas_double_click(self, event=None):
+        self._mark_double_click("fs_canvas")
+        self._close_fullscreen_preview()
+
     def _on_fs_canvas_press(self, event):
-        if self.current_screen_img_cv is None or self.fs_crop_mode:
+        if self.current_screen_img_cv is None:
+            return
+        if self.fs_crop_mode:
+            self.fs_drag_start_x = event.x
+            self.fs_drag_start_y = event.y
+            self.fs_drag_moved = False
             return
         self.fs_drag_start_x = max(self.fs_img_offset_x, min(self.fs_img_offset_x + self.fs_disp_w, event.x))
         self.fs_drag_start_y = max(self.fs_img_offset_y, min(self.fs_img_offset_y + self.fs_disp_h, event.y))
@@ -2152,7 +2345,14 @@ class ANPRViewerApp:
             self.fs_canvas.tag_raise("fs_roi_drag")
 
     def _on_fs_canvas_release(self, event):
-        if self.fs_drag_start_x is None or self.fs_drag_start_y is None or self.fs_crop_mode:
+        if self.fs_crop_mode:
+            self.fs_drag_start_x = None
+            self.fs_drag_start_y = None
+            self.fs_drag_moved = False
+            self._schedule_single_click_play_toggle("fs_canvas")
+            return
+
+        if self.fs_drag_start_x is None or self.fs_drag_start_y is None:
             return
         end_x = max(self.fs_img_offset_x, min(self.fs_img_offset_x + self.fs_disp_w, event.x))
         end_y = max(self.fs_img_offset_y, min(self.fs_img_offset_y + self.fs_disp_h, event.y))
@@ -2169,6 +2369,7 @@ class ANPRViewerApp:
         self.fs_canvas.delete("fs_roi_drag")
 
         if not was_moved or (x2 - x1) < 8 or (y2 - y1) < 8 or self.current_screen_img_cv is None:
+            self._schedule_single_click_play_toggle("fs_canvas")
             return
 
         orig_h, orig_w = self.current_screen_img_cv.shape[:2]
@@ -2181,6 +2382,7 @@ class ANPRViewerApp:
         self._apply_roi_crop_coords((crop_x1, crop_y1, crop_x2, crop_y2), open_panel=True)
 
     def _close_fullscreen_preview(self):
+        self._cancel_single_click_play_toggle()
         if self.fs_win is not None:
             try:
                 self.fs_win.destroy()
@@ -2249,7 +2451,8 @@ class ANPRViewerApp:
             f"• Поріг детекції людей/транспорту: >= {int(self.people_det_thresh * 100)}%\n"
             f"• Інтервал скріншотів людей/транспорту: {self.people_timer_ms} мс\n"
             "• Збереження файлів: /plates, /faces, /people, /video (по днях YYYY-MM-DD)\n"
-            "• Повноекранний перегляд: подвійний клік по вікну перегляду / кнопкою '⛶ Розгорнути' (Esc — згорнути)\n\n"
+            "• Керування відеопереглядом: одинарний клік по відео — Пауза/Старт; подвійний клік або '⛶ Розгорнути' — повний екран (Esc — згорнути)\n"
+            "• Плаваюче вікно кропу: перетягуйте за заголовок поверх елементів або на інший монітор\n\n"
             "Гарячий вихід: Ctrl + Alt + Shift + Q"
         )
         messagebox.showinfo("Довідка", help_text)
@@ -2512,9 +2715,6 @@ class ANPRViewerApp:
             rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             self.img_main_tk = ImageTk.PhotoImage(image=Image.fromarray(rgb_frame))
             self.main_video_label.configure(image=self.img_main_tk)
-
-            if hasattr(self, "roi_panel") and self.roi_panel.winfo_ismapped():
-                self.roi_panel.lift()
 
         self.root.after(16, self._render_loop)
 
