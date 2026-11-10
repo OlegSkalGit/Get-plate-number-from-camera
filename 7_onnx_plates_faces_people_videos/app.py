@@ -36,6 +36,7 @@ EVT_DOUBLE_CLICK = "<" + "Double-1" + ">"
 EVT_BTN_PRESS = "<" + "ButtonPress-1" + ">"
 EVT_B1_MOTION = "<" + "B1-Motion" + ">"
 EVT_BTN_RELEASE = "<" + "ButtonRelease-1" + ">"
+EVT_RIGHT_CLICK = "<" + "Button-3" + ">"
 EVT_ADMIN_EXIT_UP = "<" + "Control-Alt-Shift-KeyPress-Q" + ">"
 EVT_ADMIN_EXIT_LOW = "<" + "Control-Alt-Shift-KeyPress-q" + ">"
 
@@ -105,15 +106,17 @@ class ANPRViewerApp:
             ),
         }
 
+        # Спільні параметри плаваючого вікна перегляду
+        self.roi_user_top = int(self.config.get("viewer_top", 20))
+        self.roi_user_left = int(self.config.get("viewer_left", 20))
+        self.roi_user_width = int(self.config.get("viewer_width", 360))
+        self.roi_user_height = int(self.config.get("viewer_height", 240))
+
         # Модуль номерних знаків (plates_)
         self.view_plate_time = float(self.config.get("plates_view_time", 30))
         self.min_percent_to_save = int(self.config.get("plates_min_percent_to_save", 80))
         self.sleep_time_after_save = float(self.config.get("plates_sleep_time_after_save", 5.0))
         self.rect_scale_plate = float(self.config.get("plates_rect_scale", 5.0))
-        self.roi_user_top = int(self.config.get("plates_rect_user_top", 20))
-        self.roi_user_left = int(self.config.get("plates_rect_user_left", 20))
-        self.roi_user_width = int(self.config.get("plates_rect_user_width", 360))
-        self.roi_user_height = int(self.config.get("plates_rect_user_height", 240))
 
         # Модуль облич (faces_)
         self.face_min_similarity = float(self.config.get("faces_min_similarity", 0.48))
@@ -231,20 +234,19 @@ class ANPRViewerApp:
         self._ignore_release_tag = None
         self._ignore_release_ts = 0.0
         self.roi_visible = False
-
-        # Повноекранне вікно перегляду (на поточному моніторі)
-        self.fs_win = None
-        self.fs_canvas = None
-        self.fs_photo_tk = None
-        self.fs_crop_mode = False
-        self.fs_scale_x = 1.0
-        self.fs_scale_y = 1.0
-        self.fs_img_offset_x = 0
-        self.fs_img_offset_y = 0
-        self.fs_disp_w = 1
-        self.fs_disp_h = 1
-        self.fs_drag_start_x = None
-        self.fs_drag_start_y = None
+        self.roi_crop_mode = False
+        self.roi_maximized = False
+        self.roi_scale_x = 1.0
+        self.roi_scale_y = 1.0
+        self.roi_img_offset_x = 0
+        self.roi_img_offset_y = 0
+        self.roi_disp_w = 1
+        self.roi_disp_h = 1
+        self.roi_canvas_img_id = None
+        self.roi_canvas_drag_start_x = None
+        self.roi_canvas_drag_start_y = None
+        self.roi_canvas_drag_moved = False
+        self.roi_drag_moved_win = False
 
         self.panel_visible = True
         self.hide_timer = None
@@ -438,6 +440,10 @@ class ANPRViewerApp:
         defaults = {
             "source": "0",
             "autostart_os_and_play": False,
+            "viewer_top": 20,
+            "viewer_left": 20,
+            "viewer_width": 360,
+            "viewer_height": 240,
             # plates_
             "plates_on": True,
             "plates_show_boxes": True,
@@ -447,10 +453,6 @@ class ANPRViewerApp:
             "plates_sleep_time_after_save": 5.0,
             "plates_view_time": 30,
             "plates_rect_scale": 5.0,
-            "plates_rect_user_top": 20,
-            "plates_rect_user_left": 20,
-            "plates_rect_user_width": 360,
-            "plates_rect_user_height": 240,
             "plates_delete_older_days": 0,
             "plates_date_from": "",
             "plates_date_to": "",
@@ -512,6 +514,10 @@ class ANPRViewerApp:
                 cfg = {
                     "source": _get_str("source", "0"),
                     "autostart_os_and_play": _get_bool("autostart_os_and_play", False),
+                    "viewer_top": _get_int("viewer_top", _get_int("plates_rect_user_top", 20)),
+                    "viewer_left": _get_int("viewer_left", _get_int("plates_rect_user_left", 20)),
+                    "viewer_width": _get_int("viewer_width", _get_int("plates_rect_user_width", 360)),
+                    "viewer_height": _get_int("viewer_height", _get_int("plates_rect_user_height", 240)),
 
                     # plates_
                     "plates_on": _get_bool("plates_on", True),
@@ -522,10 +528,6 @@ class ANPRViewerApp:
                     "plates_sleep_time_after_save": _get_float("plates_sleep_time_after_save", 5.0),
                     "plates_view_time": _get_int("plates_view_time", 30),
                     "plates_rect_scale": _get_float("plates_rect_scale", 5.0),
-                    "plates_rect_user_top": _get_int("plates_rect_user_top", 20),
-                    "plates_rect_user_left": _get_int("plates_rect_user_left", 20),
-                    "plates_rect_user_width": _get_int("plates_rect_user_width", 360),
-                    "plates_rect_user_height": _get_int("plates_rect_user_height", 240),
                     "plates_delete_older_days": max(0.0, _get_float("plates_delete_older_days", 0.0)),
                     "plates_date_from": _get_str("plates_date_from", ""),
                     "plates_date_to": _get_str("plates_date_to", ""),
@@ -585,6 +587,8 @@ class ANPRViewerApp:
             "; ЗАГАЛЬНІ НАЛАШТУВАННЯ:",
             ";   source                       : 0 (вебкамера), rtsp://... або шлях до файлу .mp4",
             ";   autostart_os_and_play        : true / false (додати у автозапуск Windows та автостарт)",
+            ";   viewer_top, viewer_left      : положення (Y, X) спільного плаваючого вікна перегляду (у т.ч. інший монітор)",
+            ";   viewer_width, viewer_height  : ширина та висота спільного плаваючого вікна перегляду (px)",
             ";",
             "; ПРАВИЛА АВТОВИДАЛЕННЯ ТА МЕЖ ДАТ (окремо для кожного модуля):",
             ";   *_delete_older_days          : через скільки днів автоматично видаляти старі файли",
@@ -624,7 +628,6 @@ class ANPRViewerApp:
             ";   plates_sleep_time_after_save : пауза ігнорування повторів того самого номера (сек)",
             ";   plates_view_time             : скільки секунд показувати збільшений номер у кутку екрану",
             ";   plates_rect_scale            : масштаб збільшеного номера в кутку (базове 5.0)",
-            ";   plates_rect_user_top, left, width, height : геометрія вікна збільшеного кропу",
             ";   plates_delete_older_days     : автовидалення фото номерів старше N днів (0 = необмежено)",
             ";   plates_date_from, plates_date_to : межі дат роботи модуля (порожньо = необмежено)",
             ";",
@@ -698,6 +701,10 @@ class ANPRViewerApp:
             "; --- ЗАГАЛЬНІ ---",
             f"source = {str(data.get('source', '0'))}",
             f"autostart_os_and_play = {str(bool(data.get('autostart_os_and_play', False))).lower()}",
+            f"viewer_top = {int(data.get('viewer_top', 20))}",
+            f"viewer_left = {int(data.get('viewer_left', 20))}",
+            f"viewer_width = {int(data.get('viewer_width', 360))}",
+            f"viewer_height = {int(data.get('viewer_height', 240))}",
             "",
             "; --- МОДУЛЬ НОМЕРІВ (plates_) ---",
             f"plates_on = {str(bool(data.get('plates_on', True))).lower()}",
@@ -708,10 +715,6 @@ class ANPRViewerApp:
             f"plates_sleep_time_after_save = {self._fmt_num(data.get('plates_sleep_time_after_save', 5.0))}",
             f"plates_view_time = {self._fmt_num(data.get('plates_view_time', 30))}",
             f"plates_rect_scale = {self._fmt_num(data.get('plates_rect_scale', 5.0))}",
-            f"plates_rect_user_top = {int(data.get('plates_rect_user_top', 20))}",
-            f"plates_rect_user_left = {int(data.get('plates_rect_user_left', 20))}",
-            f"plates_rect_user_width = {int(data.get('plates_rect_user_width', 360))}",
-            f"plates_rect_user_height = {int(data.get('plates_rect_user_height', 240))}",
             f"plates_delete_older_days = {self._fmt_num(data.get('plates_delete_older_days', 0))}",
             f"plates_date_from = {str(data.get('plates_date_from', '') or '').strip()}".rstrip(),
             f"plates_date_to = {str(data.get('plates_date_to', '') or '').strip()}".rstrip(),
@@ -754,10 +757,10 @@ class ANPRViewerApp:
             pass
 
     def _save_roi_geometry_to_config(self):
-        self.config["plates_rect_user_top"] = self.roi_user_top
-        self.config["plates_rect_user_left"] = self.roi_user_left
-        self.config["plates_rect_user_width"] = self.roi_user_width
-        self.config["plates_rect_user_height"] = self.roi_user_height
+        self.config["viewer_top"] = self.roi_user_top
+        self.config["viewer_left"] = self.roi_user_left
+        self.config["viewer_width"] = self.roi_user_width
+        self.config["viewer_height"] = self.roi_user_height
         self._save_config_ini(self.config)
 
     def _check_and_delete_old_files(self):
@@ -805,8 +808,7 @@ class ANPRViewerApp:
         self.ctrl_frame = tk.Frame(self.root, bg="#1e1e24", padx=12, pady=10)
         self.ctrl_frame.pack(fill=tk.X, side=tk.TOP)
 
-        tk.Label(self.ctrl_frame, text="Відеокамера / Джерело:", fg="#e0e0e0", bg="#1e1e24", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(5, 3))
-        tk.Button(self.ctrl_frame, text="?", command=self._show_help, bg="#3a3a46", fg="#00ffff", font=("Segoe UI", 9, "bold"), width=2, relief=tk.FLAT).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(self.ctrl_frame, text="Відеокамера / Джерело:", fg="#e0e0e0", bg="#1e1e24", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(5, 6))
 
         self.source_var = tk.StringVar(value=str(self.config.get("source", "0")))
         ttk.Entry(self.ctrl_frame, width=34, textvariable=self.source_var, state="readonly").pack(side=tk.LEFT, padx=3)
@@ -944,7 +946,7 @@ class ANPRViewerApp:
 
         self.preview_label = tk.Label(self.preview_container, bg="#1a1a22", text="[Виберіть запис зі списку]", fg="#707080", font=("Segoe UI", 9), pady=10, relief=tk.SOLID, borderwidth=1)
         self.preview_label.pack(fill=tk.X)
-        self.preview_label.bind(EVT_DOUBLE_CLICK, lambda e: self._open_fullscreen_preview(crop_mode=False, source_widget=self.preview_label))
+        self.preview_label.bind(EVT_DOUBLE_CLICK, lambda e: self._open_roi_viewer(crop_mode=False, source_widget=self.preview_label))
 
         self.screen_header_frame = tk.Frame(self.preview_container, bg="#14141a")
         self.screen_header_frame.pack(fill=tk.X, pady=(6, 2))
@@ -954,8 +956,8 @@ class ANPRViewerApp:
 
         self.btn_expand_preview = tk.Button(
             self.screen_header_frame,
-            text="⛶ Розгорнути",
-            command=lambda: self._open_fullscreen_preview(crop_mode=False, source_widget=self.screen_canvas),
+            text="❐ У вікні",
+            command=lambda: self._open_roi_viewer(crop_mode=False, source_widget=self.screen_canvas),
             bg="#2d2d3a",
             fg="#00e5ff",
             font=("Segoe UI", 8, "bold"),
@@ -974,6 +976,7 @@ class ANPRViewerApp:
         self.screen_canvas.bind(EVT_B1_MOTION, self._on_screen_canvas_motion)
         self.screen_canvas.bind(EVT_BTN_RELEASE, self._on_screen_canvas_release)
         self.screen_canvas.bind(EVT_DOUBLE_CLICK, self._on_screen_canvas_double_click)
+        self.screen_canvas.bind(EVT_RIGHT_CLICK, self._on_roi_right_click)
 
         # Панель керування вбудованим відеоплеєром (показується лише у вкладці "Відео")
         self.video_controls_frame = tk.Frame(self.preview_container, bg="#1b1b26", padx=4, pady=4)
@@ -1043,11 +1046,13 @@ class ANPRViewerApp:
         self.main_video_label.bind(EVT_BTN_PRESS, self._on_video_area_click)
         self.video_container.bind(EVT_BTN_PRESS, self._on_video_area_click)
 
-        # Інтерактивне плаваюче вікно ROI (можна вільно переносити поверх елементів і на інший монітор)
+        # Єдине плаваюче вікно перегляду (повний кадр + кроп + навігація + плеєр + розгортання на монітор)
         self.roi_panel = tk.Toplevel(self.root, bg="#00ff00")
         self.roi_panel.overrideredirect(True)
         self.roi_panel.transient(self.root)
         self.roi_panel.protocol("WM_DELETE_WINDOW", self._hide_roi_panel)
+        self.roi_panel.bind("<Escape>", self._on_roi_escape)
+        self.roi_panel.bind("<Configure>", self._on_roi_panel_configure)
         self.roi_panel.withdraw()
 
         self.roi_inner = tk.Frame(self.roi_panel, bg="#16161e")
@@ -1056,16 +1061,24 @@ class ANPRViewerApp:
         self.roi_header = tk.Frame(self.roi_inner, bg="#20202c", padx=6, pady=3, cursor="fleur")
         self.roi_header.pack(fill=tk.X, side=tk.TOP)
 
-        self.roi_title_lbl = tk.Label(self.roi_header, text="Виділена область", fg="#00e5ff", bg="#20202c", font=("Segoe UI", 9, "bold"), cursor="fleur")
-        self.roi_title_lbl.pack(side=tk.LEFT)
+        self.roi_btn_close = tk.Button(
+            self.roi_header,
+            text="✕",
+            command=self._hide_roi_panel,
+            bg="#333342",
+            fg="#ff5555",
+            font=("Segoe UI", 8, "bold"),
+            bd=0,
+            relief=tk.FLAT,
+            padx=5,
+            cursor="hand2"
+        )
+        self.roi_btn_close.pack(side=tk.RIGHT)
 
-        btn_close = tk.Button(self.roi_header, text="✕", command=self._hide_roi_panel, bg="#333342", fg="#ff5555", font=("Segoe UI", 8, "bold"), bd=0, relief=tk.FLAT, padx=4, cursor="hand2")
-        btn_close.pack(side=tk.RIGHT)
-
-        self.btn_expand_roi = tk.Button(
+        self.roi_btn_max = tk.Button(
             self.roi_header,
             text="⛶",
-            command=lambda: self._open_fullscreen_preview(crop_mode=True, source_widget=self.roi_panel),
+            command=self._toggle_roi_maximize,
             bg="#333342",
             fg="#00e5ff",
             font=("Segoe UI", 8, "bold"),
@@ -1074,17 +1087,152 @@ class ANPRViewerApp:
             padx=5,
             cursor="hand2"
         )
-        self.btn_expand_roi.pack(side=tk.RIGHT, padx=(0, 3))
+        self.roi_btn_max.pack(side=tk.RIGHT, padx=(0, 3))
 
-        for w in (self.roi_header, self.roi_title_lbl):
+        self.roi_title_lbl = tk.Label(
+            self.roi_header,
+            text="Перегляд",
+            fg="#00e5ff",
+            bg="#20202c",
+            font=("Segoe UI", 9, "bold"),
+            anchor=tk.W,
+            width=1,
+            cursor="fleur"
+        )
+        self.roi_title_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        # Панель навігації та керування кропом
+        self.roi_toolbar = tk.Frame(self.roi_inner, bg="#1b1b26", padx=6, pady=3, cursor="fleur")
+        self.roi_toolbar.pack(fill=tk.X, side=tk.TOP)
+
+        self.roi_btn_prev = tk.Button(
+            self.roi_toolbar,
+            text="◀ Назад",
+            command=lambda: self._navigate_items(-1),
+            bg="#2e2e3c",
+            fg="#ffffff",
+            font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT,
+            padx=6,
+            pady=2,
+            cursor="hand2"
+        )
+        self.roi_btn_prev.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.roi_btn_next = tk.Button(
+            self.roi_toolbar,
+            text="Далі ▶",
+            command=lambda: self._navigate_items(1),
+            bg="#2e2e3c",
+            fg="#ffffff",
+            font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT,
+            padx=6,
+            pady=2,
+            cursor="hand2"
+        )
+        self.roi_btn_next.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.roi_btn_crop_mode = tk.Button(
+            self.roi_toolbar,
+            text="🖼 Кадр",
+            command=self._toggle_roi_crop_mode,
+            bg="#2d3b4e",
+            fg="#00e5ff",
+            font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT,
+            padx=6,
+            pady=2,
+            cursor="hand2"
+        )
+
+        self.roi_btn_clear_crop = tk.Button(
+            self.roi_toolbar,
+            text="✕ Скинути",
+            command=self._clear_roi_crop,
+            bg="#44333a",
+            fg="#ffaaaa",
+            font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT,
+            padx=6,
+            pady=2,
+            cursor="hand2"
+        )
+
+        for w in (self.roi_header, self.roi_title_lbl, self.roi_toolbar):
             w.bind(EVT_BTN_PRESS, self._on_roi_drag_start)
             w.bind(EVT_B1_MOTION, self._on_roi_drag_motion)
             w.bind(EVT_BTN_RELEASE, self._on_roi_drag_release)
+        for w in (self.roi_header, self.roi_title_lbl):
+            w.bind(EVT_DOUBLE_CLICK, self._on_roi_header_double_click)
 
-        self.roi_img_label = tk.Label(self.roi_inner, bg="#0d0d11", cursor="hand2")
-        self.roi_img_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.roi_img_label.bind(EVT_BTN_RELEASE, self._on_roi_img_click)
-        self.roi_img_label.bind(EVT_DOUBLE_CLICK, self._on_roi_img_double_click)
+        # Нижня панель керування відео (тільки у режимі video)
+        self.roi_controls_frame = tk.Frame(self.roi_inner, bg="#1b1b24", padx=6, pady=4)
+        self.roi_btn_play = tk.Button(
+            self.roi_controls_frame,
+            text="▶",
+            command=self._toggle_arch_play,
+            bg="#28a745",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+            width=3,
+            relief=tk.FLAT,
+            cursor="hand2"
+        )
+        self.roi_btn_play.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.roi_slider_var = tk.IntVar(value=0)
+        self.roi_slider = tk.Scale(
+            self.roi_controls_frame,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            variable=self.roi_slider_var,
+            showvalue=False,
+            bg="#1b1b24",
+            fg="#00e5ff",
+            troughcolor="#2e2e3d",
+            highlightthickness=0,
+            bd=0,
+            sliderlength=14,
+            command=self._on_arch_slider_move
+        )
+        self.roi_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self.roi_time_lbl = tk.Label(
+            self.roi_controls_frame,
+            text="00:00/00:00",
+            fg="#e0e0f0",
+            bg="#1b1b24",
+            font=("Consolas", 9, "bold")
+        )
+        self.roi_time_lbl.pack(side=tk.LEFT, padx=6)
+
+        self.roi_btn_speed = tk.Button(
+            self.roi_controls_frame,
+            text="1x",
+            command=self._cycle_arch_speed,
+            bg="#333344",
+            fg="#00e5ff",
+            font=("Segoe UI", 8, "bold"),
+            width=3,
+            relief=tk.FLAT,
+            cursor="hand2"
+        )
+        self.roi_btn_speed.pack(side=tk.RIGHT, padx=(0, 14))
+
+        self.roi_canvas = tk.Canvas(self.roi_inner, bg="#0d0d11", highlightthickness=0, cursor="cross")
+        self.roi_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.roi_canvas.bind("<Configure>", self._on_roi_canvas_configure)
+        self.roi_canvas.bind(EVT_BTN_PRESS, self._on_roi_canvas_press)
+        self.roi_canvas.bind(EVT_B1_MOTION, self._on_roi_canvas_motion)
+        self.roi_canvas.bind(EVT_BTN_RELEASE, self._on_roi_canvas_release)
+        self.roi_canvas.bind(EVT_DOUBLE_CLICK, self._on_roi_canvas_double_click)
+        self.roi_canvas.bind(EVT_RIGHT_CLICK, self._on_roi_right_click)
+        for mw_w in (self.roi_panel, self.roi_canvas):
+            mw_w.bind(EVT_MOUSEWHEEL, self._on_preview_mousewheel)
+            mw_w.bind(EVT_BTN4, self._on_preview_mousewheel)
+            mw_w.bind(EVT_BTN5, self._on_preview_mousewheel)
 
         self.roi_resize_grip = tk.Label(self.roi_inner, text="◢", fg="#00e5ff", bg="#16161e", font=("Segoe UI", 10, "bold"), cursor="sizing")
         self.roi_resize_grip.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-1, y=-1)
@@ -1194,19 +1342,108 @@ class ANPRViewerApp:
 
     def _on_screen_canvas_double_click(self, event=None):
         self._mark_double_click("screen_canvas")
-        self._open_fullscreen_preview(crop_mode=False, source_widget=self.screen_canvas)
+        self._open_roi_viewer(crop_mode=False, source_widget=self.screen_canvas)
 
-    def _on_roi_img_click(self, event=None):
-        self._schedule_single_click_play_toggle("roi_img")
+    def _on_roi_escape(self, event=None):
+        if self.roi_maximized:
+            self._toggle_roi_maximize()
+        elif self.roi_visible:
+            self._hide_roi_panel(clear_coords=True)
+        return "break"
 
-    def _on_roi_img_double_click(self, event=None):
-        self._mark_double_click("roi_img")
-        self._open_fullscreen_preview(crop_mode=True, source_widget=self.roi_panel)
+    def _on_roi_header_double_click(self, event=None):
+        self.roi_drag_moved_win = False
+        self._toggle_roi_maximize()
+        return "break"
+
+    def _on_roi_panel_configure(self, event=None):
+        if event is not None and event.widget is not self.roi_panel:
+            return
+        w = event.width if (event is not None and getattr(event, "width", 0) > 0) else None
+        self._update_roi_toolbar_labels(w)
+
+    def _on_roi_canvas_configure(self, event=None):
+        if self.roi_visible or self.roi_panel.winfo_ismapped():
+            self._render_current_roi_view()
+
+    def _on_roi_canvas_press(self, event):
+        if self.current_screen_img_cv is None:
+            return
+        if self.roi_crop_mode:
+            self.roi_canvas_drag_start_x = event.x
+            self.roi_canvas_drag_start_y = event.y
+            self.roi_canvas_drag_moved = False
+            return
+        self.roi_canvas_drag_start_x = max(self.roi_img_offset_x, min(self.roi_img_offset_x + self.roi_disp_w, event.x))
+        self.roi_canvas_drag_start_y = max(self.roi_img_offset_y, min(self.roi_img_offset_y + self.roi_disp_h, event.y))
+        self.roi_canvas_drag_moved = False
+
+    def _on_roi_canvas_motion(self, event):
+        if self.roi_canvas_drag_start_x is None or self.roi_canvas_drag_start_y is None or self.roi_crop_mode:
+            return
+        cur_x = max(self.roi_img_offset_x, min(self.roi_img_offset_x + self.roi_disp_w, event.x))
+        cur_y = max(self.roi_img_offset_y, min(self.roi_img_offset_y + self.roi_disp_h, event.y))
+        if abs(cur_x - self.roi_canvas_drag_start_x) >= 6 or abs(cur_y - self.roi_canvas_drag_start_y) >= 6:
+            self.roi_canvas_drag_moved = True
+        if self.roi_canvas_drag_moved:
+            self.roi_canvas.delete("roi_drag")
+            self.roi_canvas.create_rectangle(
+                self.roi_canvas_drag_start_x, self.roi_canvas_drag_start_y, cur_x, cur_y,
+                outline="#00ff00", width=2, tags="roi_drag"
+            )
+            self.roi_canvas.tag_raise("roi_drag")
+
+    def _on_roi_canvas_release(self, event):
+        if self.roi_crop_mode:
+            self.roi_canvas_drag_start_x = None
+            self.roi_canvas_drag_start_y = None
+            self.roi_canvas_drag_moved = False
+            self._schedule_single_click_play_toggle("roi_canvas")
+            return
+
+        if self.roi_canvas_drag_start_x is None or self.roi_canvas_drag_start_y is None:
+            self._schedule_single_click_play_toggle("roi_canvas")
+            return
+
+        end_x = max(self.roi_img_offset_x, min(self.roi_img_offset_x + self.roi_disp_w, event.x))
+        end_y = max(self.roi_img_offset_y, min(self.roi_img_offset_y + self.roi_disp_h, event.y))
+
+        x1 = min(self.roi_canvas_drag_start_x, end_x) - self.roi_img_offset_x
+        x2 = max(self.roi_canvas_drag_start_x, end_x) - self.roi_img_offset_x
+        y1 = min(self.roi_canvas_drag_start_y, end_y) - self.roi_img_offset_y
+        y2 = max(self.roi_canvas_drag_start_y, end_y) - self.roi_img_offset_y
+
+        was_moved = self.roi_canvas_drag_moved
+        self.roi_canvas_drag_start_x = None
+        self.roi_canvas_drag_start_y = None
+        self.roi_canvas_drag_moved = False
+        self.roi_canvas.delete("roi_drag")
+
+        if not was_moved or (x2 - x1) < 8 or (y2 - y1) < 8 or self.current_screen_img_cv is None:
+            self._schedule_single_click_play_toggle("roi_canvas")
+            return
+
+        orig_h, orig_w = self.current_screen_img_cv.shape[:2]
+        crop_x1 = max(0, min(orig_w - 1, int(round(x1 * self.roi_scale_x))))
+        crop_y1 = max(0, min(orig_h - 1, int(round(y1 * self.roi_scale_y))))
+        crop_x2 = max(crop_x1 + 1, min(orig_w, int(round(x2 * self.roi_scale_x))))
+        crop_y2 = max(crop_y1 + 1, min(orig_h, int(round(y2 * self.roi_scale_y))))
+
+        self._apply_roi_crop_coords((crop_x1, crop_y1, crop_x2, crop_y2), open_panel=True)
+
+    def _on_roi_canvas_double_click(self, event=None):
+        self._mark_double_click("roi_canvas")
+        self._toggle_roi_maximize()
+
+    def _on_roi_right_click(self, event=None):
+        if self.roi_crop_mode or self.current_roi_coords is not None or self.last_roi_crop_bgr is not None:
+            self._clear_roi_crop()
+        return "break"
 
     def _on_video_area_click(self, event=None):
-        if not self.roi_visible:
+        if not self.roi_visible or self.roi_maximized:
             return
-        # Не закриваємо плаваюче вікно кропу, якщо його перенесли на інший монітор або за межі зони основного відео
+        # Не закриваємо плаваюче вікно перегляду, якщо його перенесли на інший монітор або за межі зони основного відео
         try:
             vx = self.video_container.winfo_rootx()
             vy = self.video_container.winfo_rooty()
@@ -1224,8 +1461,11 @@ class ANPRViewerApp:
             pass
 
     def _on_roi_drag_start(self, event):
+        if self.roi_maximized:
+            return
         self._drag_start_x = event.x_root
         self._drag_start_y = event.y_root
+        self.roi_drag_moved_win = False
         try:
             self._orig_left = int(self.roi_panel.winfo_x())
             self._orig_top = int(self.roi_panel.winfo_y())
@@ -1234,31 +1474,50 @@ class ANPRViewerApp:
             self._orig_top = self.roi_user_top
 
     def _on_roi_drag_motion(self, event):
+        if self.roi_maximized or not hasattr(self, "_drag_start_x"):
+            return
         dx = event.x_root - self._drag_start_x
         dy = event.y_root - self._drag_start_y
+        if abs(dx) >= 2 or abs(dy) >= 2:
+            self.roi_drag_moved_win = True
         self.roi_user_left = int(self._orig_left + dx)
         self.roi_user_top = int(self._orig_top + dy)
         self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
 
     def _on_roi_drag_release(self, event):
-        self._save_roi_geometry_to_config()
+        if self.roi_maximized:
+            return
+        if self.roi_drag_moved_win:
+            self.roi_drag_moved_win = False
+            self._save_roi_geometry_to_config()
 
     def _on_roi_resize_start(self, event):
+        if self.roi_maximized:
+            return
         self._resize_start_x = event.x_root
         self._resize_start_y = event.y_root
         self._orig_w = self.roi_user_width
         self._orig_h = self.roi_user_height
+        self.roi_resize_moved = False
 
     def _on_roi_resize_motion(self, event):
+        if self.roi_maximized or not hasattr(self, "_resize_start_x"):
+            return
         dx = event.x_root - self._resize_start_x
         dy = event.y_root - self._resize_start_y
-        self.roi_user_width = max(180, self._orig_w + dx)
-        self.roi_user_height = max(120, self._orig_h + dy)
+        if abs(dx) >= 1 or abs(dy) >= 1:
+            self.roi_resize_moved = True
+        self.roi_user_width = max(260, self._orig_w + dx)
+        self.roi_user_height = max(180, self._orig_h + dy)
         self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
-        self._render_current_roi_crop()
+        self._render_current_roi_view()
 
     def _on_roi_resize_release(self, event):
-        self._save_roi_geometry_to_config()
+        if self.roi_maximized:
+            return
+        if getattr(self, "roi_resize_moved", False):
+            self.roi_resize_moved = False
+            self._save_roi_geometry_to_config()
 
     def _update_preview_layout(self, mode):
         """Для номерів/облич — 2 вікна (кроп + повний скрін); для людей та відео — 1 спільне вікно."""
@@ -1606,16 +1865,14 @@ class ANPRViewerApp:
                 crop_bgr = self._extract_roi_bgr(cv_img, self.current_roi_coords)
                 if crop_bgr is not None:
                     self.last_roi_crop_bgr = crop_bgr
-                    if self.roi_visible or self.roi_panel.winfo_ismapped():
-                        self._render_current_roi_crop()
             else:
                 self.screen_canvas.delete("roi_rect")
 
             if self.screen_canvas.find_withtag("roi_rect"):
                 self.screen_canvas.tag_raise("roi_rect")
 
-            if self.fs_win is not None and self.fs_win.winfo_exists():
-                self._render_fullscreen_content()
+            if self.roi_visible or self.roi_panel.winfo_ismapped():
+                self._render_current_roi_view()
         except Exception as e:
             print(f"[Preview render error]: {e}")
 
@@ -1626,18 +1883,22 @@ class ANPRViewerApp:
             self.current_screen_img_cv = None
             self.screen_canvas.config(width=340, height=190)
             self.screen_canvas.create_text(170, 95, text="[Скріншот відсутній]", fill="#707080", font=("Segoe UI", 9), tags="placeholder")
-            if self.fs_win is not None and self.fs_win.winfo_exists():
-                self._render_fullscreen_content()
+            if self.roi_visible or self.roi_panel.winfo_ismapped():
+                self._sync_roi_controls_visibility()
+                self._render_current_roi_view()
             return
 
         try:
             cv_img = cv2.imread(screen_path)
             if cv_img is None:
                 return
-            keep = bool(self.current_roi_coords is not None and (self.roi_visible or self.roi_panel.winfo_ismapped() or (self.fs_win is not None and self.fs_win.winfo_exists())))
-            if not keep:
+            is_open = bool(self.roi_visible or self.roi_panel.winfo_ismapped())
+            keep = bool(is_open and self.current_roi_coords is not None)
+            if not is_open and self.current_roi_coords is not None:
                 self._hide_roi_panel(clear_coords=True)
             self._display_cv_in_screen_canvas(cv_img, keep_roi=keep)
+            if is_open:
+                self._sync_roi_controls_visibility()
         except Exception as e:
             print(f"[Screenshot preview error]: {e}")
 
@@ -1658,14 +1919,15 @@ class ANPRViewerApp:
         time_str = f"{self._format_sec(curr / fps)}/{self._format_sec(total / fps)}"
 
         self.lbl_arch_time.configure(text=time_str)
+        if hasattr(self, "roi_time_lbl"):
+            self.roi_time_lbl.configure(text=time_str)
         self.arch_updating_slider = True
         try:
             self.arch_slider.configure(to=max(1, total - 1))
             self.arch_slider_var.set(curr)
-            if self.fs_win is not None and self.fs_win.winfo_exists() and hasattr(self, "fs_slider"):
-                self.fs_slider.configure(to=max(1, total - 1))
-                self.fs_slider_var.set(curr)
-                self.fs_time_lbl.configure(text=time_str)
+            if hasattr(self, "roi_slider"):
+                self.roi_slider.configure(to=max(1, total - 1))
+                self.roi_slider_var.set(curr)
         finally:
             self.arch_updating_slider = False
 
@@ -1674,8 +1936,8 @@ class ANPRViewerApp:
         bg = "#d97706" if self.arch_playing else "#28a745"
         if hasattr(self, "btn_arch_play"):
             self.btn_arch_play.configure(text=icon, bg=bg)
-        if self.fs_win is not None and self.fs_win.winfo_exists() and hasattr(self, "fs_btn_play"):
-            self.fs_btn_play.configure(text=icon, bg=bg)
+        if hasattr(self, "roi_btn_play"):
+            self.roi_btn_play.configure(text=icon, bg=bg)
 
     def _stop_archive_player(self):
         self._cancel_single_click_play_toggle()
@@ -1698,12 +1960,18 @@ class ANPRViewerApp:
         self._update_arch_play_buttons()
         if hasattr(self, "lbl_arch_time"):
             self.lbl_arch_time.configure(text="00:00/00:00")
+        if hasattr(self, "roi_time_lbl"):
+            self.roi_time_lbl.configure(text="00:00/00:00")
         self.arch_updating_slider = True
         try:
             if hasattr(self, "arch_slider_var"):
                 self.arch_slider_var.set(0)
+            if hasattr(self, "roi_slider_var"):
+                self.roi_slider_var.set(0)
         finally:
             self.arch_updating_slider = False
+        if hasattr(self, "roi_panel"):
+            self._sync_roi_controls_visibility()
 
     def _load_archive_video(self, fpath, auto_play=True):
         self._stop_archive_player()
@@ -1713,6 +1981,9 @@ class ANPRViewerApp:
             self.current_screen_img_cv = None
             self.screen_canvas.config(width=340, height=190)
             self.screen_canvas.create_text(170, 95, text="[Відеофайл відсутній]", fill="#707080", font=("Segoe UI", 9), tags="placeholder")
+            if self.roi_visible or self.roi_panel.winfo_ismapped():
+                self._sync_roi_controls_visibility()
+                self._render_current_roi_view()
             return
 
         if self.video_engine and self.video_engine.is_file_busy(fpath):
@@ -1721,6 +1992,9 @@ class ANPRViewerApp:
             self.current_screen_img_cv = None
             self.screen_canvas.config(width=340, height=190)
             self.screen_canvas.create_text(170, 95, text="[Файл ще записується...]", fill="#ffcc00", font=("Segoe UI", 9), tags="placeholder")
+            if self.roi_visible or self.roi_panel.winfo_ismapped():
+                self._sync_roi_controls_visibility()
+                self._render_current_roi_view()
             return
 
         cap = cv2.VideoCapture(fpath)
@@ -1730,6 +2004,9 @@ class ANPRViewerApp:
             self.current_screen_img_cv = None
             self.screen_canvas.config(width=340, height=190)
             self.screen_canvas.create_text(170, 95, text="[Не вдалося відкрити відео]", fill="#ff5555", font=("Segoe UI", 9), tags="placeholder")
+            if self.roi_visible or self.roi_panel.winfo_ismapped():
+                self._sync_roi_controls_visibility()
+                self._render_current_roi_view()
             return
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 15.0)
@@ -1747,7 +2024,7 @@ class ANPRViewerApp:
 
         ret, frame = cap.read()
         if ret and frame is not None:
-            keep = bool(self.current_roi_coords is not None and (self.roi_visible or self.roi_panel.winfo_ismapped() or (self.fs_win is not None and self.fs_win.winfo_exists())))
+            keep = bool(self.current_roi_coords is not None and (self.roi_visible or self.roi_panel.winfo_ismapped()))
             self._display_cv_in_screen_canvas(frame, keep_roi=keep)
         else:
             cap.release()
@@ -1755,7 +2032,7 @@ class ANPRViewerApp:
             return
 
         self._update_arch_time_ui()
-        self._sync_fs_controls_visibility()
+        self._sync_roi_controls_visibility()
 
         if auto_play:
             self.arch_playing = True
@@ -1849,6 +2126,8 @@ class ANPRViewerApp:
             idx = int(float(val_str))
         except Exception:
             return
+        if idx == self.arch_curr_frame_idx:
+            return
         self._seek_archive_video(idx)
 
     def _cycle_arch_speed(self):
@@ -1861,8 +2140,8 @@ class ANPRViewerApp:
         txt = f"{self.arch_speed}x"
         if hasattr(self, "btn_arch_speed"):
             self.btn_arch_speed.configure(text=txt)
-        if self.fs_win is not None and self.fs_win.winfo_exists() and hasattr(self, "fs_btn_speed"):
-            self.fs_btn_speed.configure(text=txt)
+        if hasattr(self, "roi_btn_speed"):
+            self.roi_btn_speed.configure(text=txt)
 
     def _on_item_selected(self, event):
         sel = self.items_tree.selection()
@@ -1909,7 +2188,7 @@ class ANPRViewerApp:
         if self.current_preview_fpath != fpath or self.current_screen_img_cv is None:
             self._on_item_selected(None)
         if self.current_screen_img_cv is not None:
-            self._open_fullscreen_preview(crop_mode=False, source_widget=self.items_tree)
+            self._open_roi_viewer(crop_mode=False, source_widget=self.items_tree)
 
     def _on_screen_canvas_press(self, event):
         if self.current_screen_img_cv is None:
@@ -1974,56 +2253,16 @@ class ANPRViewerApp:
         self.last_roi_crop_bgr = crop_bgr
         self._draw_roi_rect_on_screen_canvas()
         if open_panel:
-            self._clamp_roi_to_virtual_screen()
-            self.roi_visible = True
-            self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
-            self.roi_panel.deiconify()
-            self.roi_panel.lift()
-            if self.fs_win is not None and self.fs_win.winfo_exists():
-                self.fs_win.lift()
-            self.roi_panel.update_idletasks()
-            self._render_current_roi_crop()
-        if self.fs_win is not None and self.fs_win.winfo_exists():
-            self._sync_fs_controls_visibility()
-            self._render_fullscreen_content()
-
-    def _render_current_roi_crop(self):
-        if self.last_roi_crop_bgr is None:
-            return
-        h, w = self.last_roi_crop_bgr.shape[:2]
-        if h == 0 or w == 0:
-            return
-
-        avail_w = max(40, self.roi_user_width - 16)
-        avail_h = max(40, self.roi_user_height - 44)
-
-        scale = min(avail_w / float(w), avail_h / float(h))
-        disp_w = max(1, int(round(w * scale)))
-        disp_h = max(1, int(round(h * scale)))
-
-        resized = cv2.resize(self.last_roi_crop_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LANCZOS4)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        self.roi_photo_tk = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.roi_img_label.configure(image=self.roi_photo_tk)
-        prefix = "Живий кроп відео" if self.sidebar_mode == "video" else "Виділена область"
-        self.roi_title_lbl.configure(text=f"{prefix} ({w}x{h})")
-
-    def _hide_roi_panel(self, clear_coords=True):
-        self.roi_visible = False
-        try:
-            self.roi_panel.withdraw()
-        except Exception:
-            pass
-        if clear_coords:
-            self.current_roi_coords = None
-            self.last_roi_crop_bgr = None
-            if hasattr(self, "screen_canvas"):
-                self.screen_canvas.delete("roi_rect")
+            self.roi_crop_mode = True
+            self._show_roi_panel()
+        elif self.roi_visible or self.roi_panel.winfo_ismapped():
+            self._sync_roi_controls_visibility()
+            self._render_current_roi_view()
 
     # -----------------------------------------------------------------
-    # ПОВНОЕКРАННИЙ ПЕРЕГЛЯД НА ПОТОЧНОМУ МОНІТОРІ (спільний для всіх модулів)
+    # ЄДИНЕ ПЛАВАЮЧЕ ВІКНО ПЕРЕГЛЯДУ (спільне для всіх модулів)
     # -----------------------------------------------------------------
-    def _open_fullscreen_preview(self, crop_mode=False, source_widget=None):
+    def _open_roi_viewer(self, crop_mode=False, source_widget=None):
         if self.current_screen_img_cv is None:
             sel = self.items_tree.selection()
             if sel and sel[0] in self.tree_item_map:
@@ -2032,230 +2271,145 @@ class ANPRViewerApp:
             return
 
         use_crop = bool(crop_mode and (self.current_roi_coords is not None or self.last_roi_crop_bgr is not None))
-        self.fs_crop_mode = use_crop
+        if not self.roi_visible:
+            self.roi_maximized = False
+        self.roi_crop_mode = use_crop
+        self._show_roi_panel()
 
-        if self.fs_win is not None and self.fs_win.winfo_exists():
-            self._sync_fs_controls_visibility()
-            self.fs_win.lift()
-            self.fs_win.focus_force()
-            self._render_fullscreen_content()
-            return
+    def _show_roi_panel(self):
+        was_visible = self.roi_visible
+        self.roi_visible = True
+        self._sync_roi_controls_visibility()
 
-        mx, my, mw, mh = self._get_current_monitor_geometry(source_widget if source_widget is not None else self.root)
-
-        win = tk.Toplevel(self.root)
-        win.configure(bg="#0a0a0e")
-        win.overrideredirect(True)
-        win.geometry(f"{mw}x{mh}+{mx}+{my}")
-        win.transient(self.root)
-        win.lift()
-        win.focus_force()
-        self.fs_win = win
-        self.fs_drag_start_x = None
-        self.fs_drag_start_y = None
-        self.fs_drag_moved = False
-
-        win.bind("<Escape>", lambda e: (self._close_fullscreen_preview(), "break")[1])
-
-        # Верхня панель керування повноекранного перегляду
-        fs_top = tk.Frame(win, bg="#1b1b24", padx=12, pady=8)
-        fs_top.pack(fill=tk.X, side=tk.TOP)
-
-        self.fs_title_lbl = tk.Label(
-            fs_top,
-            text="Повноекранний перегляд",
-            fg="#00e5ff",
-            bg="#1b1b24",
-            font=("Segoe UI", 11, "bold")
-        )
-        self.fs_title_lbl.pack(side=tk.LEFT)
-
-        btn_fs_close = tk.Button(
-            fs_top,
-            text="✕ Згорнути (Esc)",
-            command=self._close_fullscreen_preview,
-            bg="#dc3545",
-            fg="white",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=10,
-            pady=3,
-            cursor="hand2"
-        )
-        btn_fs_close.pack(side=tk.RIGHT, padx=(6, 0))
-
-        self.fs_btn_clear_crop = tk.Button(
-            fs_top,
-            text="✕ Скинути кроп",
-            command=self._clear_fs_crop,
-            bg="#44333a",
-            fg="#ffaaaa",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=8,
-            pady=3,
-            cursor="hand2"
-        )
-
-        self.fs_btn_crop_mode = tk.Button(
-            fs_top,
-            text="🖼 Повний кадр",
-            command=self._toggle_fs_crop_mode,
-            bg="#2d3b4e",
-            fg="#00e5ff",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=8,
-            pady=3,
-            cursor="hand2"
-        )
-
-        btn_next = tk.Button(
-            fs_top,
-            text="Наступний ▶",
-            command=lambda: self._navigate_items(1),
-            bg="#2e2e3c",
-            fg="#ffffff",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=8,
-            pady=3,
-            cursor="hand2"
-        )
-        btn_next.pack(side=tk.RIGHT, padx=(4, 6))
-
-        btn_prev = tk.Button(
-            fs_top,
-            text="◀ Попередній",
-            command=lambda: self._navigate_items(-1),
-            bg="#2e2e3c",
-            fg="#ffffff",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=8,
-            pady=3,
-            cursor="hand2"
-        )
-        btn_prev.pack(side=tk.RIGHT, padx=4)
-
-        # Нижня панель плеєра відео (тільки у режимі video)
-        self.fs_controls = tk.Frame(win, bg="#1b1b24", padx=14, pady=8)
-
-        self.fs_btn_play = tk.Button(
-            self.fs_controls,
-            text="⏸" if self.arch_playing else "▶",
-            command=self._toggle_arch_play,
-            bg="#d97706" if self.arch_playing else "#28a745",
-            fg="white",
-            font=("Segoe UI", 10, "bold"),
-            width=4,
-            relief=tk.FLAT,
-            cursor="hand2"
-        )
-        self.fs_btn_play.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.fs_slider_var = tk.IntVar(value=self.arch_curr_frame_idx)
-        self.fs_slider = tk.Scale(
-            self.fs_controls,
-            from_=0,
-            to=max(1, self.arch_total_frames - 1),
-            orient=tk.HORIZONTAL,
-            variable=self.fs_slider_var,
-            showvalue=False,
-            bg="#1b1b24",
-            fg="#00e5ff",
-            troughcolor="#2e2e3d",
-            highlightthickness=0,
-            bd=0,
-            sliderlength=18,
-            command=self._on_arch_slider_move
-        )
-        self.fs_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-
-        self.fs_time_lbl = tk.Label(
-            self.fs_controls,
-            text=self.lbl_arch_time.cget("text") if hasattr(self, "lbl_arch_time") else "00:00/00:00",
-            fg="#e0e0f0",
-            bg="#1b1b24",
-            font=("Consolas", 10, "bold")
-        )
-        self.fs_time_lbl.pack(side=tk.LEFT, padx=10)
-
-        self.fs_btn_speed = tk.Button(
-            self.fs_controls,
-            text=f"{self.arch_speed}x",
-            command=self._cycle_arch_speed,
-            bg="#333344",
-            fg="#00e5ff",
-            font=("Segoe UI", 9, "bold"),
-            width=4,
-            relief=tk.FLAT,
-            cursor="hand2"
-        )
-        self.fs_btn_speed.pack(side=tk.RIGHT)
-
-        # Полотно повноекранного зображення/відео
-        self.fs_canvas = tk.Canvas(win, bg="#0a0a0e", highlightthickness=0, cursor="cross")
-        self.fs_canvas.pack(fill=tk.BOTH, expand=True)
-        self.fs_canvas.bind("<Configure>", lambda e: self._render_fullscreen_content())
-        self.fs_canvas.bind(EVT_BTN_PRESS, self._on_fs_canvas_press)
-        self.fs_canvas.bind(EVT_B1_MOTION, self._on_fs_canvas_motion)
-        self.fs_canvas.bind(EVT_BTN_RELEASE, self._on_fs_canvas_release)
-        self.fs_canvas.bind(EVT_DOUBLE_CLICK, self._on_fs_canvas_double_click)
-        self.fs_canvas.bind(EVT_MOUSEWHEEL, self._on_preview_mousewheel)
-        self.fs_canvas.bind(EVT_BTN4, self._on_preview_mousewheel)
-        self.fs_canvas.bind(EVT_BTN5, self._on_preview_mousewheel)
-
-        self._sync_fs_controls_visibility()
-        win.update_idletasks()
-        self._render_fullscreen_content()
-
-    def _sync_fs_controls_visibility(self):
-        if self.fs_win is None or not self.fs_win.winfo_exists():
-            return
-
-        has_crop = self.current_roi_coords is not None
-        if has_crop:
-            self.fs_btn_crop_mode.configure(text="🖼 Повний кадр" if self.fs_crop_mode else "🔍 Показати кроп")
-            if not self.fs_btn_crop_mode.winfo_ismapped():
-                self.fs_btn_crop_mode.pack(side=tk.RIGHT, padx=4)
-            if not self.fs_btn_clear_crop.winfo_ismapped():
-                self.fs_btn_clear_crop.pack(side=tk.RIGHT, padx=4)
+        if self.roi_maximized:
+            mx, my, mw, mh = self._get_current_monitor_geometry(self.roi_panel)
+            self.roi_panel.geometry(f"{mw}x{mh}+{mx}+{my}")
         else:
-            self.fs_btn_crop_mode.pack_forget()
-            self.fs_btn_clear_crop.pack_forget()
+            self._clamp_roi_to_virtual_screen()
+            self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
 
-        if self.fs_canvas is not None:
-            self.fs_canvas.configure(cursor="hand2" if self.fs_crop_mode else "cross")
+        self.roi_panel.deiconify()
+        self.roi_panel.lift()
+        if not was_visible:
+            try:
+                self.roi_panel.focus_set()
+            except Exception:
+                pass
+        self.roi_panel.update_idletasks()
+        self._update_roi_toolbar_labels()
+        self._render_current_roi_view()
+        if not self.roi_maximized:
+            self.roi_resize_grip.lift()
+
+    def _update_roi_toolbar_labels(self, panel_width=None):
+        if panel_width is None:
+            try:
+                w = int(self.roi_panel.winfo_width())
+            except Exception:
+                w = self.roi_user_width
+            if w <= 20:
+                w = self.roi_user_width
+        else:
+            w = int(panel_width)
+
+        wide = (w >= 460) or self.roi_maximized
+        prev_txt = "◀ Попередній" if wide else "◀ Назад"
+        next_txt = "Наступний ▶" if wide else "Далі ▶"
+        clear_txt = "✕ Скинути кроп" if wide else "✕ Скинути"
+        if self.roi_crop_mode:
+            crop_txt = "🖼 Повний кадр" if wide else "🖼 Кадр"
+        else:
+            crop_txt = "🔍 Показати кроп" if wide else "🔍 Кроп"
+
+        if self.roi_btn_prev.cget("text") != prev_txt:
+            self.roi_btn_prev.configure(text=prev_txt)
+        if self.roi_btn_next.cget("text") != next_txt:
+            self.roi_btn_next.configure(text=next_txt)
+        if self.roi_btn_crop_mode.cget("text") != crop_txt:
+            self.roi_btn_crop_mode.configure(text=crop_txt)
+        if self.roi_btn_clear_crop.cget("text") != clear_txt:
+            self.roi_btn_clear_crop.configure(text=clear_txt)
+
+    def _sync_roi_controls_visibility(self):
+        has_crop = self.current_roi_coords is not None
+        if not has_crop and self.roi_crop_mode:
+            self.roi_crop_mode = False
+
+        if has_crop:
+            if not self.roi_btn_crop_mode.winfo_ismapped():
+                self.roi_btn_crop_mode.pack(side=tk.LEFT, padx=(0, 4))
+            if not self.roi_btn_clear_crop.winfo_ismapped():
+                self.roi_btn_clear_crop.pack(side=tk.LEFT)
+        else:
+            self.roi_btn_crop_mode.pack_forget()
+            self.roi_btn_clear_crop.pack_forget()
+
+        self._update_roi_toolbar_labels()
+
+        max_icon = "🗗" if self.roi_maximized else "⛶"
+        if self.roi_btn_max.cget("text") != max_icon:
+            self.roi_btn_max.configure(text=max_icon)
+
+        drag_cursor = "" if self.roi_maximized else "fleur"
+        for w in (self.roi_header, self.roi_title_lbl, self.roi_toolbar):
+            if str(w.cget("cursor")) != drag_cursor:
+                w.configure(cursor=drag_cursor)
+
+        if self.roi_maximized:
+            self.roi_resize_grip.place_forget()
+            self.roi_btn_speed.pack_configure(padx=(0, 0))
+        else:
+            self.roi_resize_grip.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-1, y=-1)
+            self.roi_btn_speed.pack_configure(padx=(0, 14))
+
+        self.roi_canvas.configure(cursor="hand2" if self.roi_crop_mode else "cross")
 
         if self.sidebar_mode == "video" and self.arch_cap is not None:
-            if not self.fs_controls.winfo_ismapped():
-                self.fs_controls.pack(fill=tk.X, side=tk.BOTTOM, before=self.fs_canvas)
+            if not self.roi_controls_frame.winfo_ismapped():
+                self.roi_controls_frame.pack(fill=tk.X, side=tk.BOTTOM, before=self.roi_canvas)
             self._update_arch_play_buttons()
             self._update_arch_time_ui()
         else:
-            self.fs_controls.pack_forget()
+            self.roi_controls_frame.pack_forget()
 
-    def _render_fullscreen_content(self):
-        if self.fs_win is None or not self.fs_win.winfo_exists() or self.fs_canvas is None:
+        if not self.roi_maximized:
+            self.roi_resize_grip.lift()
+
+    def _render_current_roi_view(self):
+        if not (self.roi_visible or self.roi_panel.winfo_ismapped()):
             return
 
-        cw = self.fs_canvas.winfo_width()
-        ch = self.fs_canvas.winfo_height()
+        cw = self.roi_canvas.winfo_width()
+        ch = self.roi_canvas.winfo_height()
         if cw < 20 or ch < 20:
             return
 
         if self.current_screen_img_cv is None:
-            self.fs_canvas.delete("all")
-            self.fs_canvas.create_text(cw // 2, ch // 2, text="[Немає зображення для перегляду]", fill="#707080", font=("Segoe UI", 14))
+            self.roi_canvas.delete("all")
+            self.roi_canvas_img_id = None
+            self.roi_canvas.create_text(
+                cw // 2, ch // 2,
+                text="[Немає зображення для перегляду]",
+                fill="#707080",
+                font=("Segoe UI", 11),
+                tags="placeholder"
+            )
+            self.roi_title_lbl.configure(text="Перегляд")
             return
 
-        if self.fs_crop_mode:
-            src_bgr = self._extract_roi_bgr(self.current_screen_img_cv, self.current_roi_coords)
-            if src_bgr is None:
-                src_bgr = self.last_roi_crop_bgr if self.last_roi_crop_bgr is not None else self.current_screen_img_cv
-        else:
-            src_bgr = self.current_screen_img_cv
+        is_crop = False
+        src_bgr = self.current_screen_img_cv
+        if self.roi_crop_mode:
+            crop_bgr = self._extract_roi_bgr(self.current_screen_img_cv, self.current_roi_coords) if self.current_roi_coords is not None else None
+            if crop_bgr is not None:
+                self.last_roi_crop_bgr = crop_bgr
+                src_bgr = crop_bgr
+                is_crop = True
+            elif self.last_roi_crop_bgr is not None:
+                src_bgr = self.last_roi_crop_bgr
+                is_crop = True
+            else:
+                self.roi_crop_mode = False
 
         orig_h, orig_w = src_bgr.shape[:2]
         if orig_w <= 0 or orig_h <= 0:
@@ -2267,134 +2421,101 @@ class ANPRViewerApp:
         off_x = (cw - disp_w) // 2
         off_y = (ch - disp_h) // 2
 
-        self.fs_scale_x = orig_w / float(disp_w)
-        self.fs_scale_y = orig_h / float(disp_h)
-        self.fs_img_offset_x = off_x
-        self.fs_img_offset_y = off_y
-        self.fs_disp_w = disp_w
-        self.fs_disp_h = disp_h
+        self.roi_scale_x = orig_w / float(disp_w)
+        self.roi_scale_y = orig_h / float(disp_h)
+        self.roi_img_offset_x = off_x
+        self.roi_img_offset_y = off_y
+        self.roi_disp_w = disp_w
+        self.roi_disp_h = disp_h
 
-        interp = cv2.INTER_LANCZOS4 if self.fs_crop_mode else cv2.INTER_LINEAR
+        interp = cv2.INTER_LANCZOS4 if is_crop else cv2.INTER_LINEAR
         resized = cv2.resize(src_bgr, (disp_w, disp_h), interpolation=interp)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        self.fs_photo_tk = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.roi_photo_tk = ImageTk.PhotoImage(Image.fromarray(rgb))
 
-        self.fs_canvas.delete("fs_img")
-        self.fs_canvas.create_image(off_x, off_y, anchor=tk.NW, image=self.fs_photo_tk, tags="fs_img")
+        self.roi_canvas.delete("placeholder")
+        if self.roi_canvas_img_id is None or not self.roi_canvas.find_withtag("roi_img"):
+            self.roi_canvas_img_id = self.roi_canvas.create_image(
+                off_x, off_y, anchor=tk.NW, image=self.roi_photo_tk, tags="roi_img"
+            )
+        else:
+            self.roi_canvas.coords(self.roi_canvas_img_id, off_x, off_y)
+            self.roi_canvas.itemconfig(self.roi_canvas_img_id, image=self.roi_photo_tk)
 
-        # Якщо у повному режимі є кроп — показати зелену рамку області кропу
-        self.fs_canvas.delete("fs_roi_existing")
-        if (not self.fs_crop_mode) and (self.current_roi_coords is not None) and (self.fs_drag_start_x is None):
+        # У повному режимі відображаємо зелену рамку поточного кропу
+        self.roi_canvas.delete("roi_existing")
+        if (not is_crop) and (self.current_roi_coords is not None) and (self.roi_canvas_drag_start_x is None):
             cx1, cy1, cx2, cy2 = self.current_roi_coords
-            rx1 = off_x + cx1 / self.fs_scale_x
-            ry1 = off_y + cy1 / self.fs_scale_y
-            rx2 = off_x + cx2 / self.fs_scale_x
-            ry2 = off_y + cy2 / self.fs_scale_y
-            self.fs_canvas.create_rectangle(rx1, ry1, rx2, ry2, outline="#00ff00", width=2, tags="fs_roi_existing")
-            self.fs_canvas.tag_raise("fs_roi_existing")
+            rx1 = off_x + cx1 / self.roi_scale_x
+            ry1 = off_y + cy1 / self.roi_scale_y
+            rx2 = off_x + cx2 / self.roi_scale_x
+            ry2 = off_y + cy2 / self.roi_scale_y
+            self.roi_canvas.create_rectangle(rx1, ry1, rx2, ry2, outline="#00ff00", width=2, tags="roi_existing")
+            self.roi_canvas.tag_raise("roi_existing")
 
-        if self.fs_canvas.find_withtag("fs_roi_drag"):
-            self.fs_canvas.tag_raise("fs_roi_drag")
+        if self.roi_canvas.find_withtag("roi_drag"):
+            self.roi_canvas.tag_raise("roi_drag")
 
         fname = os.path.basename(self.current_preview_fpath) if self.current_preview_fpath else ""
-        mode_tag = f"Кроп ({orig_w}x{orig_h})" if self.fs_crop_mode else f"Повний екран ({orig_w}x{orig_h}) • виділіть область для кропу"
-        self.fs_title_lbl.configure(text=f"{fname}   —   {mode_tag}" if fname else mode_tag)
+        if is_crop:
+            tag = f"Кроп відео ({orig_w}x{orig_h})" if self.sidebar_mode == "video" else f"Кроп ({orig_w}x{orig_h})"
+        else:
+            tag = f"Повний кадр ({orig_w}x{orig_h})"
+        title_txt = f"{fname} — {tag}" if fname else tag
+        if self.roi_title_lbl.cget("text") != title_txt:
+            self.roi_title_lbl.configure(text=title_txt)
 
-    def _toggle_fs_crop_mode(self):
+    def _toggle_roi_crop_mode(self):
         if self.current_roi_coords is None and self.last_roi_crop_bgr is None:
             return
-        self.fs_crop_mode = not self.fs_crop_mode
-        self._sync_fs_controls_visibility()
-        self._render_fullscreen_content()
+        self.roi_crop_mode = not self.roi_crop_mode
+        self._sync_roi_controls_visibility()
+        self._render_current_roi_view()
 
-    def _clear_fs_crop(self):
-        self._hide_roi_panel(clear_coords=True)
-        self.fs_crop_mode = False
-        self._sync_fs_controls_visibility()
-        self._render_fullscreen_content()
+    def _clear_roi_crop(self):
+        self.current_roi_coords = None
+        self.last_roi_crop_bgr = None
+        self.roi_crop_mode = False
+        if hasattr(self, "screen_canvas"):
+            self.screen_canvas.delete("roi_rect")
+        if self.roi_visible or self.roi_panel.winfo_ismapped():
+            self._sync_roi_controls_visibility()
+            self._render_current_roi_view()
 
-    def _on_fs_canvas_double_click(self, event=None):
-        self._mark_double_click("fs_canvas")
-        self._close_fullscreen_preview()
-
-    def _on_fs_canvas_press(self, event):
-        if self.current_screen_img_cv is None:
+    def _toggle_roi_maximize(self):
+        if not self.roi_visible:
             return
-        if self.fs_crop_mode:
-            self.fs_drag_start_x = event.x
-            self.fs_drag_start_y = event.y
-            self.fs_drag_moved = False
-            return
-        self.fs_drag_start_x = max(self.fs_img_offset_x, min(self.fs_img_offset_x + self.fs_disp_w, event.x))
-        self.fs_drag_start_y = max(self.fs_img_offset_y, min(self.fs_img_offset_y + self.fs_disp_h, event.y))
-        self.fs_drag_moved = False
+        if not self.roi_maximized:
+            mx, my, mw, mh = self._get_current_monitor_geometry(self.roi_panel)
+            self.roi_maximized = True
+            self.roi_panel.geometry(f"{mw}x{mh}+{mx}+{my}")
+        else:
+            self.roi_maximized = False
+            self._clamp_roi_to_virtual_screen()
+            self.roi_panel.geometry(f"{self.roi_user_width}x{self.roi_user_height}+{self.roi_user_left}+{self.roi_user_top}")
 
-    def _on_fs_canvas_motion(self, event):
-        if self.fs_drag_start_x is None or self.fs_drag_start_y is None or self.fs_crop_mode:
-            return
-        cur_x = max(self.fs_img_offset_x, min(self.fs_img_offset_x + self.fs_disp_w, event.x))
-        cur_y = max(self.fs_img_offset_y, min(self.fs_img_offset_y + self.fs_disp_h, event.y))
-        if abs(cur_x - self.fs_drag_start_x) >= 6 or abs(cur_y - self.fs_drag_start_y) >= 6:
-            self.fs_drag_moved = True
-        if self.fs_drag_moved:
-            self.fs_canvas.delete("fs_roi_drag")
-            self.fs_canvas.create_rectangle(
-                self.fs_drag_start_x, self.fs_drag_start_y, cur_x, cur_y,
-                outline="#00ff00", width=2, tags="fs_roi_drag"
-            )
-            self.fs_canvas.tag_raise("fs_roi_drag")
+        self.roi_panel.lift()
+        self._sync_roi_controls_visibility()
+        self.roi_panel.update_idletasks()
+        self._update_roi_toolbar_labels()
+        self._render_current_roi_view()
+        if not self.roi_maximized:
+            self.roi_resize_grip.lift()
 
-    def _on_fs_canvas_release(self, event):
-        if self.fs_crop_mode:
-            self.fs_drag_start_x = None
-            self.fs_drag_start_y = None
-            self.fs_drag_moved = False
-            self._schedule_single_click_play_toggle("fs_canvas")
-            return
-
-        if self.fs_drag_start_x is None or self.fs_drag_start_y is None:
-            return
-        end_x = max(self.fs_img_offset_x, min(self.fs_img_offset_x + self.fs_disp_w, event.x))
-        end_y = max(self.fs_img_offset_y, min(self.fs_img_offset_y + self.fs_disp_h, event.y))
-
-        x1 = min(self.fs_drag_start_x, end_x) - self.fs_img_offset_x
-        x2 = max(self.fs_drag_start_x, end_x) - self.fs_img_offset_x
-        y1 = min(self.fs_drag_start_y, end_y) - self.fs_img_offset_y
-        y2 = max(self.fs_drag_start_y, end_y) - self.fs_img_offset_y
-
-        was_moved = self.fs_drag_moved
-        self.fs_drag_start_x = None
-        self.fs_drag_start_y = None
-        self.fs_drag_moved = False
-        self.fs_canvas.delete("fs_roi_drag")
-
-        if not was_moved or (x2 - x1) < 8 or (y2 - y1) < 8 or self.current_screen_img_cv is None:
-            self._schedule_single_click_play_toggle("fs_canvas")
-            return
-
-        orig_h, orig_w = self.current_screen_img_cv.shape[:2]
-        crop_x1 = max(0, min(orig_w - 1, int(round(x1 * self.fs_scale_x))))
-        crop_y1 = max(0, min(orig_h - 1, int(round(y1 * self.fs_scale_y))))
-        crop_x2 = max(crop_x1 + 1, min(orig_w, int(round(x2 * self.fs_scale_x))))
-        crop_y2 = max(crop_y1 + 1, min(orig_h, int(round(y2 * self.fs_scale_y))))
-
-        self.fs_crop_mode = True
-        self._apply_roi_crop_coords((crop_x1, crop_y1, crop_x2, crop_y2), open_panel=True)
-
-    def _close_fullscreen_preview(self):
+    def _hide_roi_panel(self, clear_coords=True):
         self._cancel_single_click_play_toggle()
-        if self.fs_win is not None:
-            try:
-                self.fs_win.destroy()
-            except Exception:
-                pass
-            self.fs_win = None
-        self.fs_canvas = None
-        self.fs_photo_tk = None
+        self.roi_visible = False
+        self.roi_maximized = False
+        self.roi_crop_mode = False
         try:
-            self.root.focus_force()
+            self.roi_panel.withdraw()
         except Exception:
             pass
+        if clear_coords:
+            self.current_roi_coords = None
+            self.last_roi_crop_bgr = None
+            if hasattr(self, "screen_canvas"):
+                self.screen_canvas.delete("roi_rect")
 
     def _schedule_hide(self, delay=5000):
         self._cancel_hide_timer()
@@ -2432,30 +2553,6 @@ class ANPRViewerApp:
             else:
                 if self.hide_timer is None and not self.sidebar_visible:
                     self._schedule_hide(5000)
-
-    def _show_help(self):
-        def _fmt_days(d):
-            return "необмежено" if d <= 0 else f"{self._fmt_num(d)} дн."
-
-        help_text = (
-            "ANPR, Face, People & Video Monitor (Modular Architecture)\n\n"
-            f"• Номери (plates_on): {self.plates_on} | рамки: {self.plates_show_boxes} | дати: {self._format_date_range_str('plates')} | автовид.: {_fmt_days(self.plates_delete_older_days)}\n"
-            f"• Обличчя (faces_on): {self.faces_on} | рамки: {self.faces_show_boxes} | дати: {self._format_date_range_str('faces')} | автовид.: {_fmt_days(self.faces_delete_older_days)}\n"
-            f"• Люди/транспорт (people_on): {self.people_on} (транспорт: {self.people_detect_transport}) | рамки: {self.people_show_boxes} | дати: {self._format_date_range_str('people')} | автовид.: {_fmt_days(self.people_delete_older_days)}\n"
-            f"• Відеозапис (video_on): {self.video_on} | фрагмент: {self._fmt_num(self.video_duration_min)} хв @ {self._fmt_num(self.video_fps)} fps ({self.video_codec} ultrafast) | дати: {self._format_date_range_str('video')} | автовид.: {_fmt_days(self.video_delete_older_days)}\n\n"
-            "• Детекція номерів: best.onnx (640x640) + CCT OCR\n"
-            "• Детекція облич: SCRFD / InsightFace + AdaFace/MBF (112x112)\n"
-            "• Детекція людей та транспорту: yolo11n.onnx (640x640)\n"
-            f"• Поріг збереження номерів: >= {self.min_percent_to_save}%\n"
-            f"• Поріг схожості облич: >= {int(self.face_min_similarity * 100)}%\n"
-            f"• Поріг детекції людей/транспорту: >= {int(self.people_det_thresh * 100)}%\n"
-            f"• Інтервал скріншотів людей/транспорту: {self.people_timer_ms} мс\n"
-            "• Збереження файлів: /plates, /faces, /people, /video (по днях YYYY-MM-DD)\n"
-            "• Керування відеопереглядом: одинарний клік по відео — Пауза/Старт; подвійний клік або '⛶ Розгорнути' — повний екран (Esc — згорнути)\n"
-            "• Плаваюче вікно кропу: перетягуйте за заголовок поверх елементів або на інший монітор\n\n"
-            "Гарячий вихід: Ctrl + Alt + Shift + Q"
-        )
-        messagebox.showinfo("Довідка", help_text)
 
     def toggle_stream(self):
         if not self.is_running:
@@ -2721,7 +2818,7 @@ class ANPRViewerApp:
     def on_close(self):
         self.is_running = False
         self.ai_event.set()
-        self._close_fullscreen_preview()
+        self._hide_roi_panel(clear_coords=False)
         self._stop_archive_player()
         if self.video_thread and self.video_thread.is_alive():
             self.video_thread.join(timeout=2.0)
