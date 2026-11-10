@@ -211,14 +211,27 @@ class ANPRViewerApp:
 
         self.current_screen_img_cv = None
         self.current_preview_fpath = None
+        self.current_item_preview_pil = None
+        self.current_item_base_name = ""
+        self.current_item_disp_h = 40
+        self._screen_placeholder_info = ("[Виберіть запис зі списку]", "#707080")
+        self._preview_revision = 0
         self.last_roi_crop_bgr = None
         self.current_roi_coords = None
         self.canvas_scale_x = 1.0
         self.canvas_scale_y = 1.0
         self.canvas_disp_w = 340
         self.canvas_disp_h = 190
+        self.canvas_slot_w = 340
+        self.canvas_slot_h = 190
+        self.canvas_img_offset_x = 1
+        self.canvas_img_offset_y = 1
         self.drag_start_x = None
         self.drag_start_y = None
+        self.side_panel_width = 360
+        self._last_main_body_size = None
+        self._last_sidebar_layout_key = None
+        self._in_sidebar_relayout = False
 
         # Вбудований плеєр архівного відео
         self.arch_cap = None
@@ -885,74 +898,48 @@ class ANPRViewerApp:
 
         self.main_body = tk.Frame(self.root, bg="#0d0d11")
         self.main_body.pack(fill=tk.BOTH, expand=True)
+        self.main_body.bind("<Configure>", self._on_main_body_configure)
 
-        # Бічна панель
-        self.side_panel = tk.Frame(self.main_body, bg="#1e1e24", width=360)
+        # Бічна панель (динамічно адаптується під ширину та висоту поточного екрану)
+        self.side_panel = tk.Frame(self.main_body, bg="#1e1e24", width=self.side_panel_width)
         self.side_panel.pack_propagate(False)
+        self.side_panel.bind("<Configure>", self._on_side_panel_configure)
 
-        side_header = tk.Frame(self.side_panel, bg="#282832", padx=10, pady=6)
-        side_header.pack(fill=tk.X, side=tk.TOP)
-        self.side_header_lbl = tk.Label(side_header, text="Історія номерів", fg="#00e5ff", bg="#282832", font=("Segoe UI", 10, "bold"))
-        self.side_header_lbl.pack(side=tk.LEFT)
-        tk.Button(side_header, text="↻", command=self.refresh_saved_list, bg="#3a3a48", fg="white", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), width=3, cursor="hand2").pack(side=tk.RIGHT)
+        self.side_header = tk.Frame(self.side_panel, bg="#282832", padx=10, pady=6)
+        self.side_header.pack(fill=tk.X, side=tk.TOP)
+        self.side_header_lbl = tk.Label(self.side_header, text="Історія номерів", fg="#00e5ff", bg="#282832", font=("Segoe UI", 10, "bold"), anchor=tk.W, width=1)
+        self.side_header_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(self.side_header, text="↻", command=self.refresh_saved_list, bg="#3a3a48", fg="white", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), width=3, cursor="hand2").pack(side=tk.RIGHT)
 
-        search_frame = tk.Frame(self.side_panel, bg="#22222c", padx=6, pady=6)
-        search_frame.pack(fill=tk.X, side=tk.TOP)
+        self.search_frame = tk.Frame(self.side_panel, bg="#22222c", padx=6, pady=6)
+        self.search_frame.pack(fill=tk.X, side=tk.TOP)
 
-        tk.Label(search_frame, text="🔍", fg="#888899", bg="#22222c", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(2, 4))
+        tk.Label(self.search_frame, text="🔍", fg="#888899", bg="#22222c", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(2, 4))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *args: self._apply_search_and_sort())
-        self.search_entry = tk.Entry(search_frame, textvariable=self.search_var, bg="#14141a", fg="#ffffff", insertbackground="white", bd=1, relief=tk.FLAT, font=("Segoe UI", 9))
+        self.search_entry = tk.Entry(self.search_frame, textvariable=self.search_var, bg="#14141a", fg="#ffffff", insertbackground="white", bd=1, relief=tk.FLAT, font=("Segoe UI", 9))
         self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2), ipady=2)
 
-        btn_clear = tk.Button(search_frame, text="✕", command=self._clear_search, bg="#2d2d38", fg="#ff7777", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), width=2, cursor="hand2")
+        btn_clear = tk.Button(self.search_frame, text="✕", command=self._clear_search, bg="#2d2d38", fg="#ff7777", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), width=2, cursor="hand2")
         btn_clear.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.btn_sort = tk.Button(search_frame, text="▼ Час", command=self._toggle_sort, bg="#333342", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=5, cursor="hand2")
+        self.btn_sort = tk.Button(self.search_frame, text="▼ Час", command=self._toggle_sort, bg="#333342", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=5, cursor="hand2")
         self.btn_sort.pack(side=tk.RIGHT)
 
-        tree_frame = tk.Frame(self.side_panel, bg="#16161d", padx=6, pady=4)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-        scrollbar = tk.Scrollbar(tree_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("ProDark.Treeview", background="#16161d", foreground="#ffffff", fieldbackground="#16161d", font=("Segoe UI", 10), rowheight=26, borderwidth=0)
-        style.map("ProDark.Treeview", background=[("selected", "#007acc")], foreground=[("selected", "#ffffff")])
-
-        self.items_tree = ttk.Treeview(tree_frame, style="ProDark.Treeview", show="tree", selectmode="browse", yscrollcommand=scrollbar.set)
-        self.items_tree.column("#0", width=330, stretch=True)
-        self.items_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.items_tree.yview)
-
-        self.items_tree.tag_configure("day_tag", font=("Segoe UI", 10, "bold"), foreground="#00e5ff")
-        self.items_tree.tag_configure("item_tag", font=("Consolas", 10, "bold"), foreground="#75e08b")
-        self.items_tree.bind(EVT_TREE_SELECT, self._on_item_selected)
-        self.items_tree.bind(EVT_DOUBLE_CLICK, self._on_item_double_clicked)
-
-        for w in (self.items_tree, scrollbar, tree_frame):
-            w.bind(EVT_ENTER, self._bind_tree_mousewheel)
-            w.bind(EVT_LEAVE, self._unbind_tree_mousewheel)
-
-        self.preview_container = tk.Frame(self.side_panel, bg="#14141a", pady=6, padx=8)
+        # Важливо: preview_container пакуємо ДО tree_frame, щоб прев'ю (знімок і скрін) ніколи не зникало за межі екрану,
+        # а tree_frame завжди заповнював весь залишок простору між пошуком і блоком прев'ю.
+        self.preview_container = tk.Frame(self.side_panel, bg="#14141a", pady=4, padx=8)
         self.preview_container.pack(fill=tk.X, side=tk.BOTTOM)
 
-        self.preview_info_lbl = tk.Label(self.preview_container, text="Знімок об'єкта:", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9))
-        self.preview_info_lbl.pack(anchor=tk.W, pady=(0, 2))
+        self.preview_info_lbl = tk.Label(self.preview_container, text="Знімок об'єкта:", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9), anchor=tk.W, width=1)
+        self.preview_info_lbl.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
 
-        self.preview_label = tk.Label(self.preview_container, bg="#1a1a22", text="[Виберіть запис зі списку]", fg="#707080", font=("Segoe UI", 9), pady=10, relief=tk.SOLID, borderwidth=1)
-        self.preview_label.pack(fill=tk.X)
+        self.preview_label = tk.Label(self.preview_container, bg="#1a1a22", text="[Виберіть запис зі списку]", fg="#707080", font=("Segoe UI", 9), pady=8, relief=tk.SOLID, borderwidth=1)
+        self.preview_label.pack(side=tk.TOP, fill=tk.X)
         self.preview_label.bind(EVT_DOUBLE_CLICK, lambda e: self._open_roi_viewer(crop_mode=False, source_widget=self.preview_label))
 
         self.screen_header_frame = tk.Frame(self.preview_container, bg="#14141a")
-        self.screen_header_frame.pack(fill=tk.X, pady=(6, 2))
-
-        self.screen_info_lbl = tk.Label(self.screen_header_frame, text="Фото скріну (кроп / 2x клік):", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9))
-        self.screen_info_lbl.pack(side=tk.LEFT)
+        self.screen_header_frame.pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
 
         self.btn_expand_preview = tk.Button(
             self.screen_header_frame,
@@ -968,8 +955,38 @@ class ANPRViewerApp:
         )
         self.btn_expand_preview.pack(side=tk.RIGHT)
 
+        self.screen_info_lbl = tk.Label(self.screen_header_frame, text="Фото скріну (кроп / 2x клік):", fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9), anchor=tk.W, width=1)
+        self.screen_info_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
         self.screen_canvas = tk.Canvas(self.preview_container, bg="#1a1a22", width=340, height=190, highlightthickness=1, highlightbackground="#333340", cursor="cross")
-        self.screen_canvas.pack(fill=tk.X, pady=(0, 2))
+        self.screen_canvas.pack(side=tk.TOP, pady=(0, 2))
+
+        self.tree_frame = tk.Frame(self.side_panel, bg="#16161d", padx=6, pady=4)
+        self.tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(self.tree_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("ProDark.Treeview", background="#16161d", foreground="#ffffff", fieldbackground="#16161d", font=("Segoe UI", 10), rowheight=26, borderwidth=0)
+        style.map("ProDark.Treeview", background=[("selected", "#007acc")], foreground=[("selected", "#ffffff")])
+
+        self.items_tree = ttk.Treeview(self.tree_frame, style="ProDark.Treeview", show="tree", selectmode="browse", yscrollcommand=scrollbar.set)
+        self.items_tree.column("#0", width=330, stretch=True)
+        self.items_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.items_tree.yview)
+
+        self.items_tree.tag_configure("day_tag", font=("Segoe UI", 10, "bold"), foreground="#00e5ff")
+        self.items_tree.tag_configure("item_tag", font=("Consolas", 10, "bold"), foreground="#75e08b")
+        self.items_tree.bind(EVT_TREE_SELECT, self._on_item_selected)
+        self.items_tree.bind(EVT_DOUBLE_CLICK, self._on_item_double_clicked)
+
+        for w in (self.items_tree, scrollbar, self.tree_frame):
+            w.bind(EVT_ENTER, self._bind_tree_mousewheel)
+            w.bind(EVT_LEAVE, self._unbind_tree_mousewheel)
         self.screen_canvas_img_id = None
         self.drag_moved = False
         self.screen_canvas.bind(EVT_BTN_PRESS, self._on_screen_canvas_press)
@@ -1519,32 +1536,269 @@ class ANPRViewerApp:
             self.roi_resize_moved = False
             self._save_roi_geometry_to_config()
 
+    def _compute_sidebar_width(self, container_w=None):
+        if container_w is None or container_w <= 100:
+            try:
+                container_w = int(self.main_body.winfo_width())
+            except Exception:
+                container_w = 0
+        if container_w <= 100:
+            try:
+                container_w = int(self.root.winfo_width())
+            except Exception:
+                container_w = 0
+        if container_w <= 100:
+            try:
+                container_w = int(self.root.winfo_screenwidth())
+            except Exception:
+                container_w = 1280
+
+        max_by_ratio = max(220, int(round(container_w * 0.42)))
+        target_w = int(round(container_w * 0.23))
+        target_w = max(290, min(480, target_w))
+        return min(target_w, max_by_ratio)
+
+    def _sync_sidebar_width(self, container_w=None):
+        target_w = self._compute_sidebar_width(container_w)
+        self.side_panel_width = target_w
+        try:
+            if int(self.side_panel.cget("width")) != target_w:
+                self.side_panel.configure(width=target_w)
+        except Exception:
+            self.side_panel.configure(width=target_w)
+        try:
+            self.items_tree.column("#0", width=max(160, target_w - 30))
+        except Exception:
+            pass
+        return target_w
+
+    def _get_sidebar_preview_budgets(self, mode=None):
+        """Динамічно обчислює (slot_w, max_item_h, max_screen_h) під поточний розмір вікна/екрану."""
+        mode = mode or self.sidebar_mode
+
+        try:
+            pw = int(self.side_panel.winfo_width())
+        except Exception:
+            pw = 0
+        if pw <= 60:
+            pw = self.side_panel_width or self._compute_sidebar_width()
+        slot_w = max(140, pw - 18)  # 16px padx preview_container + 2px highlightthickness
+
+        try:
+            ph = int(self.side_panel.winfo_height())
+        except Exception:
+            ph = 0
+        if ph <= 60:
+            try:
+                ph = int(self.main_body.winfo_height())
+            except Exception:
+                ph = 0
+        if ph <= 60:
+            try:
+                rh = int(self.root.winfo_height())
+                ch = int(self.ctrl_frame.winfo_height()) if self.panel_visible else 0
+                if rh > 100:
+                    ph = rh - max(0, ch)
+            except Exception:
+                ph = 0
+        if ph <= 60:
+            ph = max(480, int(self.root.winfo_screenheight()) - 60)
+
+        try:
+            side_hdr_h = max(28, int(self.side_header.winfo_reqheight()))
+        except Exception:
+            side_hdr_h = 34
+        try:
+            search_h = max(28, int(self.search_frame.winfo_reqheight()))
+        except Exception:
+            search_h = 34
+        top_chrome_h = side_hdr_h + search_h
+
+        container_pad_y = 10
+        try:
+            scr_hdr_h = max(22, int(self.screen_header_frame.winfo_reqheight())) + 6
+        except Exception:
+            scr_hdr_h = 30
+        canvas_chrome_h = 4
+
+        if mode in ("plates", "faces"):
+            try:
+                prev_hdr_h = max(18, int(self.preview_info_lbl.winfo_reqheight())) + 2
+            except Exception:
+                prev_hdr_h = 22
+            item_border_h = 4
+            ctrl_h = 0
+        elif mode == "video":
+            prev_hdr_h = 0
+            item_border_h = 0
+            try:
+                ctrl_h = max(32, int(self.video_controls_frame.winfo_reqheight())) + 6
+            except Exception:
+                ctrl_h = 38
+        else:
+            prev_hdr_h = 0
+            item_border_h = 0
+            ctrl_h = 0
+
+        preview_chrome_h = container_pad_y + prev_hdr_h + item_border_h + scr_hdr_h + canvas_chrome_h + ctrl_h
+
+        if ph < 500:
+            min_tree_h = max(80, int(round(ph * 0.24)))
+        elif ph < 760:
+            min_tree_h = max(130, int(round(ph * 0.27)))
+        else:
+            min_tree_h = max(165, int(round(ph * 0.30)))
+
+        preview_budget = max(120, ph - top_chrome_h - min_tree_h - 6)
+        img_budget = max(80, preview_budget - preview_chrome_h)
+
+        if mode in ("plates", "faces"):
+            min_screen_floor = max(48, int(round(img_budget * 0.48)))
+            base_item_max_h = max(
+                36,
+                min(
+                    int(round(img_budget * 0.38)),
+                    int(round(slot_w * 0.58)),
+                    max(36, img_budget - min_screen_floor),
+                ),
+            )
+            if self.current_item_preview_pil is not None:
+                iw, ih = self.current_item_preview_pil.size
+                if iw > 0 and ih > 0:
+                    iscale = min(slot_w / float(iw), base_item_max_h / float(ih))
+                    used_item_h = max(1, min(base_item_max_h, int(round(ih * iscale))))
+                else:
+                    used_item_h = min(base_item_max_h, 40)
+            else:
+                try:
+                    req_lbl_h = int(self.preview_label.winfo_reqheight())
+                except Exception:
+                    req_lbl_h = 38
+                used_item_h = min(base_item_max_h, max(32, req_lbl_h))
+            max_screen_h = max(48, img_budget - used_item_h)
+            return slot_w, base_item_max_h, max_screen_h
+
+        return slot_w, 0, max(60, img_budget)
+
+    def _on_main_body_configure(self, event=None):
+        if event is not None and event.widget is not self.main_body:
+            return
+        mw = int(getattr(event, "width", 0) or self.main_body.winfo_width() or 0)
+        mh = int(getattr(event, "height", 0) or self.main_body.winfo_height() or 0)
+        if mw < 200 or mh < 150:
+            return
+        if (mw, mh) == self._last_main_body_size:
+            return
+        self._last_main_body_size = (mw, mh)
+        self._sync_sidebar_width(mw)
+        if self.sidebar_visible:
+            self._relayout_sidebar_previews()
+
+    def _on_side_panel_configure(self, event=None):
+        if event is not None and event.widget is not self.side_panel:
+            return
+        if not self.sidebar_visible:
+            return
+        pw = int(getattr(event, "width", 0) or self.side_panel.winfo_width() or 0)
+        ph = int(getattr(event, "height", 0) or self.side_panel.winfo_height() or 0)
+        if pw < 60 or ph < 60:
+            return
+        self._relayout_sidebar_previews()
+
+    def _relayout_sidebar_previews(self, force=False):
+        if self._in_sidebar_relayout or not self.sidebar_visible:
+            return
+        try:
+            pw = int(self.side_panel.winfo_width())
+            ph = int(self.side_panel.winfo_height())
+        except Exception:
+            pw, ph = self.side_panel_width, 0
+
+        budgets = self._get_sidebar_preview_budgets()
+        state_key = (pw, ph, self.sidebar_mode, budgets, self._preview_revision)
+        if not force and state_key == self._last_sidebar_layout_key:
+            return
+
+        self._in_sidebar_relayout = True
+        try:
+            self._last_sidebar_layout_key = state_key
+            if self.sidebar_mode in ("plates", "faces") and self.current_item_preview_pil is not None:
+                self._render_item_preview_image()
+
+            if self.current_screen_img_cv is not None:
+                self._display_cv_in_screen_canvas(self.current_screen_img_cv, keep_roi=True)
+            else:
+                ph_txt, ph_col = self._screen_placeholder_info
+                self._set_screen_canvas_placeholder(ph_txt, color=ph_col)
+
+            self._last_sidebar_layout_key = (
+                pw,
+                ph,
+                self.sidebar_mode,
+                self._get_sidebar_preview_budgets(),
+                self._preview_revision,
+            )
+        finally:
+            self._in_sidebar_relayout = False
+
     def _update_preview_layout(self, mode):
         """Для номерів/облич — 2 вікна (кроп + повний скрін); для людей та відео — 1 спільне вікно."""
         if mode in ("people", "video"):
             self.preview_info_lbl.pack_forget()
             self.preview_label.pack_forget()
         else:
-            if not self.preview_info_lbl.winfo_ismapped():
-                self.preview_info_lbl.pack(anchor=tk.W, pady=(0, 2), before=self.screen_header_frame)
-            if not self.preview_label.winfo_ismapped():
-                self.preview_label.pack(fill=tk.X, before=self.screen_header_frame)
+            if str(self.preview_info_lbl.winfo_manager()) != "pack":
+                self.preview_info_lbl.pack(side=tk.TOP, fill=tk.X, pady=(0, 2), before=self.screen_header_frame)
+            if str(self.preview_label.winfo_manager()) != "pack":
+                self.preview_label.pack(side=tk.TOP, fill=tk.X, before=self.screen_header_frame)
 
         if mode == "video":
             self.screen_info_lbl.configure(text="Відеоперегляд (кроп / 2x клік):")
-            if not self.video_controls_frame.winfo_ismapped():
-                self.video_controls_frame.pack(fill=tk.X, pady=(4, 0))
+            if str(self.video_controls_frame.winfo_manager()) != "pack":
+                self.video_controls_frame.pack(side=tk.TOP, fill=tk.X, pady=(4, 0), after=self.screen_canvas)
         else:
             self.video_controls_frame.pack_forget()
             self.screen_info_lbl.configure(text="Фото скріну (кроп / 2x клік):")
 
-    def _clear_screen_preview(self):
-        self.current_screen_img_cv = None
-        self.current_preview_fpath = None
-        self.screen_canvas_img_id = None
+    def _clear_item_preview(self, placeholder="[Виберіть запис зі списку]"):
+        self.current_item_preview_pil = None
+        self.current_item_base_name = ""
+        self.preview_photo_tk = None
+        self.preview_info_lbl.configure(text="Знімок об'єкта:")
+        self.preview_label.configure(image="", text=placeholder, pady=8)
+        self.current_item_disp_h = 38
+
+    def _set_screen_canvas_placeholder(self, text="[Виберіть запис зі списку]", color="#707080"):
+        self._screen_placeholder_info = (text, color)
         self.screen_canvas.delete("all")
-        self.screen_canvas.config(width=340, height=190)
-        self.screen_canvas.create_text(170, 95, text="[Виберіть запис зі списку]", fill="#707080", font=("Segoe UI", 9), tags="placeholder")
+        self.screen_canvas_img_id = None
+        self.current_screen_img_cv = None
+        self.screen_photo_tk = None
+        slot_w, _, max_screen_h = self._get_sidebar_preview_budgets()
+        ph_w = slot_w
+        ph_h = min(max_screen_h, max(72, int(round(ph_w * 9.0 / 16.0))))
+        self.canvas_disp_w = ph_w
+        self.canvas_disp_h = ph_h
+        self.canvas_slot_w = ph_w
+        self.canvas_slot_h = ph_h
+        self.canvas_img_offset_x = 1
+        self.canvas_img_offset_y = 1
+        self.screen_canvas.config(width=ph_w, height=ph_h)
+        self.screen_canvas.create_text(
+            ph_w // 2 + 1,
+            ph_h // 2 + 1,
+            text=text,
+            fill=color,
+            font=("Segoe UI", 9),
+            width=max(100, ph_w - 16),
+            tags="placeholder",
+        )
+
+    def _clear_screen_preview(self, clear_item=True):
+        if clear_item:
+            self._clear_item_preview()
+        self.current_preview_fpath = None
+        self._set_screen_canvas_placeholder("[Виберіть запис зі списку]", color="#707080")
 
     def toggle_side_panel(self, mode="plates"):
         if self.sidebar_visible and self.sidebar_mode == mode:
@@ -1562,6 +1816,7 @@ class ANPRViewerApp:
             if mode != "video":
                 self._stop_archive_player()
             self.video_container.pack_forget()
+            self._sync_sidebar_width()
             self.side_panel.pack(side=tk.LEFT, fill=tk.Y)
             self.video_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.sidebar_visible = True
@@ -1588,11 +1843,13 @@ class ANPRViewerApp:
             self._update_preview_layout(mode)
             if prev_mode != mode:
                 self._hide_roi_panel(clear_coords=True)
-                self._clear_screen_preview()
+                self._clear_screen_preview(clear_item=True)
                 self.items_tree.delete(*self.items_tree.get_children())
                 self.tree_item_map.clear()
 
+            self._last_sidebar_layout_key = None
             self.refresh_saved_list()
+            self._relayout_sidebar_previews(force=True)
 
     def _clear_search(self):
         self.search_var.set("")
@@ -1777,25 +2034,40 @@ class ANPRViewerApp:
 
     def _show_item_in_preview(self, fpath):
         if not fpath or not os.path.exists(fpath):
+            self._clear_item_preview("[Знімок відсутній]")
             return
         try:
-            pil_img = Image.open(fpath)
-            orig_w, orig_h = pil_img.size
-            target_w = 340
-            target_h = max(1, int(target_w * (orig_h / float(orig_w))))
-            pil_img = pil_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-            self.preview_photo_tk = ImageTk.PhotoImage(pil_img)
-            base = os.path.basename(fpath).replace(".jpg", "")
-            if self.sidebar_mode == "plates":
-                lbl_type = "Фото номера:"
-            elif self.sidebar_mode == "faces":
-                lbl_type = "Фото обличчя:"
-            else:
-                lbl_type = "Скріншот об'єкта:"
-            self.preview_info_lbl.configure(text=f"{lbl_type} {base}")
-            self.preview_label.configure(image=self.preview_photo_tk, text="", pady=0)
+            with Image.open(fpath) as pil_src:
+                pil_src.load()
+                self.current_item_preview_pil = pil_src.copy()
+            self.current_item_base_name = os.path.splitext(os.path.basename(fpath))[0]
+            self._render_item_preview_image()
         except Exception:
-            pass
+            self._clear_item_preview("[Помилка читання знімка]")
+
+    def _render_item_preview_image(self):
+        if self.current_item_preview_pil is None:
+            return
+        slot_w, max_item_h, _ = self._get_sidebar_preview_budgets()
+        orig_w, orig_h = self.current_item_preview_pil.size
+        if orig_w <= 0 or orig_h <= 0:
+            return
+        scale = min(slot_w / float(orig_w), max_item_h / float(orig_h))
+        target_w = max(1, int(round(orig_w * scale)))
+        target_h = max(1, int(round(orig_h * scale)))
+        pil_img = self.current_item_preview_pil.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        self.preview_photo_tk = ImageTk.PhotoImage(pil_img)
+        self.current_item_disp_h = target_h
+
+        base = self.current_item_base_name
+        if self.sidebar_mode == "plates":
+            lbl_type = "Фото номера:"
+        elif self.sidebar_mode == "faces":
+            lbl_type = "Фото обличчя:"
+        else:
+            lbl_type = "Скріншот об'єкта:"
+        self.preview_info_lbl.configure(text=f"{lbl_type} {base}")
+        self.preview_label.configure(image=self.preview_photo_tk, text="", pady=0)
 
     @staticmethod
     def _extract_roi_bgr(cv_img, coords):
@@ -1817,10 +2089,10 @@ class ANPRViewerApp:
         if self.canvas_scale_x <= 0 or self.canvas_scale_y <= 0:
             return
         cx1, cy1, cx2, cy2 = self.current_roi_coords
-        sx1 = cx1 / self.canvas_scale_x
-        sy1 = cy1 / self.canvas_scale_y
-        sx2 = cx2 / self.canvas_scale_x
-        sy2 = cy2 / self.canvas_scale_y
+        sx1 = self.canvas_img_offset_x + cx1 / self.canvas_scale_x
+        sy1 = self.canvas_img_offset_y + cy1 / self.canvas_scale_y
+        sx2 = self.canvas_img_offset_x + cx2 / self.canvas_scale_x
+        sy2 = self.canvas_img_offset_y + cy2 / self.canvas_scale_y
         self.screen_canvas.create_rectangle(
             sx1, sy1, sx2, sy2,
             outline="#00ff00", width=2, tags="roi_rect"
@@ -1833,29 +2105,54 @@ class ANPRViewerApp:
         try:
             self.current_screen_img_cv = cv_img
             orig_h, orig_w = cv_img.shape[:2]
+            if orig_w <= 0 or orig_h <= 0:
+                return
 
-            canvas_w = 340
-            aspect = orig_h / float(orig_w) if orig_w > 0 else (9.0 / 16.0)
-            canvas_h = max(1, int(round(canvas_w * aspect)))
+            slot_w, _, max_screen_h = self._get_sidebar_preview_budgets()
+            scale = min(slot_w / float(orig_w), max_screen_h / float(orig_h))
+            disp_w = max(1, int(round(orig_w * scale)))
+            disp_h = max(1, int(round(orig_h * scale)))
+            off_x = 1 + max(0, (slot_w - disp_w) // 2)
+            off_y = 1
 
-            resized = cv2.resize(cv_img, (canvas_w, canvas_h), interpolation=cv2.INTER_AREA)
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            resized = cv2.resize(cv_img, (disp_w, disp_h), interpolation=interp)
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             self.screen_photo_tk = ImageTk.PhotoImage(Image.fromarray(rgb))
 
-            size_changed = (canvas_w != self.canvas_disp_w or canvas_h != self.canvas_disp_h)
-            self.canvas_scale_x = orig_w / float(canvas_w)
-            self.canvas_scale_y = orig_h / float(canvas_h)
-            self.canvas_disp_w = canvas_w
-            self.canvas_disp_h = canvas_h
+            slot_changed = (
+                slot_w != getattr(self, "canvas_slot_w", None)
+                or disp_h != getattr(self, "canvas_slot_h", None)
+            )
+            img_geom_changed = (
+                slot_changed
+                or disp_w != self.canvas_disp_w
+                or disp_h != self.canvas_disp_h
+                or off_x != self.canvas_img_offset_x
+                or off_y != self.canvas_img_offset_y
+            )
+
+            self.canvas_scale_x = orig_w / float(disp_w)
+            self.canvas_scale_y = orig_h / float(disp_h)
+            self.canvas_disp_w = disp_w
+            self.canvas_disp_h = disp_h
+            self.canvas_img_offset_x = off_x
+            self.canvas_img_offset_y = off_y
+            self.canvas_slot_w = slot_w
+            self.canvas_slot_h = disp_h
 
             self.screen_canvas.delete("placeholder")
-            if size_changed or self.screen_canvas_img_id is None or not self.screen_canvas.find_withtag("frame_img"):
+            if slot_changed:
+                self.screen_canvas.config(width=slot_w, height=disp_h)
+
+            if self.screen_canvas_img_id is None or not self.screen_canvas.find_withtag("frame_img"):
                 self.screen_canvas.delete("frame_img")
-                self.screen_canvas.config(width=canvas_w, height=canvas_h)
                 self.screen_canvas_img_id = self.screen_canvas.create_image(
-                    0, 0, anchor=tk.NW, image=self.screen_photo_tk, tags="frame_img"
+                    off_x, off_y, anchor=tk.NW, image=self.screen_photo_tk, tags="frame_img"
                 )
             else:
+                if img_geom_changed:
+                    self.screen_canvas.coords(self.screen_canvas_img_id, off_x, off_y)
                 self.screen_canvas.itemconfig(self.screen_canvas_img_id, image=self.screen_photo_tk)
 
             if keep_roi and self.current_roi_coords is not None:
@@ -1878,11 +2175,7 @@ class ANPRViewerApp:
 
     def _show_screenshot_in_canvas(self, screen_path):
         if not screen_path or not os.path.exists(screen_path):
-            self.screen_canvas.delete("all")
-            self.screen_canvas_img_id = None
-            self.current_screen_img_cv = None
-            self.screen_canvas.config(width=340, height=190)
-            self.screen_canvas.create_text(170, 95, text="[Скріншот відсутній]", fill="#707080", font=("Segoe UI", 9), tags="placeholder")
+            self._set_screen_canvas_placeholder("[Скріншот відсутній]", color="#707080")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
@@ -1891,6 +2184,7 @@ class ANPRViewerApp:
         try:
             cv_img = cv2.imread(screen_path)
             if cv_img is None:
+                self._set_screen_canvas_placeholder("[Помилка читання скріншоту]", color="#ff5555")
                 return
             is_open = bool(self.roi_visible or self.roi_panel.winfo_ismapped())
             keep = bool(is_open and self.current_roi_coords is not None)
@@ -1976,22 +2270,14 @@ class ANPRViewerApp:
     def _load_archive_video(self, fpath, auto_play=True):
         self._stop_archive_player()
         if not fpath or not os.path.exists(fpath):
-            self.screen_canvas.delete("all")
-            self.screen_canvas_img_id = None
-            self.current_screen_img_cv = None
-            self.screen_canvas.config(width=340, height=190)
-            self.screen_canvas.create_text(170, 95, text="[Відеофайл відсутній]", fill="#707080", font=("Segoe UI", 9), tags="placeholder")
+            self._set_screen_canvas_placeholder("[Відеофайл відсутній]", color="#707080")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
             return
 
         if self.video_engine and self.video_engine.is_file_busy(fpath):
-            self.screen_canvas.delete("all")
-            self.screen_canvas_img_id = None
-            self.current_screen_img_cv = None
-            self.screen_canvas.config(width=340, height=190)
-            self.screen_canvas.create_text(170, 95, text="[Файл ще записується...]", fill="#ffcc00", font=("Segoe UI", 9), tags="placeholder")
+            self._set_screen_canvas_placeholder("[Файл ще записується...]", color="#ffcc00")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
@@ -1999,11 +2285,7 @@ class ANPRViewerApp:
 
         cap = cv2.VideoCapture(fpath)
         if not cap.isOpened():
-            self.screen_canvas.delete("all")
-            self.screen_canvas_img_id = None
-            self.current_screen_img_cv = None
-            self.screen_canvas.config(width=340, height=190)
-            self.screen_canvas.create_text(170, 95, text="[Не вдалося відкрити відео]", fill="#ff5555", font=("Segoe UI", 9), tags="placeholder")
+            self._set_screen_canvas_placeholder("[Не вдалося відкрити відео]", color="#ff5555")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
@@ -2156,6 +2438,7 @@ class ANPRViewerApp:
             return
 
         self.current_preview_fpath = fpath
+        self._preview_revision += 1
 
         if self.sidebar_mode == "video":
             self._load_archive_video(fpath, auto_play=True)
@@ -2193,15 +2476,23 @@ class ANPRViewerApp:
     def _on_screen_canvas_press(self, event):
         if self.current_screen_img_cv is None:
             return
-        self.drag_start_x = max(0, min(self.canvas_disp_w, event.x))
-        self.drag_start_y = max(0, min(self.canvas_disp_h, event.y))
+        min_x = self.canvas_img_offset_x
+        max_x = self.canvas_img_offset_x + self.canvas_disp_w
+        min_y = self.canvas_img_offset_y
+        max_y = self.canvas_img_offset_y + self.canvas_disp_h
+        self.drag_start_x = max(min_x, min(max_x, event.x))
+        self.drag_start_y = max(min_y, min(max_y, event.y))
         self.drag_moved = False
 
     def _on_screen_canvas_motion(self, event):
         if self.drag_start_x is None or self.drag_start_y is None or self.current_screen_img_cv is None:
             return
-        cur_x = max(0, min(self.canvas_disp_w, event.x))
-        cur_y = max(0, min(self.canvas_disp_h, event.y))
+        min_x = self.canvas_img_offset_x
+        max_x = self.canvas_img_offset_x + self.canvas_disp_w
+        min_y = self.canvas_img_offset_y
+        max_y = self.canvas_img_offset_y + self.canvas_disp_h
+        cur_x = max(min_x, min(max_x, event.x))
+        cur_y = max(min_y, min(max_y, event.y))
         if abs(cur_x - self.drag_start_x) >= 4 or abs(cur_y - self.drag_start_y) >= 4:
             self.drag_moved = True
         if self.drag_moved:
@@ -2216,13 +2507,18 @@ class ANPRViewerApp:
         if self.drag_start_x is None or self.drag_start_y is None or self.current_screen_img_cv is None:
             return
 
-        end_x = max(0, min(self.canvas_disp_w, event.x))
-        end_y = max(0, min(self.canvas_disp_h, event.y))
+        min_x = self.canvas_img_offset_x
+        max_x = self.canvas_img_offset_x + self.canvas_disp_w
+        min_y = self.canvas_img_offset_y
+        max_y = self.canvas_img_offset_y + self.canvas_disp_h
 
-        x1 = min(self.drag_start_x, end_x)
-        x2 = max(self.drag_start_x, end_x)
-        y1 = min(self.drag_start_y, end_y)
-        y2 = max(self.drag_start_y, end_y)
+        end_x = max(min_x, min(max_x, event.x))
+        end_y = max(min_y, min(max_y, event.y))
+
+        x1 = min(self.drag_start_x, end_x) - min_x
+        x2 = max(self.drag_start_x, end_x) - min_x
+        y1 = min(self.drag_start_y, end_y) - min_y
+        y2 = max(self.drag_start_y, end_y) - min_y
 
         was_dragged = self.drag_moved
         self.drag_start_x = None
