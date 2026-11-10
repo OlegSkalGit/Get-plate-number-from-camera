@@ -12,11 +12,24 @@ try:
 except ImportError:
     imageio_ffmpeg = None
 
+ALLOWED_X264_PRESETS = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+)
+
 
 class VideoEngine:
     """
     Автономний модуль циклічного відеозапису фрагментами заданої тривалості.
-    Використовує imageio-ffmpeg (libx264, preset ultrafast, 15 fps) у фоновому потоці
+    Використовує imageio-ffmpeg (libx264 із налаштованими preset, CRF, keyframe-інтервалом
+    та опційним обмеженням бітрейту/висоти кадру) у фоновому потоці
     з резервним fallback на OpenCV mp4v, щоб не навантажувати основний потік камери.
     Записує чисті кадри без рамок детекції у папку video/YYYY-MM-DD/HH-MM-SS.mp4.
     """
@@ -31,8 +44,19 @@ class VideoEngine:
         self.duration_min = max(0.05, float(self.config.get("video_duration_min", 5.0)))
         self.segment_duration_sec = self.duration_min * 60.0
         self.fps = max(1.0, min(60.0, float(self.config.get("video_fps", 15.0))))
-        self.codec = str(self.config.get("video_codec", "libx264")).strip().lower()
-        self.crf = int(self.config.get("video_crf", 28))
+        self.codec = str(self.config.get("video_codec", "libx264")).strip().lower() or "libx264"
+
+        raw_preset = str(self.config.get("video_preset", "veryfast")).strip().lower()
+        if raw_preset in ALLOWED_X264_PRESETS:
+            self.preset = raw_preset
+        else:
+            print(f"[VideoEngine] Невідомий preset '{raw_preset}', використано 'veryfast'")
+            self.preset = "veryfast"
+
+        self.crf = max(0, min(51, int(round(float(self.config.get("video_crf", 30))))))
+        self.keyframe_sec = max(0.5, min(60.0, float(self.config.get("video_keyframe_sec", 6.0))))
+        self.max_bitrate_kbps = max(0, int(round(float(self.config.get("video_max_bitrate_kbps", 900)))))
+        self.max_height = max(0, int(round(float(self.config.get("video_max_height", 0)))))
 
         self.ffmpeg_exe = None
         if imageio_ffmpeg is not None:
@@ -58,6 +82,8 @@ class VideoEngine:
         self.segment_start_ts = 0.0
         self.segment_w = 0
         self.segment_h = 0
+        self.output_w = 0
+        self.output_h = 0
         self.current_day_folder = ""
         self.current_time_display = ""
 
@@ -136,6 +162,12 @@ class VideoEngine:
         if even_w < 16 or even_h < 16:
             return False
 
+        out_w, out_h = even_w, even_h
+        if self.max_height > 0 and even_h > self.max_height:
+            out_h = max(16, self.max_height - (self.max_height % 2))
+            scaled_w = int(round(even_w * (out_h / float(even_h))))
+            out_w = max(16, scaled_w - (scaled_w % 2))
+
         now_dt = datetime.now()
         day_folder = now_dt.strftime("%Y-%m-%d")
         time_prefix = now_dt.strftime("%H-%M-%S")
@@ -151,6 +183,7 @@ class VideoEngine:
             out_path = os.path.join(day_dir, f"{time_prefix}_{idx}.mp4")
             idx += 1
 
+        gop_frames = max(1, int(round(self.fps * self.keyframe_sec)))
         use_ffmpeg = (self.ffmpeg_exe is not None) and ("mp4v" not in self.codec)
         if use_ffmpeg:
             cmd = [
@@ -164,13 +197,22 @@ class VideoEngine:
                 "-i", "-",
                 "-an",
                 "-vcodec", "libx264",
-                "-preset", "ultrafast",
+                "-preset", self.preset,
                 "-crf", str(self.crf),
-                "-g", str(max(15, int(round(self.fps * 2)))),
+                "-g", str(gop_frames),
+            ]
+            if self.max_bitrate_kbps > 0:
+                cmd.extend([
+                    "-maxrate", f"{self.max_bitrate_kbps}k",
+                    "-bufsize", f"{self.max_bitrate_kbps * 2}k",
+                ])
+            if (out_w, out_h) != (even_w, even_h):
+                cmd.extend(["-vf", f"scale={out_w}:{out_h}"])
+            cmd.extend([
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
-                out_path
-            ]
+                out_path,
+            ])
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             try:
                 proc = subprocess.Popen(
@@ -189,7 +231,7 @@ class VideoEngine:
 
         if not use_ffmpeg:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(out_path, fourcc, self.fps, (even_w, even_h))
+            writer = cv2.VideoWriter(out_path, fourcc, self.fps, (out_w, out_h))
             if not writer.isOpened():
                 print(f"[VideoEngine] Не вдалося відкрити VideoWriter для {out_path}")
                 return False
@@ -201,9 +243,17 @@ class VideoEngine:
         self.segment_start_ts = time.time()
         self.segment_w = even_w
         self.segment_h = even_h
+        self.output_w = out_w
+        self.output_h = out_h
         self.current_day_folder = day_folder
         self.current_time_display = time_display
-        print(f"[ВІДЕОЗАПИС СТАРТ] {out_path} ({even_w}x{even_h} @ {self.fps:.0f} fps)")
+        res_info = f"{out_w}x{out_h}" if (out_w, out_h) == (even_w, even_h) else f"{even_w}x{even_h}->{out_w}x{out_h}"
+        if use_ffmpeg:
+            cap_info = f", cap={self.max_bitrate_kbps}k" if self.max_bitrate_kbps > 0 else ""
+            enc_info = f"libx264 preset={self.preset}, crf={self.crf}, kf={self.keyframe_sec:g}s{cap_info}"
+        else:
+            enc_info = "mp4v"
+        print(f"[ВІДЕОЗАПИС СТАРТ] {out_path} ({res_info} @ {self.fps:g} fps, {enc_info})")
         return True
 
     def _close_segment_async(self, block: bool = False):
@@ -323,7 +373,10 @@ class VideoEngine:
                         write_ok = False
                 elif self.cv_writer is not None:
                     try:
-                        self.cv_writer.write(frame_to_write)
+                        out_frame = frame_to_write
+                        if (self.output_w, self.output_h) != (self.segment_w, self.segment_h):
+                            out_frame = cv2.resize(frame_to_write, (self.output_w, self.output_h), interpolation=cv2.INTER_AREA)
+                        self.cv_writer.write(out_frame)
                     except Exception as e:
                         print(f"[VideoEngine OpenCV Write Error]: {e}")
                         write_ok = False

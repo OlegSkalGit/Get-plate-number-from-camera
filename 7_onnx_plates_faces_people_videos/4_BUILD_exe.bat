@@ -65,6 +65,13 @@ if %ERRORLEVEL% neq 0 (
 echo Копіювання ресурсів...
 if not exist "dist\ANPR_Monitor\model" mkdir "dist\ANPR_Monitor\model"
 xcopy /e /y /i "model\*" "dist\ANPR_Monitor\model\" >nul
+if exist "_redist_" (
+    if not exist "dist\ANPR_Monitor\_redist_" mkdir "dist\ANPR_Monitor\_redist_"
+    xcopy /e /y /i "_redist_\*" "dist\ANPR_Monitor\_redist_\" >nul
+) else if exist "..\_redist_" (
+    if not exist "dist\ANPR_Monitor\_redist_" mkdir "dist\ANPR_Monitor\_redist_"
+    xcopy /e /y /i "..\_redist_\*" "dist\ANPR_Monitor\_redist_\" >nul
+)
 if exist "config.ini" copy /y "config.ini" "dist\ANPR_Monitor\config.ini" >nul
 if exist "README.md" copy /y "README.md" "dist\ANPR_Monitor\" >nul
 
