@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
+from scripts.core.i18n import tr
 from scripts.ui.helpers import WindowGeometryTracker, ScrollableFrame
 
 try:
@@ -58,12 +59,12 @@ def _ask_text_modal(parent, title: str, prompt: str, initial_val: str = ""):
         dlg.destroy()
 
     tk.Button(
-        btns, text="Скасувати", command=_cancel,
+        btns, text=tr("ui.common.cancel", "Cancel"), command=_cancel,
         bg="#323544", fg="#d5dae8", relief=tk.FLAT,
         font=("Segoe UI", 9, "bold"), padx=14, pady=5, cursor="hand2"
     ).pack(side=tk.RIGHT, padx=(6, 0))
     tk.Button(
-        btns, text="Зберегти", command=_ok,
+        btns, text=tr("ui.common.save", "Save"), command=_ok,
         bg="#007acc", fg="#ffffff", relief=tk.FLAT,
         font=("Segoe UI", 9, "bold"), padx=16, pady=5, cursor="hand2"
     ).pack(side=tk.RIGHT)
@@ -111,7 +112,7 @@ class ReanalyzeCropDialog:
         self._ui_poll_after_id = None
 
         self.dlg = tk.Toplevel(parent)
-        self.dlg.title("⚠ Не та людина — Реаналіз кропу обличчя")
+        self.dlg.title(tr("ui.reanalyze.window_title", "⚠ Wrong person — Reanalyze face crop"))
         self.dlg.configure(bg="#14151e")
         self.dlg.geometry("680x580")
         self.dlg.minsize(560, 480)
@@ -194,24 +195,38 @@ class ReanalyzeCropDialog:
         info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tk.Label(
             info,
-            text=f"Поточне помилкове призначення: {self.ev.get('person_name', '—')}",
+            text=tr("ui.reanalyze.curr_assign", "Current incorrect assignment: {name}", name=self.ev.get("person_name", "—")),
             fg="#ffcc00", bg="#1b1d29", font=("Segoe UI", 10, "bold"), anchor=tk.W
         ).pack(fill=tk.X)
         tk.Label(
             info,
-            text=f"UUID: {self.ev.get('person_uuid') or 'неприв’язано'}",
+            text=tr(
+                "ui.reanalyze.uuid_fmt",
+                "UUID: {uuid}",
+                uuid=self.ev.get("person_uuid") or tr("ui.reanalyze.unassigned", "unassigned"),
+            ),
             fg="#8c92a4", bg="#1b1d29", font=("Consolas", 8), anchor=tk.W
         ).pack(fill=tk.X, pady=(2, 4))
         tk.Label(
             info,
-            text=f"Камера: {self.ev.get('camera_name', '—')}  •  Час: {self.ev.get('day', '')} {self.ev.get('time', '')}",
+            text=tr(
+                "ui.reanalyze.cam_time_fmt",
+                "Camera: {cam}  •  Time: {day} {time}",
+                cam=self.ev.get("camera_name", "—"),
+                day=self.ev.get("day", ""),
+                time=self.ev.get("time", ""),
+            ),
             fg="#d5dae8", bg="#1b1d29", font=("Segoe UI", 9), anchor=tk.W
         ).pack(fill=tk.X)
         rem_cnt = len(self.remaining_old_crops)
         rem_txt = (
-            f"Після вилучення решта кропів ({rem_cnt} шт.) буде перерахована для очищення еталону."
+            tr(
+                "ui.reanalyze.rem_plural",
+                "After removal, the remaining crops ({n}) will be recalculated to clean the gallery.",
+                n=rem_cnt,
+            )
             if rem_cnt > 0 else
-            "Це єдиний кроп поточної людини на диску."
+            tr("ui.reanalyze.rem_single", "This is the only crop for this person on disk.")
         )
         tk.Label(
             info, text=rem_txt, fg="#75e08b" if rem_cnt > 0 else "#9ba3b8",
@@ -222,20 +237,20 @@ class ReanalyzeCropDialog:
         ctrl = tk.Frame(self.dlg, bg="#14151e", padx=12, pady=4)
         ctrl.pack(fill=tk.X)
         tk.Label(
-            ctrl, text="Поріг збігу для пошуку:", fg="#d5dae8", bg="#14151e", font=("Segoe UI", 9)
+            ctrl, text=tr("ui.reanalyze.thresh_label", "Match search threshold:"), fg="#d5dae8", bg="#14151e", font=("Segoe UI", 9)
         ).pack(side=tk.LEFT)
         tk.Spinbox(
             ctrl, from_=0.20, to=0.90, increment=0.02, textvariable=self.thresh_var, width=6,
             bg="#262836", fg="#ffffff", buttonbackground="#323544", relief=tk.FLAT, font=("Segoe UI", 9)
         ).pack(side=tk.LEFT, padx=8)
         tk.Button(
-            ctrl, text="🔄 Реаналізувати базу кропів", command=self._run_scan,
+            ctrl, text=tr("ui.reanalyze.btn_rescan", "🔄 Reanalyze crop DB"), command=self._run_scan,
             bg="#2f3346", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
             padx=10, pady=4, cursor="hand2"
         ).pack(side=tk.LEFT, padx=(4, 8))
 
         self.status_lbl = tk.Label(
-            ctrl, text="Аналіз...", fg="#ffcc00", bg="#14151e", font=("Segoe UI", 8, "bold")
+            ctrl, text=tr("ui.reanalyze.status.analyzing", "Analyzing..."), fg="#ffcc00", bg="#14151e", font=("Segoe UI", 8, "bold")
         )
         self.status_lbl.pack(side=tk.RIGHT)
 
@@ -247,18 +262,18 @@ class ReanalyzeCropDialog:
         bot = tk.Frame(self.dlg, bg="#1b1d29", padx=14, pady=10, highlightthickness=1, highlightbackground="#2b2e3d")
         bot.pack(fill=tk.X)
         self.btn_del_only = tk.Button(
-            bot, text="🗑 Просто видалити кроп", command=self._delete_only,
+            bot, text=tr("ui.reanalyze.btn_del_only", "🗑 Just delete crop"), command=self._delete_only,
             bg="#64262b", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=12, pady=6, cursor="hand2"
         )
         self.btn_del_only.pack(side=tk.LEFT)
         tk.Button(
-            bot, text="Скасувати", command=self._close_dlg,
+            bot, text=tr("ui.common.cancel", "Cancel"), command=self._close_dlg,
             bg="#323544", fg="#d5dae8", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=14, pady=6, cursor="hand2"
         ).pack(side=tk.RIGHT, padx=(8, 0))
         self.btn_apply = tk.Button(
-            bot, text="✅ Перепризначити кроп", command=self._apply,
+            bot, text=tr("ui.reanalyze.btn_apply", "✅ Reassign crop"), command=self._apply,
             bg="#007acc", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=16, pady=6, cursor="hand2"
         )
@@ -269,7 +284,7 @@ class ReanalyzeCropDialog:
         seq = self._scan_seq
         for ch in list(self.list_scroll.inner.winfo_children()):
             ch.destroy()
-        self.status_lbl.configure(text="⏳ Реаналіз ембедінгів...", fg="#ffcc00")
+        self.status_lbl.configure(text=tr("ui.reanalyze.status.rescanning", "⏳ Reanalyzing embeddings..."), fg="#ffcc00")
         self.btn_apply.configure(state=tk.DISABLED)
 
         old_uid = str(self.ev.get("person_uuid") or "")
@@ -296,8 +311,8 @@ class ReanalyzeCropDialog:
         self._thumbs_cache.clear()
 
         if not res or not res.get("ok"):
-            err = (res or {}).get("error") or "Не вдалося виконати аналіз."
-            self.status_lbl.configure(text="❌ Помилка", fg="#ff6666")
+            err = (res or {}).get("error") or tr("ui.reanalyze.err_analysis", "Failed to run analysis.")
+            self.status_lbl.configure(text=tr("ui.reanalyze.status.error", "❌ Error"), fg="#ff6666")
             tk.Label(
                 self.list_scroll.inner, text=err, fg="#ff7777", bg="#14151e",
                 font=("Segoe UI", 9), wraplength=580, justify=tk.LEFT, pady=16
@@ -311,12 +326,14 @@ class ReanalyzeCropDialog:
         if best:
             self.choice_var.set(best["id"])
             self.status_lbl.configure(
-                text=f"Знайдено збіг: {best['name']} ({best['similarity']*100:.1f}%)", fg="#75e08b"
+                text=tr("ui.reanalyze.status.found", "Match found: {name} ({pct:.1f}%)", name=best["name"], pct=best["similarity"] * 100),
+                fg="#75e08b",
             )
         else:
             self.choice_var.set("__NEW__")
             self.status_lbl.configure(
-                text="Підходящих збігів ≥ порогу не знайдено — рекомендовано новий UUID", fg="#00e5ff"
+                text=tr("ui.reanalyze.status.not_found", "No matches ≥ threshold found — new UUID recommended"),
+                fg="#00e5ff",
             )
 
         # Опція створення нової людини з новим UUID
@@ -327,7 +344,7 @@ class ReanalyzeCropDialog:
         new_card.pack(fill=tk.X, pady=4)
         rb_new = tk.Radiobutton(
             new_card,
-            text="➕ Створити нову окрему людину (новий унікальний UUID)",
+            text=tr("ui.reanalyze.rb_new", "➕ Create a new separate person (new unique UUID)"),
             variable=self.choice_var,
             value="__NEW__",
             bg="#1d2433", fg="#00e5ff", selectcolor="#12131a",
@@ -337,21 +354,28 @@ class ReanalyzeCropDialog:
         rb_new.pack(anchor=tk.W)
         tk.Label(
             new_card,
-            text="Використовуйте, якщо на кропі інша особа, якої ще немає в базі (або схожість занизька).",
+            text=tr(
+                "ui.reanalyze.rb_new_hint",
+                "Use if this crop shows a different person not yet in the database (or similarity is too low).",
+            ),
             fg="#9ba3b8", bg="#1d2433", font=("Segoe UI", 8)
         ).pack(anchor=tk.W, padx=(22, 0))
 
         if not cands:
             tk.Label(
                 self.list_scroll.inner,
-                text="Інших відомих людей у базі поки немає.",
+                text=tr("ui.reanalyze.no_other_people", "No other known people in the database yet."),
                 fg="#8c92a4", bg="#14151e", font=("Segoe UI", 9), pady=12
             ).pack(anchor=tk.W)
             return
 
         tk.Label(
             self.list_scroll.inner,
-            text=f"Кандидати з бази облич та збережених кропів (усього порівняно: {res.get('all_candidates_count', len(cands))}):",
+            text=tr(
+                "ui.reanalyze.cands_hdr",
+                "Candidates from face database and saved crops (total compared: {n}):",
+                n=res.get("all_candidates_count", len(cands)),
+            ),
             fg="#d5dae8", bg="#14151e", font=("Segoe UI", 9, "bold"), anchor=tk.W
         ).pack(fill=tk.X, pady=(8, 4))
 
@@ -378,8 +402,11 @@ class ReanalyzeCropDialog:
 
             sim_pct = cand["similarity"] * 100.0
             gal_pct = cand["gallery_sim"] * 100.0
-            crop_pct_txt = f" | кроп на диску: {cand['crop_sim']*100:.1f}%" if cand.get("crop_sim") is not None else ""
-            badge = " [ЗБІГ]" if is_pass else ""
+            crop_pct_txt = (
+                tr("ui.reanalyze.crop_sim_bit", " | crop on disk: {pct:.1f}%", pct=cand["crop_sim"] * 100)
+                if cand.get("crop_sim") is not None else ""
+            )
+            badge = tr("ui.reanalyze.match_badge", " [MATCH]") if is_pass else ""
 
             rb = tk.Radiobutton(
                 row,
@@ -393,7 +420,13 @@ class ReanalyzeCropDialog:
             rb.pack(fill=tk.X, anchor=tk.W)
             tk.Label(
                 row,
-                text=f"UUID: {cand['id']}  •  еталон: {gal_pct:.1f}%{crop_pct_txt}",
+                text=tr(
+                    "ui.reanalyze.cand_detail",
+                    "UUID: {id}  •  gallery: {gal:.1f}%{crop_bit}",
+                    id=cand["id"],
+                    gal=gal_pct,
+                    crop_bit=crop_pct_txt,
+                ),
                 fg="#8c92a4", bg=bg_c, font=("Segoe UI", 8), anchor=tk.W
             ).pack(fill=tk.X, padx=(22, 0))
 
@@ -402,7 +435,7 @@ class ReanalyzeCropDialog:
         if not choice:
             return
         self.btn_apply.configure(state=tk.DISABLED)
-        self.status_lbl.configure(text="⏳ Оновлення бази та перепризначення...", fg="#ffcc00")
+        self.status_lbl.configure(text=tr("ui.reanalyze.status.updating", "⏳ Updating database and reassigning..."), fg="#ffcc00")
 
         old_uid = str(self.ev.get("person_uuid") or "")
         crop_path = str(self.ev.get("crop_path") or "")
@@ -429,14 +462,17 @@ class ReanalyzeCropDialog:
 
     def _delete_only(self):
         if not messagebox.askyesno(
-            "Видалення помилкового кропу",
-            "Просто видалити цей помилковий кроп з диска та перерахувати еталон поточної людини по решті кропів?",
+            tr("ui.reanalyze.del_title", "Delete wrong crop"),
+            tr(
+                "ui.reanalyze.del_confirm",
+                "Delete this wrong crop from disk and recalculate the current person's gallery from the remaining crops?",
+            ),
             parent=self.dlg,
         ):
             return
         self.btn_apply.configure(state=tk.DISABLED)
         self.btn_del_only.configure(state=tk.DISABLED)
-        self.status_lbl.configure(text="⏳ Видалення кропу та перерахунок еталону...", fg="#ffcc00")
+        self.status_lbl.configure(text=tr("ui.reanalyze.status.deleting", "⏳ Deleting crop and recalculating gallery..."), fg="#ffcc00")
 
         def _exec_del():
             res = self.db.delete_crop_event(self.ev, self.remaining_old_crops)
@@ -452,10 +488,10 @@ class ReanalyzeCropDialog:
         if not res or not res.get("ok"):
             self.btn_apply.configure(state=tk.NORMAL)
             self.btn_del_only.configure(state=tk.NORMAL)
-            self.status_lbl.configure(text="❌ Помилка", fg="#ff6666")
+            self.status_lbl.configure(text=tr("ui.reanalyze.status.error", "❌ Error"), fg="#ff6666")
             messagebox.showerror(
-                "Помилка операції",
-                (res or {}).get("error") or "Не вдалося виконати дію з кропом.",
+                tr("ui.common.op_error_title", "Operation error"),
+                (res or {}).get("error") or tr("ui.reanalyze.err_action", "Failed to perform action on crop."),
                 parent=self.dlg,
             )
             return
@@ -479,6 +515,7 @@ class PeopleWindow:
         self.on_close_cb = on_close_cb
 
         self._is_closing = False
+        self._reanalyzing_all = False
         self._load_seq = 0
         self._video_seq = 0
         self._notify_after_id = None
@@ -486,7 +523,7 @@ class PeopleWindow:
         self._ui_poll_after_id = None
 
         self.win = tk.Toplevel(parent_root)
-        self.win.title("👥 Люди — Унікальні особи, кропи, скріни та відеоархів")
+        self.win.title(tr("ui.people.window_title", "👥 People — Unique persons, crops, screenshots and video archive"))
         self.win.configure(bg="#12131a")
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -509,6 +546,13 @@ class PeopleWindow:
         self._timeline_items = []       # відфільтровані та відсортовані елементи правої стрічки
         self._tree_item_map = {}        # iid -> timeline item dict
         self._current_item = None       # поточний обраний елемент таймлайну
+        self._global_stats_mode = "init"
+        self._video_scanning = False
+        self._media_empty_key = ("ui.people.timeline.select_event", "Select an event from the list")
+        self._crop_ph_key = ("ui.people.ph.dash", "—")
+        self._screen_ph_key = ("ui.people.ph.screen_missing_plain", "Full screenshot missing")
+        self._vid_ph_spec = None
+        self._vid_hits_lbl = None
 
         # UI-кеші зображень
         self._left_thumbs = []
@@ -567,10 +611,11 @@ class PeopleWindow:
         top_bar = tk.Frame(self.win, bg="#191b26", padx=12, pady=8, highlightthickness=1, highlightbackground="#2b2e3d")
         top_bar.pack(fill=tk.X)
 
-        tk.Label(
-            top_bar, text="👥 Люди та історія появ", fg="#ffffff", bg="#191b26",
+        self.lbl_top_title = tk.Label(
+            top_bar, text=tr("ui.people.top_title", "👥 People & Appearance History"), fg="#ffffff", bg="#191b26",
             font=("Segoe UI", 11, "bold")
-        ).pack(side=tk.LEFT, padx=(0, 14))
+        )
+        self.lbl_top_title.pack(side=tk.LEFT, padx=(0, 14))
 
         tk.Label(top_bar, text="🔍", fg="#9ba3b8", bg="#191b26", font=("Segoe UI", 10)).pack(side=tk.LEFT)
         tk.Entry(
@@ -579,27 +624,46 @@ class PeopleWindow:
         ).pack(side=tk.LEFT, ipady=4, padx=(4, 12))
 
         self.lbl_global_stats = tk.Label(
-            top_bar, text="Людей: 0", fg="#00e5ff", bg="#222534",
+            top_bar, text=tr("ui.people.stats_init", "People: {n}", n=0), fg="#00e5ff", bg="#222534",
             font=("Segoe UI", 8, "bold"), padx=10, pady=4
         )
         self.lbl_global_stats.pack(side=tk.LEFT, padx=(0, 10))
 
-        tk.Button(
-            top_bar, text="✖ Закрити", command=self.close,
+        self.btn_close_win = tk.Button(
+            top_bar, text=tr("ui.people.btn_close", "✖ Close"), command=self.close,
             bg="#44252a", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=12, pady=4, cursor="hand2"
-        ).pack(side=tk.RIGHT)
-        tk.Button(
-            top_bar, text="↻ Оновити", command=self.refresh_all,
+        )
+        self.btn_close_win.pack(side=tk.RIGHT)
+        self.btn_refresh = tk.Button(
+            top_bar, text=tr("ui.people.btn_refresh", "↻ Refresh"), command=self.refresh_all,
             bg="#007acc", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=12, pady=4, cursor="hand2"
-        ).pack(side=tk.RIGHT, padx=(0, 6))
+        )
+        self.btn_refresh.pack(side=tk.RIGHT, padx=(0, 6))
         self.btn_reanalyze_all = tk.Button(
-            top_bar, text="♻ Реаналіз бази з кропів", command=self._on_reanalyze_all_profiles,
+            top_bar, text=tr("ui.people.btn_reanalyze_all", "♻ Reanalyze DB from crops"), command=self._on_reanalyze_all_profiles,
             bg="#2b3145", fg="#75e08b", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=12, pady=4, cursor="hand2"
         )
         self.btn_reanalyze_all.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.lbl_operator_banner = tk.Label(
+            self.win,
+            text=tr(
+                "ui.people.operator_banner",
+                "👤 Operator mode: read-only view enabled. Renaming, ignoring, database reanalysis, and disk deletion are blocked.",
+            ),
+            fg="#ffcc00",
+            bg="#2c2416",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=6,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            highlightthickness=1,
+            highlightbackground="#66521e",
+        )
 
         # Основна горизонтальна область
         self.main_paned = tk.PanedWindow(
@@ -613,14 +677,15 @@ class PeopleWindow:
 
         left_hdr = tk.Frame(left_pane, bg="#1e202c", padx=10, pady=7)
         left_hdr.pack(fill=tk.X)
-        tk.Label(
-            left_hdr, text="Унікальні люди", fg="#ffffff", bg="#1e202c", font=("Segoe UI", 9, "bold")
-        ).pack(side=tk.LEFT)
+        self.lbl_left_title = tk.Label(
+            left_hdr, text=tr("ui.people.left_title", "Unique people"), fg="#ffffff", bg="#1e202c", font=("Segoe UI", 9, "bold")
+        )
+        self.lbl_left_title.pack(side=tk.LEFT)
 
         sort_box = tk.Frame(left_hdr, bg="#1e202c")
         sort_box.pack(side=tk.RIGHT)
         self.btn_sort_people = tk.Button(
-            sort_box, text="🕒 Нещодавні", command=self._cycle_people_sort,
+            sort_box, text=tr("ui.people.sort.recent", "🕒 Recent"), command=self._cycle_people_sort,
             bg="#2b2f40", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
             padx=7, pady=2, cursor="hand2"
         )
@@ -648,7 +713,7 @@ class PeopleWindow:
         hdr_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.lbl_person_name = tk.Label(
-            hdr_info, text="Оберіть людину зі списку ліворуч",
+            hdr_info, text=tr("ui.people.select_person", "Select a person from the list on the left"),
             fg="#ffffff", bg="#191b26", font=("Segoe UI", 12, "bold"), anchor=tk.W
         )
         self.lbl_person_name.pack(fill=tk.X)
@@ -660,7 +725,7 @@ class PeopleWindow:
         )
         self.lbl_person_uuid.pack(side=tk.LEFT)
         self.btn_copy_uuid = tk.Button(
-            uuid_row, text="📋 Копіювати UUID", command=self._copy_selected_uuid,
+            uuid_row, text=tr("ui.people.btn_copy_uuid", "📋 Copy UUID"), command=self._copy_selected_uuid,
             bg="#262938", fg="#d5dae8", relief=tk.FLAT, font=("Segoe UI", 7, "bold"),
             padx=6, pady=1, cursor="hand2"
         )
@@ -674,19 +739,19 @@ class PeopleWindow:
         hdr_actions = tk.Frame(self.person_hdr, bg="#191b26")
         hdr_actions.pack(side=tk.RIGHT)
         self.btn_rename = tk.Button(
-            hdr_actions, text="✎ Дати ім'я", command=self._rename_selected_person,
+            hdr_actions, text=tr("ui.people.btn_rename", "✎ Rename"), command=self._rename_selected_person,
             bg="#007acc", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=10, pady=5, cursor="hand2"
         )
         self.btn_rename.pack(side=tk.LEFT, padx=3)
         self.btn_ignore = tk.Button(
-            hdr_actions, text="🚫 Ігнор", command=self._toggle_ignore_selected,
+            hdr_actions, text=tr("ui.people.btn_ignore_short", "🚫 Ignore"), command=self._toggle_ignore_selected,
             bg="#3a2f22", fg="#ffcc00", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=10, pady=5, cursor="hand2"
         )
         self.btn_ignore.pack(side=tk.LEFT, padx=3)
         self.btn_del_person = tk.Button(
-            hdr_actions, text="🗑 Видалити", command=self._delete_selected_person,
+            hdr_actions, text=tr("ui.people.btn_delete", "🗑 Delete"), command=self._delete_selected_person,
             bg="#44252a", fg="#ff7777", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=10, pady=5, cursor="hand2"
         )
@@ -697,7 +762,12 @@ class PeopleWindow:
         flt_bar.pack(fill=tk.X, pady=(0, 8))
 
         self._filter_buttons = {}
-        for fkey, flbl in (("all", "Усі"), ("crop", "👤 Кропи"), ("screen", "🖼 Повні скріни"), ("video", "🎬 Відео")):
+        for fkey, flbl in (
+            ("all", tr("ui.people.filter.all_short", "All")),
+            ("crop", tr("ui.people.filter.crop_short", "👤 Crops")),
+            ("screen", tr("ui.people.filter.screen_short", "🖼 Full frames")),
+            ("video", tr("ui.people.filter.video_short", "🎬 Videos")),
+        ):
             btn = tk.Button(
                 flt_bar, text=flbl, command=lambda k=fkey: self._set_kind_filter(k),
                 bg="#252836", fg="#d5dae8", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
@@ -707,7 +777,7 @@ class PeopleWindow:
             self._filter_buttons[fkey] = btn
 
         self.btn_time_order = tk.Button(
-            flt_bar, text="▼ Спочатку новіші", command=self._toggle_time_order,
+            flt_bar, text=tr("ui.people.order_newest", "▼ Newest first"), command=self._toggle_time_order,
             bg="#2b2f40", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
             padx=10, pady=4, cursor="hand2"
         )
@@ -760,7 +830,7 @@ class PeopleWindow:
         self.right_paned.add(self.view_box, minsize=340)
 
         self.lbl_item_header = tk.Label(
-            self.view_box, text="Оберіть подію у списку", fg="#d5dae8", bg="#1e202c",
+            self.view_box, text=tr("ui.people.timeline.select_event", "Select an event from the list"), fg="#d5dae8", bg="#1e202c",
             font=("Segoe UI", 9, "bold"), padx=10, pady=7, anchor=tk.W
         )
         self.lbl_item_header.pack(fill=tk.X)
@@ -775,17 +845,21 @@ class PeopleWindow:
         self.img_row.pack(fill=tk.BOTH, expand=True)
 
         self.crop_frame_box = tk.Frame(self.img_row, bg="#151720", padx=8, pady=8, highlightthickness=1, highlightbackground="#282b3a")
-        tk.Label(
-            self.crop_frame_box, text="Кроп обличчя", fg="#00e5ff", bg="#151720", font=("Segoe UI", 8, "bold")
-        ).pack(pady=(0, 6))
-        self.lbl_crop_preview = tk.Label(self.crop_frame_box, bg="#0d0e14", text="—", fg="#6e7385")
+        self.lbl_crop_box_title = tk.Label(
+            self.crop_frame_box, text=tr("ui.people.crop_box_title", "Face crop"), fg="#00e5ff", bg="#151720", font=("Segoe UI", 8, "bold")
+        )
+        self.lbl_crop_box_title.pack(pady=(0, 6))
+        self.lbl_crop_preview = tk.Label(self.crop_frame_box, bg="#0d0e14", text=tr("ui.people.ph.dash", "—"), fg="#6e7385")
         self.lbl_crop_preview.pack(expand=True)
 
         self.screen_frame_box = tk.Frame(self.img_row, bg="#151720", padx=8, pady=8, highlightthickness=1, highlightbackground="#282b3a")
-        tk.Label(
-            self.screen_frame_box, text="Повний кадр камери", fg="#9ee8ff", bg="#151720", font=("Segoe UI", 8, "bold")
-        ).pack(pady=(0, 6))
-        self.lbl_screen_preview = tk.Label(self.screen_frame_box, bg="#0d0e14", text="Повний скрін відсутній", fg="#6e7385")
+        self.lbl_screen_box_title = tk.Label(
+            self.screen_frame_box, text=tr("ui.people.screen_box_title", "Full camera frame"), fg="#9ee8ff", bg="#151720", font=("Segoe UI", 8, "bold")
+        )
+        self.lbl_screen_box_title.pack(pady=(0, 6))
+        self.lbl_screen_preview = tk.Label(
+            self.screen_frame_box, bg="#0d0e14", text=tr("ui.people.ph.screen_missing_plain", "Full screenshot missing"), fg="#6e7385"
+        )
         self.lbl_screen_preview.pack(fill=tk.BOTH, expand=True)
         self.screen_frame_box.bind("<Configure>", lambda e: self._rerender_active_images())
 
@@ -833,35 +907,35 @@ class PeopleWindow:
         self.item_actions.pack(fill=tk.X)
 
         self.btn_wrong_person = tk.Button(
-            self.item_actions, text="⚠ Не та людина (реаналізувати)", command=self._on_wrong_person_clicked,
+            self.item_actions, text=tr("ui.people.btn_wrong_person", "⚠ Wrong person (reanalyze)"), command=self._on_wrong_person_clicked,
             bg="#b45309", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=12, pady=5, cursor="hand2"
         )
         self.btn_wrong_person.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_del_crop = tk.Button(
-            self.item_actions, text="🗑 Видалити кроп", command=self._on_delete_crop_clicked,
+            self.item_actions, text=tr("ui.people.btn_del_crop", "🗑 Delete crop"), command=self._on_delete_crop_clicked,
             bg="#64262b", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=10, pady=5, cursor="hand2"
         )
         self.btn_del_crop.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_jump_video = tk.Button(
-            self.item_actions, text="🎬 Відео цього моменту", command=self._on_jump_to_matching_video,
+            self.item_actions, text=tr("ui.people.btn_jump_video", "🎬 Video of this moment"), command=self._on_jump_to_matching_video,
             bg="#1f4e78", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
             padx=10, pady=5, cursor="hand2"
         )
         self.btn_jump_video.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_open_folder = tk.Button(
-            self.item_actions, text="📂 Папка", command=self._open_item_folder,
+            self.item_actions, text=tr("ui.people.btn_open_folder", "📂 Folder"), command=self._open_item_folder,
             bg="#2f3346", fg="#d5dae8", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
             padx=8, pady=5, cursor="hand2"
         )
         self.btn_open_folder.pack(side=tk.RIGHT)
 
         self.btn_open_external = tk.Button(
-            self.item_actions, text="↗ Відкрити файл", command=self._open_item_external,
+            self.item_actions, text=tr("ui.people.btn_open_file", "↗ Open file"), command=self._open_item_external,
             bg="#2f3346", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
             padx=8, pady=5, cursor="hand2"
         )
@@ -870,6 +944,167 @@ class PeopleWindow:
         self._update_filter_buttons_style()
         self._update_person_header()
         self._update_item_action_buttons()
+        self._sync_operator_mode_ui()
+
+    def _sync_global_stats_label(self):
+        if not hasattr(self, "lbl_global_stats"):
+            return
+        if self._global_stats_mode == "no_db":
+            self.lbl_global_stats.configure(
+                text=tr("ui.people.err_no_face_db", "Faces module ('face_db') unavailable")
+            )
+        elif self._global_stats_mode == "loaded":
+            total_crops = sum(len(v) for v in self._events_by_person.values()) + len(self._unassigned_events)
+            self.lbl_global_stats.configure(
+                text=tr("ui.people.stats_fmt", "Unique people: {people}  |  Crops: {crops}", people=len(self._records), crops=total_crops)
+            )
+        else:
+            self.lbl_global_stats.configure(text=tr("ui.people.stats_init", "People: {n}", n=len(self._records)))
+
+    def _sync_people_sort_btn_text(self):
+        cur = self.people_sort_var.get()
+        labels = {
+            "recent": tr("ui.people.sort.recent", "🕒 Recent"),
+            "crops": tr("ui.people.sort.crops", "🔢 By count"),
+            "name": tr("ui.people.sort.name", "🔤 By name"),
+        }
+        self.btn_sort_people.configure(text=labels.get(cur, labels["recent"]))
+
+    def _sync_time_order_btn_text(self):
+        desc = bool(self.sort_desc_var.get())
+        self.btn_time_order.configure(
+            text=tr("ui.people.order_newest", "▼ Newest first") if desc else tr("ui.people.order_oldest", "▲ Chronological ↑")
+        )
+
+    def _format_item_header(self, item: dict) -> str:
+        kind = item["kind"]
+        if kind == "video":
+            vid = item["video"]
+            dur_s = self._format_sec(vid.get("duration_sec", 0.0))
+            return tr(
+                "ui.people.item_hdr.video",
+                "🎬 Video: {day} {time}  •  {cam}  •  {dur} ({mb:.1f} MB)",
+                day=vid["day"],
+                time=vid["time"],
+                cam=vid["camera_name"],
+                dur=dur_s,
+                mb=vid["size_mb"],
+            )
+        ev = item["event"]
+        sh_txt = (
+            tr("ui.people.item_hdr.sharp_bit", "  •  sharpness {val}", val=ev["sharpness"])
+            if ev.get("sharpness") else ""
+        )
+        tag_txt = f" [{ev['tag']}]" if ev.get("tag") else ""
+        k_lbl = (
+            tr("ui.people.item_hdr.crop_kind", "👤 Face crop")
+            if kind == "crop" else
+            tr("ui.people.item_hdr.screen_kind", "🖼 Full frame")
+        )
+        return f"{k_lbl}: {ev['day']} {ev['time']}  •  {ev['camera_name']}{tag_txt}{sh_txt}"
+
+    def apply_language(self):
+        if self._is_closing:
+            return
+        try:
+            self.win.title(tr("ui.people.window_title", "👥 People — Unique persons, crops, screenshots and video archive"))
+            self.lbl_top_title.configure(text=tr("ui.people.top_title", "👥 People & Appearance History"))
+            self._sync_global_stats_label()
+            self.btn_close_win.configure(text=tr("ui.people.btn_close", "✖ Close"))
+            self.btn_refresh.configure(text=tr("ui.people.btn_refresh", "↻ Refresh"))
+            if self._reanalyzing_all:
+                self.btn_reanalyze_all.configure(text=tr("ui.people.btn_reanalyzing", "⏳ Reanalyzing DB..."))
+            else:
+                self.btn_reanalyze_all.configure(text=tr("ui.people.btn_reanalyze_all", "♻ Reanalyze DB from crops"))
+            self.lbl_operator_banner.configure(
+                text=tr(
+                    "ui.people.operator_banner",
+                    "👤 Operator mode: read-only view enabled. Renaming, ignoring, database reanalysis, and disk deletion are blocked.",
+                )
+            )
+            self.lbl_left_title.configure(text=tr("ui.people.left_title", "Unique people"))
+            self._sync_people_sort_btn_text()
+            self._sync_time_order_btn_text()
+            self.btn_copy_uuid.configure(text=tr("ui.people.btn_copy_uuid", "📋 Copy UUID"))
+            self.btn_rename.configure(text=tr("ui.people.btn_rename", "✎ Rename"))
+            self.btn_del_person.configure(text=tr("ui.people.btn_delete", "🗑 Delete"))
+            if self._video_scanning:
+                self.lbl_video_scan.configure(text=tr("ui.people.scanning_video", "⏳ Searching videos..."))
+            self.lbl_crop_box_title.configure(text=tr("ui.people.crop_box_title", "Face crop"))
+            self.lbl_screen_box_title.configure(text=tr("ui.people.screen_box_title", "Full camera frame"))
+            self.btn_wrong_person.configure(text=tr("ui.people.btn_wrong_person", "⚠ Wrong person (reanalyze)"))
+            self.btn_del_crop.configure(text=tr("ui.people.btn_del_crop", "🗑 Delete crop"))
+            self.btn_jump_video.configure(text=tr("ui.people.btn_jump_video", "🎬 Video of this moment"))
+            self.btn_open_folder.configure(text=tr("ui.people.btn_open_folder", "📂 Folder"))
+            self.btn_open_external.configure(text=tr("ui.people.btn_open_file", "↗ Open file"))
+
+            self._render_people_list()
+            self._update_person_header()
+            self._rebuild_timeline(reload_media=False)
+
+            if self._current_item is not None:
+                self.lbl_item_header.configure(text=self._format_item_header(self._current_item))
+                if self._current_item.get("kind") == "video":
+                    if self._vid_hits_lbl is not None and self._vid_hits_lbl.winfo_exists():
+                        self._vid_hits_lbl.configure(text=tr("ui.people.vid_hits_label", "Appearances in video:"))
+                    if self._vid_ph_spec is not None and self.vid_canvas.find_withtag("ph"):
+                        pk, pdflt, pcol = self._vid_ph_spec
+                        self._set_video_placeholder(tr(pk, pdflt), color=pcol)
+                else:
+                    if self._crop_preview_tk is None:
+                        ck, cd = self._crop_ph_key
+                        self.lbl_crop_preview.configure(text=tr(ck, cd))
+                    if self._screen_preview_tk is None:
+                        sk, sd = self._screen_ph_key
+                        self.lbl_screen_preview.configure(text=tr(sk, sd))
+            elif self._media_empty_key is not None:
+                mk, md = self._media_empty_key
+                self.lbl_item_header.configure(text=tr(mk, md))
+        except Exception:
+            pass
+
+    def _is_operator_mode(self) -> bool:
+        try:
+            return bool(self.cfg_mgr and self.cfg_mgr.is_operator_mode())
+        except Exception:
+            return False
+
+    def _sync_operator_mode_ui(self):
+        is_op = self._is_operator_mode()
+        try:
+            if is_op:
+                if str(self.lbl_operator_banner.winfo_manager()) != "pack":
+                    self.lbl_operator_banner.pack(fill=tk.X, padx=8, pady=(6, 0), before=self.main_paned)
+                for b in (
+                    self.btn_reanalyze_all,
+                    self.btn_rename,
+                    self.btn_ignore,
+                    self.btn_del_person,
+                    self.btn_wrong_person,
+                    self.btn_del_crop,
+                ):
+                    b.configure(state=tk.DISABLED)
+            else:
+                if str(self.lbl_operator_banner.winfo_manager()) == "pack":
+                    self.lbl_operator_banner.pack_forget()
+                if not getattr(self, "_reanalyzing_all", False):
+                    self.btn_reanalyze_all.configure(state=tk.NORMAL)
+        except Exception:
+            pass
+
+    def _guard_operator_write(self, action_label: str) -> bool:
+        if not self._is_operator_mode():
+            return False
+        messagebox.showinfo(
+            tr("ui.op.title", "Operator Mode"),
+            tr(
+                "ui.people.op_blocked_msg",
+                "Action '{action}' is unavailable in Operator mode (disk writes and changes are disabled).\nSwitch the system to Server mode in Settings to edit the face database.",
+                action=action_label,
+            ),
+            parent=self.win,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Доступ до модулів без жорсткого імпорту
@@ -1001,7 +1236,8 @@ class PeopleWindow:
             self._events_by_person = {}
             self._unassigned_events = []
             self._summary = {}
-            self.lbl_global_stats.configure(text="Модуль облич ('face_db') недоступний")
+            self._global_stats_mode = "no_db"
+            self._sync_global_stats_label()
             self._render_people_list()
             return
 
@@ -1026,10 +1262,8 @@ class PeopleWindow:
         self._unassigned_events = list(collected.get("unassigned_events") or [])
         self._summary = dict(collected.get("summary") or {})
 
-        total_crops = sum(len(v) for v in self._events_by_person.values()) + len(self._unassigned_events)
-        self.lbl_global_stats.configure(
-            text=f"Унікальних людей: {len(self._records)}  |  Кропів: {total_crops}"
-        )
+        self._global_stats_mode = "loaded"
+        self._sync_global_stats_label()
 
         # Перевіряємо валідність вибраного UID
         valid_ids = {r["id"] for r in self._records}
@@ -1046,14 +1280,14 @@ class PeopleWindow:
         else:
             self._matched_videos = []
             self._rebuild_timeline()
+        self._sync_operator_mode_ui()
 
     def _cycle_people_sort(self):
         order = ["recent", "crops", "name"]
-        labels = {"recent": "🕒 Нещодавні", "crops": "🔢 За кількістю", "name": "🔤 За ім'ям"}
         cur = self.people_sort_var.get()
         nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "recent"
         self.people_sort_var.set(nxt)
-        self.btn_sort_people.configure(text=labels[nxt])
+        self._sync_people_sort_btn_text()
         self._render_people_list()
 
     def _render_people_list(self):
@@ -1082,7 +1316,7 @@ class PeopleWindow:
         if not recs and not self._unassigned_events:
             tk.Label(
                 self.people_scroll.inner,
-                text="База людей порожня\nабо нічого не знайдено.",
+                text=tr("ui.people.list_empty", "People database is empty\nor nothing matched your search."),
                 fg="#8c92a4", bg="#151720", font=("Segoe UI", 9), pady=24
             ).pack()
             return
@@ -1122,7 +1356,7 @@ class PeopleWindow:
             txt_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
             ign = bool(rec.get("ignore", False))
-            ign_str = " [ІГНОР]" if ign else ""
+            ign_str = tr("ui.people.card_ignore_tag", " [IGNORE]") if ign else ""
             l1 = tk.Label(
                 txt_box,
                 text=f"{rec['name']}{ign_str}",
@@ -1141,7 +1375,8 @@ class PeopleWindow:
             last_ts = float(st.get("last_ts", 0.0))
             last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M") if last_ts > 0 else "—"
             l3 = tk.Label(
-                txt_box, text=f"Кропів: {c_cnt}  •  Востаннє: {last_str}",
+                txt_box,
+                text=tr("ui.people.card_meta_fmt", "Crops: {crops}  •  Last seen: {last}", crops=c_cnt, last=last_str),
                 fg="#9ba3b8", bg=bg_c, font=("Segoe UI", 8), anchor=tk.W
             )
             l3.pack(fill=tk.X)
@@ -1149,7 +1384,10 @@ class PeopleWindow:
             for w in (card, t_lbl, txt_box, l1, l2, l3):
                 w.bind("<Button-1>", lambda e, target=uid: self.select_person(target))
 
-        if self._unassigned_events and (not q or "НЕПРИВ" in q or "ВИДАЛЕН" in q):
+        unassigned_title = tr("ui.people.unassigned_card_title", "⚠ Unassigned / deleted ({n})", n=len(self._unassigned_events))
+        if self._unassigned_events and (
+            not q or q in unassigned_title.upper() or "UNASSIGNED" in q or "DELETED" in q or "НЕПРИВ" in q or "ВИДАЛЕН" in q
+        ):
             is_sel = (self._selected_uid == "__UNASSIGNED__")
             bg_c = "#2c221b" if is_sel else "#221b18"
             bd_c = "#ffcc00" if is_sel else "#4d3a27"
@@ -1160,12 +1398,13 @@ class PeopleWindow:
             ucard.pack(fill=tk.X, padx=6, pady=(8, 4))
             self._person_card_frames["__UNASSIGNED__"] = ucard
             ul1 = tk.Label(
-                ucard, text=f"⚠ Неприв'язані / видалені ({len(self._unassigned_events)})",
+                ucard, text=unassigned_title,
                 fg="#ffcc00", bg=bg_c, font=("Segoe UI", 9, "bold"), anchor=tk.W
             )
             ul1.pack(fill=tk.X)
             ul2 = tk.Label(
-                ucard, text="Старі кропи без запису у faces.txt — можна реаналізувати або видалити",
+                ucard,
+                text=tr("ui.people.unassigned_card_hint", "Orphan crops without faces.txt record — can be reanalyzed or deleted"),
                 fg="#b8a898", bg=bg_c, font=("Segoe UI", 7), anchor=tk.W
             )
             ul2.pack(fill=tk.X)
@@ -1190,10 +1429,12 @@ class PeopleWindow:
         self._video_seq += 1
         v_seq = self._video_seq
         if not evs:
+            self._video_scanning = False
             self.lbl_video_scan.configure(text="")
             return
 
-        self.lbl_video_scan.configure(text="⏳ Пошук відео...", fg="#ffcc00")
+        self._video_scanning = True
+        self.lbl_video_scan.configure(text=tr("ui.people.scanning_video", "⏳ Searching videos..."), fg="#ffcc00")
 
         def _vid_worker():
             vids = self._find_matching_videos_for_person(evs)
@@ -1205,6 +1446,7 @@ class PeopleWindow:
         if v_seq != self._video_seq or uid != self._selected_uid or self._is_closing or not self.win.winfo_exists():
             return
         self._matched_videos = list(vids or [])
+        self._video_scanning = False
         self.lbl_video_scan.configure(text="")
         self._update_person_header()
         self._rebuild_timeline()
@@ -1232,21 +1474,26 @@ class PeopleWindow:
         self.hdr_thumb_lbl.configure(image="", text="👤", width=8, height=4)
 
         if self._selected_uid == "__UNASSIGNED__":
-            self.lbl_person_name.configure(text="⚠ Неприв'язані кропи", fg="#ffcc00")
-            self.lbl_person_uuid.configure(text="UUID: (відсутній у faces.txt)")
-            self.lbl_person_meta.configure(text=f"Кропів: {len(evs)}  •  Відеофрагментів: {len(self._matched_videos)}")
+            self.lbl_person_name.configure(text=tr("ui.people.unassigned_hdr", "⚠ Unassigned crops"), fg="#ffcc00")
+            self.lbl_person_uuid.configure(text=tr("ui.people.unassigned_uuid", "UUID: (missing from faces.txt)"))
+            self.lbl_person_meta.configure(
+                text=tr("ui.people.unassigned_meta", "Crops: {crops}  •  Video segments: {videos}", crops=len(evs), videos=len(self._matched_videos))
+            )
             self.btn_rename.configure(state=tk.DISABLED)
-            self.btn_ignore.configure(state=tk.DISABLED)
+            self.btn_ignore.configure(state=tk.DISABLED, text=tr("ui.people.btn_ignore_short", "🚫 Ignore"))
             self.btn_del_person.configure(state=tk.DISABLED)
             self.btn_copy_uuid.configure(state=tk.DISABLED)
+            self._sync_operator_mode_ui()
             return
 
         if rec is None:
-            self.lbl_person_name.configure(text="Оберіть людину зі списку ліворуч", fg="#ffffff")
+            self.lbl_person_name.configure(text=tr("ui.people.select_person", "Select a person from the list on the left"), fg="#ffffff")
             self.lbl_person_uuid.configure(text="UUID: —")
             self.lbl_person_meta.configure(text="")
+            self.btn_ignore.configure(text=tr("ui.people.btn_ignore_short", "🚫 Ignore"))
             for b in (self.btn_rename, self.btn_ignore, self.btn_del_person, self.btn_copy_uuid):
                 b.configure(state=tk.DISABLED)
+            self._sync_operator_mode_ui()
             return
 
         tp = rec.get("thumb_path") or ""
@@ -1263,8 +1510,9 @@ class PeopleWindow:
                 pass
 
         ign = bool(rec.get("ignore", False))
+        ign_hdr = tr("ui.people.hdr_ignored_tag", "  [IGNORED]") if ign else ""
         self.lbl_person_name.configure(
-            text=f"{rec['name']}{'  [ІГНОРУЄТЬСЯ]' if ign else ''}",
+            text=f"{rec['name']}{ign_hdr}",
             fg="#ffcc00" if ign else "#ffffff"
         )
         self.lbl_person_uuid.configure(text=f"UUID: {rec['id']}")
@@ -1276,17 +1524,26 @@ class PeopleWindow:
         s_cnt = int(st.get("screen_count", 0))
         v_cnt = len(self._matched_videos)
         self.lbl_person_meta.configure(
-            text=f"Ракурсів: {rec.get('gallery_count', 1)}/4  •  Кропів: {c_cnt}  •  Скрінів: {s_cnt}  •  Відео: {v_cnt}  •  Камери: {cams}"
+            text=tr(
+                "ui.people.person_meta_fmt",
+                "Angles: {gal}/4  •  Crops: {crops}  •  Screenshots: {screens}  •  Videos: {videos}  •  Cameras: {cams}",
+                gal=rec.get("gallery_count", 1),
+                crops=c_cnt,
+                screens=s_cnt,
+                videos=v_cnt,
+                cams=cams,
+            )
         )
 
         self.btn_rename.configure(state=tk.NORMAL)
         self.btn_del_person.configure(state=tk.NORMAL)
         self.btn_ignore.configure(
             state=tk.NORMAL,
-            text="✅ Зняти ігнор" if ign else "🚫 Ігнорувати",
+            text=tr("ui.people.btn_unignore", "✅ Unignore") if ign else tr("ui.people.btn_ignore", "🚫 Ignore"),
             bg="#1f442c" if ign else "#3a2f22",
             fg="#75e08b" if ign else "#ffcc00",
         )
+        self._sync_operator_mode_ui()
 
     def _set_kind_filter(self, kind_key: str):
         self.kind_filter_var.set(kind_key)
@@ -1296,7 +1553,7 @@ class PeopleWindow:
     def _toggle_time_order(self):
         desc = not bool(self.sort_desc_var.get())
         self.sort_desc_var.set(desc)
-        self.btn_time_order.configure(text="▼ Спочатку новіші" if desc else "▲ Хронологічно ↑")
+        self._sync_time_order_btn_text()
         self._rebuild_timeline()
 
     def _update_filter_buttons_style(self):
@@ -1308,10 +1565,10 @@ class PeopleWindow:
         tot_cnt = c_cnt + s_cnt + v_cnt
 
         labels = {
-            "all": f"Усі ({tot_cnt})",
-            "crop": f"👤 Кропи ({c_cnt})",
-            "screen": f"🖼 Скріни ({s_cnt})",
-            "video": f"🎬 Відео ({v_cnt})",
+            "all": tr("ui.people.filter.all", "All ({n})", n=tot_cnt),
+            "crop": tr("ui.people.filter.crop", "👤 Crops ({n})", n=c_cnt),
+            "screen": tr("ui.people.filter.screen", "🖼 Screenshots ({n})", n=s_cnt),
+            "video": tr("ui.people.filter.video", "🎬 Videos ({n})", n=v_cnt),
         }
         for k, btn in self._filter_buttons.items():
             active = (k == cur)
@@ -1321,7 +1578,7 @@ class PeopleWindow:
                 fg="#ffffff" if active else "#d5dae8",
             )
 
-    def _rebuild_timeline(self):
+    def _rebuild_timeline(self, reload_media: bool = True):
         self._update_filter_buttons_style()
         prev_selected_key = self._current_item.get("item_key") if self._current_item else None
 
@@ -1398,13 +1655,20 @@ class PeopleWindow:
                     tag_bit = f" [{ev['tag']}]" if ev.get("tag") else ""
                     txt = f"  👤 {item['time']}  {item['camera_name']}{tag_bit}"
                 elif k == "screen":
-                    txt = f"  🖼 {item['time']}  Повний кадр ({item['camera_name']})"
+                    txt = tr("ui.people.tl.screen_row", "  🖼 {time}  Full frame ({cam})", time=item["time"], cam=item["camera_name"])
                 else:
                     vid = item["video"]
                     hits_n = len(vid.get("hits") or [])
                     off_s = self._format_sec(vid.get("seek_sec", 0.0))
-                    hits_bit = f" ({hits_n} появ)" if hits_n > 1 else ""
-                    txt = f"  🎬 {item['time']}  Відео +{off_s}{hits_bit} [{item['camera_name']}]"
+                    hits_bit = tr("ui.people.tl.hits_bit", " ({n} appearances)", n=hits_n) if hits_n > 1 else ""
+                    txt = tr(
+                        "ui.people.tl.video_row",
+                        "  🎬 {time}  Video +{offset}{hits_bit} [{cam}]",
+                        time=item["time"],
+                        offset=off_s,
+                        hits_bit=hits_bit,
+                        cam=item["camera_name"],
+                    )
 
                 iid = self.tl_tree.insert(day_node, "end", text=txt)
                 self._tree_item_map[iid] = item
@@ -1417,9 +1681,10 @@ class PeopleWindow:
         if target_iid is not None:
             self.tl_tree.selection_set(target_iid)
             self.tl_tree.focus(target_iid)
-            self._show_timeline_item(self._tree_item_map[target_iid])
+            if reload_media or reselect_iid is None:
+                self._show_timeline_item(self._tree_item_map[target_iid])
         else:
-            self._clear_media_stage("Подій для відображення не знайдено")
+            self._clear_media_stage_by_key("ui.people.timeline.empty", "No events to display")
 
     def _on_timeline_select(self, event=None):
         sel = self.tl_tree.selection()
@@ -1432,9 +1697,24 @@ class PeopleWindow:
     # ------------------------------------------------------------------
     # Відображення кропу, повного скріна або відеоплеєра
     # ------------------------------------------------------------------
-    def _clear_media_stage(self, msg: str = "Оберіть подію зі списку"):
+    def _clear_media_stage_by_key(self, key: str, default_text: str):
         self._stop_video_player()
         self._current_item = None
+        self._media_empty_key = (key, default_text)
+        self.lbl_item_header.configure(text=tr(key, default_text))
+        self.video_panel.pack_forget()
+        self.img_panel.pack_forget()
+        self._crop_preview_tk = None
+        self._screen_preview_tk = None
+        self._update_item_action_buttons()
+
+    def _clear_media_stage(self, msg: str = None):
+        if msg is None:
+            self._clear_media_stage_by_key("ui.people.timeline.select_event", "Select an event from the list")
+            return
+        self._stop_video_player()
+        self._current_item = None
+        self._media_empty_key = None
         self.lbl_item_header.configure(text=msg)
         self.video_panel.pack_forget()
         self.img_panel.pack_forget()
@@ -1444,28 +1724,20 @@ class PeopleWindow:
 
     def _show_timeline_item(self, item: dict):
         self._current_item = item
+        self._media_empty_key = None
         kind = item["kind"]
 
         if kind == "video":
             vid = item["video"]
             self.img_panel.pack_forget()
             self.video_panel.pack(fill=tk.BOTH, expand=True)
-            dur_s = self._format_sec(vid.get("duration_sec", 0.0))
-            self.lbl_item_header.configure(
-                text=f"🎬 Відео: {vid['day']} {vid['time']}  •  {vid['camera_name']}  •  {dur_s} ({vid['size_mb']:.1f} МБ)"
-            )
+            self.lbl_item_header.configure(text=self._format_item_header(item))
             self._load_video_item(vid)
         else:
             self._stop_video_player()
             self.video_panel.pack_forget()
             self.img_panel.pack(fill=tk.BOTH, expand=True)
-            ev = item["event"]
-            sh_txt = f"  •  різкість {ev['sharpness']}" if ev.get("sharpness") else ""
-            tag_txt = f" [{ev['tag']}]" if ev.get("tag") else ""
-            k_lbl = "👤 Кроп обличчя" if kind == "crop" else "🖼 Повний кадр"
-            self.lbl_item_header.configure(
-                text=f"{k_lbl}: {ev['day']} {ev['time']}  •  {ev['camera_name']}{tag_txt}{sh_txt}"
-            )
+            self.lbl_item_header.configure(text=self._format_item_header(item))
             if kind == "crop":
                 self.crop_frame_box.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
                 self.screen_frame_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1494,9 +1766,11 @@ class PeopleWindow:
                         self._crop_preview_tk = ImageTk.PhotoImage(pim)
                         self.lbl_crop_preview.configure(image=self._crop_preview_tk, text="")
                 except Exception:
-                    self.lbl_crop_preview.configure(image="", text="[Помилка читання]")
+                    self._crop_ph_key = ("ui.people.ph.read_err", "[Read error]")
+                    self.lbl_crop_preview.configure(image="", text=tr(*self._crop_ph_key))
             else:
-                self.lbl_crop_preview.configure(image="", text="[Файл кропу відсутній]")
+                self._crop_ph_key = ("ui.people.ph.crop_missing", "[Crop file missing]")
+                self.lbl_crop_preview.configure(image="", text=tr(*self._crop_ph_key))
 
         fp = ev.get("full_path") or ""
         self._screen_preview_tk = None
@@ -1515,9 +1789,11 @@ class PeopleWindow:
                         self._screen_preview_tk = ImageTk.PhotoImage(pim)
                         self.lbl_screen_preview.configure(image=self._screen_preview_tk, text="")
             except Exception:
-                self.lbl_screen_preview.configure(image="", text="[Помилка читання повного скріна]")
+                self._screen_ph_key = ("ui.people.ph.screen_read_err", "[Error reading full screenshot]")
+                self.lbl_screen_preview.configure(image="", text=tr(*self._screen_ph_key))
         else:
-            self.lbl_screen_preview.configure(image="", text="[Повний скрін відсутній]")
+            self._screen_ph_key = ("ui.people.ph.screen_missing", "[Full screenshot missing]")
+            self.lbl_screen_preview.configure(image="", text=tr(*self._screen_ph_key))
 
     def _find_matching_video_for_event(self, ev: dict):
         if not ev:
@@ -1538,6 +1814,7 @@ class PeopleWindow:
                 self.btn_jump_video, self.btn_open_folder, self.btn_open_external
             ):
                 b.configure(state=tk.DISABLED)
+            self._sync_operator_mode_ui()
             return
 
         self.btn_open_folder.configure(state=tk.NORMAL)
@@ -1554,6 +1831,7 @@ class PeopleWindow:
             self.btn_del_crop.configure(state=tk.NORMAL)
             has_vid = self._find_matching_video_for_event(ev) is not None
             self.btn_jump_video.configure(state=tk.NORMAL if has_vid else tk.DISABLED)
+        self._sync_operator_mode_ui()
 
     # ------------------------------------------------------------------
     # Відеоплеєр для знайдених сегментів
@@ -1652,12 +1930,14 @@ class PeopleWindow:
 
     def _load_video_item(self, vid: dict, override_seek_sec: float = None):
         self._stop_video_player()
+        self._vid_ph_spec = None
         for ch in list(self.vid_hits_bar.winfo_children()):
             ch.destroy()
 
-        tk.Label(
-            self.vid_hits_bar, text="Моменти появи у відео:", fg="#9ba3b8", bg="#181a24", font=("Segoe UI", 8)
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        self._vid_hits_lbl = tk.Label(
+            self.vid_hits_bar, text=tr("ui.people.vid_hits_label", "Appearances in video:"), fg="#9ba3b8", bg="#181a24", font=("Segoe UI", 8)
+        )
+        self._vid_hits_lbl.pack(side=tk.LEFT, padx=(0, 6))
         for hit in (vid.get("hits") or []):
             s_sec = float(hit["seek_sec"])
             tk.Button(
@@ -1670,21 +1950,26 @@ class PeopleWindow:
 
         fpath = str(vid.get("path") or "")
         if not fpath or not os.path.exists(fpath):
-            self._set_video_placeholder("[Відеофайл відсутній]", color="#ff6666")
+            self._vid_ph_spec = ("ui.people.vid_ph.missing", "[Video file missing]", "#ff6666")
+            self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ff6666")
             return
         if vid.get("busy"):
-            self._set_video_placeholder("[Відеофайл ще активно записується...]", color="#ffcc00")
+            self._vid_ph_spec = ("ui.people.vid_ph.recording", "[Video file is still recording...]", "#ffcc00")
+            self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ffcc00")
             return
         if cv2 is None:
-            self._set_video_placeholder(
-                "[Для вбудованого плеєра потрібна бібліотека OpenCV (cv2)]\nСкористайтесь кнопкою «↗ Відкрити файл».",
-                color="#ffcc00",
+            self._vid_ph_spec = (
+                "ui.people.vid_ph.no_cv2",
+                "[OpenCV (cv2) is required for the built-in player]\nUse the \"↗ Open file\" button.",
+                "#ffcc00",
             )
+            self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ffcc00")
             return
 
         cap = cv2.VideoCapture(fpath)
         if not cap.isOpened():
-            self._set_video_placeholder("[Не вдалося відкрити відеофайл]", color="#ff6666")
+            self._vid_ph_spec = ("ui.people.vid_ph.open_err", "[Failed to open video file]", "#ff6666")
+            self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ff6666")
             return
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 15.0)
@@ -1804,20 +2089,24 @@ class PeopleWindow:
             pass
 
     def _rename_selected_person(self):
+        if self._guard_operator_write(tr("ui.people.op_act.rename", "Rename person")):
+            return
         rec = self._get_selected_record()
         db = self._get_face_db()
         if not rec or db is None:
             return
         new_n = _ask_text_modal(
             self.win,
-            "Дати ім'я людині",
-            f"Введіть нове ім'я для людини\nUUID: {rec['id']}",
+            tr("ui.people.rename.title", "Rename person"),
+            tr("ui.people.rename.prompt", "Enter a new name for this person\nUUID: {uuid}", uuid=rec["id"]),
             rec["name"],
         )
         if new_n and db.rename_record(rec["id"], new_n, cameras_info=self._get_cameras_info()):
             self.refresh_all(select_uid=rec["id"])
 
     def _toggle_ignore_selected(self):
+        if self._guard_operator_write(tr("ui.people.op_act.ignore", "Toggle ignore")):
+            return
         rec = self._get_selected_record()
         db = self._get_face_db()
         if not rec or db is None:
@@ -1826,17 +2115,22 @@ class PeopleWindow:
             self.refresh_all(select_uid=rec["id"])
 
     def _delete_selected_person(self):
+        if self._guard_operator_write(tr("ui.people.op_act.delete_person", "Delete person")):
+            return
         rec = self._get_selected_record()
         db = self._get_face_db()
         if not rec or db is None:
             return
         evs = self._events_by_person.get(rec["id"]) or []
         ans = messagebox.askyesnocancel(
-            "Видалення людини",
-            f"Видалити '{rec['name']}' (UUID: {rec['id']})?\n\n"
-            f"• Так — видалити профіль І всі його кропи з диска ({len(evs)} шт.).\n"
-            f"• Ні — видалити лише еталон з бази faces.txt (кропи лишаться в 'Неприв’язаних').\n"
-            f"• Скасувати — не видаляти.",
+            tr("ui.people.delete_person.title", "Delete person"),
+            tr(
+                "ui.people.delete_person.confirm",
+                "Delete '{name}' (UUID: {uuid})?\n\n• Yes — delete the profile AND all of its crops from disk ({n}).\n• No — delete only the gallery record from faces.txt (crops remain in 'Unassigned').\n• Cancel — do not delete.",
+                name=rec["name"],
+                uuid=rec["id"],
+                n=len(evs),
+            ),
             parent=self.win,
         )
         if ans is None:
@@ -1849,6 +2143,8 @@ class PeopleWindow:
         self.refresh_all()
 
     def _on_wrong_person_clicked(self):
+        if self._guard_operator_write(tr("ui.people.op_act.reanalyze_crop", "Reanalyze face crop")):
+            return
         item = self._current_item
         db = self._get_face_db()
         if not item or item.get("kind") not in ("crop", "screen") or db is None:
@@ -1856,7 +2152,11 @@ class PeopleWindow:
         ev = item["event"]
         crop_path = str(ev.get("crop_path") or "")
         if not crop_path or not os.path.exists(crop_path):
-            messagebox.showwarning("Кроп відсутній", "Файл кропу обличчя не знайдено на диску.", parent=self.win)
+            messagebox.showwarning(
+                tr("ui.people.crop_missing.title", "Crop missing"),
+                tr("ui.people.crop_missing.msg", "Face crop file was not found on disk."),
+                parent=self.win,
+            )
             return
 
         old_uid = str(ev.get("person_uuid") or "")
@@ -1885,25 +2185,38 @@ class PeopleWindow:
                 return
             target_uid = r.get("new_uid")
             msg = (
-                f"Створено нову людину: {r['new_name']}\nUUID: {target_uid}"
+                tr("ui.people.reanalyze.created_msg", "Created new person: {name}\nUUID: {uuid}", name=r["new_name"], uuid=target_uid)
                 if r.get("created_new")
-                else f"Кроп перенесено до: {r['new_name']} (схожість {r['similarity']*100:.1f}%)\nUUID: {target_uid}"
+                else tr(
+                    "ui.people.reanalyze.moved_msg",
+                    "Crop moved to: {name} (similarity {pct:.1f}%)\nUUID: {uuid}",
+                    name=r["new_name"],
+                    pct=r["similarity"] * 100,
+                    uuid=target_uid,
+                )
             )
-            messagebox.showinfo("Реаналіз виконано", msg, parent=self.win)
+            messagebox.showinfo(tr("ui.people.reanalyze.done_title", "Reanalysis complete"), msg, parent=self.win)
             # Якщо у попередньої людини залишилися події — можемо лишитися на ній або перейти на нового власника
             keep_uid = old_uid if (old_uid and r.get("old_remaining", 0) > 0) else target_uid
             self.refresh_all(select_uid=keep_uid)
 
     def _on_delete_crop_clicked(self):
+        if self._guard_operator_write(tr("ui.people.op_act.delete_crop", "Delete face crop")):
+            return
         item = self._current_item
         db = self._get_face_db()
         if not item or item.get("kind") not in ("crop", "screen") or db is None:
             return
         ev = item["event"]
         if not messagebox.askyesno(
-            "Видалення кропу",
-            f"Видалити цей кроп ({ev['day']} {ev['time']}, {ev['camera_name']})?\n"
-            f"Еталони людини будуть перераховані по решті кропів.",
+            tr("ui.people.del_crop.title", "Delete crop"),
+            tr(
+                "ui.people.del_crop.confirm",
+                "Delete this crop ({day} {time}, {cam})?\nPerson embeddings will be recalculated from remaining crops.",
+                day=ev["day"],
+                time=ev["time"],
+                cam=ev["camera_name"],
+            ),
             parent=self.win,
         ):
             return
@@ -1918,18 +2231,21 @@ class PeopleWindow:
         res = db.delete_crop_event(ev, remaining_old)
         if not res or not res.get("ok"):
             messagebox.showerror(
-                "Помилка видалення",
-                (res or {}).get("error") or "Не вдалося видалити кроп.",
+                tr("ui.people.del_crop.err_title", "Delete error"),
+                (res or {}).get("error") or tr("ui.people.del_crop.err_msg", "Failed to delete crop."),
                 parent=self.win,
             )
             return
         self.refresh_all(select_uid=self._selected_uid)
 
     def _on_reanalyze_all_profiles(self):
+        if self._guard_operator_write(tr("ui.people.op_act.reanalyze_all", "Bulk face DB reanalysis")):
+            return
         db = self._get_face_db()
         if db is None:
             return
-        self.btn_reanalyze_all.configure(state=tk.DISABLED, text="⏳ Реаналіз бази...")
+        self._reanalyzing_all = True
+        self.btn_reanalyze_all.configure(state=tk.DISABLED, text=tr("ui.people.btn_reanalyzing", "⏳ Reanalyzing DB..."))
         cams_info = self._get_cameras_info()
 
         def _worker():
@@ -1939,20 +2255,26 @@ class PeopleWindow:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_reanalyze_all_done(self, res: dict):
+        self._reanalyzing_all = False
         if self._is_closing or not self.win.winfo_exists():
             return
-        self.btn_reanalyze_all.configure(state=tk.NORMAL, text="♻ Реаналіз бази з кропів")
+        self.btn_reanalyze_all.configure(state=tk.NORMAL, text=tr("ui.people.btn_reanalyze_all", "♻ Reanalyze DB from crops"))
+        self._sync_operator_mode_ui()
         if not res or not res.get("ok"):
             messagebox.showwarning(
-                "Реаналіз бази",
-                (res or {}).get("error") or "Не вдалося виконати реаналіз.",
+                tr("ui.people.reanalyze_all.title", "Database reanalysis"),
+                (res or {}).get("error") or tr("ui.people.reanalyze_all.err", "Failed to complete reanalysis."),
                 parent=self.win,
             )
             return
         messagebox.showinfo(
-            "Реаналіз бази завершено",
-            f"Оновлено профілів за реальними кропами на диску: {res.get('updated_profiles', 0)}\n"
-            f"Пропущено (без кропів на диску): {res.get('skipped_empty', 0)}",
+            tr("ui.people.reanalyze_all.done_title", "Database reanalysis complete"),
+            tr(
+                "ui.people.reanalyze_all.done_msg",
+                "Profiles updated from actual crops on disk: {updated}\nSkipped (no crops on disk): {skipped}",
+                updated=res.get("updated_profiles", 0),
+                skipped=res.get("skipped_empty", 0),
+            ),
             parent=self.win,
         )
         self.refresh_all(select_uid=self._selected_uid)
@@ -1963,7 +2285,11 @@ class PeopleWindow:
             return
         match = self._find_matching_video_for_event(item["event"])
         if not match:
-            messagebox.showinfo("Відео не знайдено", "Для цієї мітки часу немає збереженого відеофрагмента.", parent=self.win)
+            messagebox.showinfo(
+                tr("ui.people.no_video.title", "Video not found"),
+                tr("ui.people.no_video.msg", "No saved video segment matches this timestamp."),
+                parent=self.win,
+            )
             return
         vid, seek_sec = match
         target_key = f"video::{vid['path']}"
@@ -2036,6 +2362,7 @@ class PeopleWindow:
 
     def on_modules_reloaded(self):
         if not self._is_closing:
+            self._sync_operator_mode_ui()
             self.refresh_all(select_uid=self._selected_uid)
 
     def focus(self):

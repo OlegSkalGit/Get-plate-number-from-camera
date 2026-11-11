@@ -11,6 +11,8 @@ import threading
 from datetime import datetime
 import numpy as np
 
+from scripts.core.i18n import tr
+
 try:
     import cv2
 except ImportError:
@@ -18,6 +20,10 @@ except ImportError:
 
 try:
     import onnxruntime as ort
+    try:
+        ort.set_default_logger_severity(3)
+    except Exception:
+        pass
 except ImportError:
     ort = None
 
@@ -71,7 +77,13 @@ def _ensure_deps():
     if ort is None:
         try:
             ort = importlib.import_module("onnxruntime")
+            ort.set_default_logger_severity(3)
         except ImportError:
+            pass
+    else:
+        try:
+            ort.set_default_logger_severity(3)
+        except Exception:
             pass
 
 
@@ -91,6 +103,7 @@ def refresh_capabilities():
         cv2 = None
     try:
         ort = importlib.import_module("onnxruntime")
+        ort.set_default_logger_severity(3)
     except ImportError:
         ort = None
 
@@ -103,6 +116,17 @@ def _find_model_file(base_dir: str, candidates: tuple):
     return None
 
 
+def is_ready(base_dir: str = "") -> bool:
+    if cv2 is None or ort is None:
+        return False
+    if base_dir:
+        det_p = _find_model_file(base_dir, DETECTOR_CANDIDATES)
+        rec_p = _find_model_file(base_dir, RECOGNIZER_CANDIDATES)
+        if not det_p or not rec_p:
+            return False
+    return True
+
+
 def get_status_summary(base_dir: str = "") -> str:
     missing_libs = []
     if cv2 is None:
@@ -110,7 +134,7 @@ def get_status_summary(base_dir: str = "") -> str:
     if ort is None:
         missing_libs.append("onnxruntime")
     if missing_libs:
-        return f"Потрібні бібліотеки: {', '.join(missing_libs)}"
+        return tr("mod.common.libs_needed", "Required libraries: {libs}", libs=", ".join(missing_libs))
 
     if base_dir:
         det_p = _find_model_file(base_dir, DETECTOR_CANDIDATES)
@@ -121,9 +145,40 @@ def get_status_summary(base_dir: str = "") -> str:
         if not rec_p:
             missing_m.append("face_recognizer.onnx")
         if missing_m:
-            return f"Відсутні моделі: {', '.join(missing_m)}"
-        return f"Готовий ({os.path.basename(det_p)} + {os.path.basename(rec_p)})"
-    return "Готовий (SCRFD + ArcFace/AdaFace)"
+            return tr("mod.common.models_missing", "Missing models: {models}", models=", ".join(missing_m))
+        return tr(
+            "mod.faces.status.ready_files",
+            "Ready ({det} + {rec})",
+            det=os.path.basename(det_p),
+            rec=os.path.basename(rec_p),
+        )
+    return tr("mod.faces.status.ready", "Ready (SCRFD + ArcFace/AdaFace)")
+
+
+def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None) -> dict:
+    """Перевіряє бібліотеки та ONNX-моделі модуля облич."""
+    refresh_capabilities()
+    missing = []
+    if cv2 is None:
+        missing.append("opencv-python")
+    if ort is None:
+        missing.append("onnxruntime")
+    if base_dir:
+        if not _find_model_file(base_dir, DETECTOR_CANDIDATES):
+            missing.append("scrfd_face_detector.onnx")
+        if not _find_model_file(base_dir, RECOGNIZER_CANDIDATES):
+            missing.append("face_recognizer.onnx")
+    ok = len(missing) == 0
+    return {
+        "ok": ok,
+        "downloaded": [],
+        "missing": missing,
+        "message": tr("mod.faces.res.ready", "Face models (SCRFD + FaceRecognizer) are ready.") if ok else tr(
+            "mod.common.res_missing",
+            "Missing resources: {items}",
+            items=", ".join(missing),
+        ),
+    }
 
 
 def sanitize_filename_part(name: str, fallback: str = "Unknown", max_len: int = 48) -> str:
@@ -352,7 +407,7 @@ def is_valid_frontal_face(landmarks, box, min_size=20, max_yaw=32.0, max_pitch=2
 def _build_ort_session(model_path: str, providers=None, intra_op_threads: int = 2):
     _ensure_deps()
     if ort is None:
-        raise ImportError("Пакет 'onnxruntime' не встановлено для модуля облич")
+        raise ImportError("Package 'onnxruntime' is not installed for the faces module")
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
     opts.intra_op_num_threads = max(1, int(intra_op_threads))
@@ -372,7 +427,7 @@ class SCRFDDetector:
     def __init__(self, model_path, input_size=(640, 640), providers=None, intra_op_threads=2):
         _ensure_deps()
         if cv2 is None:
-            raise ImportError("Пакет 'opencv-python' не встановлено для SCRFDDetector")
+            raise ImportError("Package 'opencv-python' is not installed for SCRFDDetector")
         self.model_path = model_path
         self.input_size = input_size
         self._lock = threading.Lock()
@@ -518,22 +573,58 @@ class SCRFDDetector:
         return results
 
 
+def _parse_allow_disk_write(config: dict = None, app_context: dict = None) -> bool:
+    for src in (app_context, config):
+        if not isinstance(src, dict):
+            continue
+        if "allow_disk_write" in src and src.get("allow_disk_write") is not None:
+            val = src.get("allow_disk_write")
+            if isinstance(val, str):
+                return val.strip().lower() not in ("false", "0", "no", "off")
+            return bool(val)
+        mode = src.get("operation_mode")
+        if mode is not None and str(mode).strip() != "":
+            return str(mode).strip().lower() != "operator"
+    return True
+
+
+def _merge_runtime_write_cfg(flat_cfg: dict, app_context: dict = None) -> dict:
+    cfg = dict(flat_cfg or {})
+    allow_write = _parse_allow_disk_write(cfg, app_context)
+    cfg["allow_disk_write"] = allow_write
+    cfg["operation_mode"] = "server" if allow_write else "operator"
+    return cfg
+
+
 class _BaseFaceDB:
     """
     Спільна логіка роботи з базою облич (faces.txt, thumbs/) та архівом кропів/скрінів
     по усіх камерах (колекціонування подій, видалення кропів, реаналіз бази кропів).
     """
-    def __init__(self, db_file_path: str, thumbs_dir: str = None):
+    def __init__(self, db_file_path: str, thumbs_dir: str = None, allow_disk_write: bool = True):
         self.db_path = db_file_path
+        self.allow_disk_write = bool(allow_disk_write)
         db_dir = os.path.dirname(os.path.abspath(db_file_path))
-        os.makedirs(db_dir, exist_ok=True)
         self.thumbs_dir = thumbs_dir or os.path.join(db_dir, "thumbs")
-        os.makedirs(self.thumbs_dir, exist_ok=True)
+        if self.allow_disk_write:
+            os.makedirs(db_dir, exist_ok=True)
+            os.makedirs(self.thumbs_dir, exist_ok=True)
 
         self._db_lock = threading.Lock()
         self.known_templates = []
         self._db_sig = None
         self._last_template_save_ts = {}
+
+    def set_allow_disk_write(self, allow: bool):
+        allow_b = bool(allow)
+        with self._db_lock:
+            self.allow_disk_write = allow_b
+            if allow_b:
+                db_dir = os.path.dirname(os.path.abspath(self.db_path))
+                os.makedirs(db_dir, exist_ok=True)
+                os.makedirs(self.thumbs_dir, exist_ok=True)
+                if not os.path.exists(self.db_path):
+                    self._load_database_locked()
 
     def _get_embedder(self):
         return None
@@ -557,6 +648,11 @@ class _BaseFaceDB:
         """
         self.known_templates.clear()
         if not os.path.exists(self.db_path):
+            if not getattr(self, "allow_disk_write", True):
+                self._db_sig = None
+                return
+            db_dir = os.path.dirname(os.path.abspath(self.db_path))
+            os.makedirs(db_dir, exist_ok=True)
             with open(self.db_path, "w", encoding="utf-8") as f:
                 f.write("# UniqueFaceID,FaceName,Ignore,VectorGallery\n")
             self._db_sig = self._file_sig(self.db_path)
@@ -625,6 +721,8 @@ class _BaseFaceDB:
 
     def _save_all_database_locked(self):
         """Атомарний перезапис faces.txt через тимчасовий файл та резервну копію."""
+        if not getattr(self, "allow_disk_write", True):
+            return
         db_dir = os.path.dirname(os.path.abspath(self.db_path))
         os.makedirs(db_dir, exist_ok=True)
         tmp_path = f"{self.db_path}.tmp"
@@ -664,6 +762,8 @@ class _BaseFaceDB:
         return str(uuid.uuid4())
 
     def _save_thumb_if_needed(self, u_id: str, crop_img, overwrite: bool = False):
+        if not getattr(self, "allow_disk_write", True):
+            return
         if crop_img is None or getattr(crop_img, "size", 0) == 0:
             return
         os.makedirs(self.thumbs_dir, exist_ok=True)
@@ -709,6 +809,8 @@ class _BaseFaceDB:
             return out
 
     def rename_record(self, u_id: str, new_name: str, cameras_info: list = None) -> bool:
+        if not getattr(self, "allow_disk_write", True):
+            return False
         safe = sanitize_csv_field(new_name, fallback="")
         if not safe:
             return False
@@ -749,6 +851,8 @@ class _BaseFaceDB:
                         pass
 
     def set_ignore(self, u_id: str, ignore_flag: bool) -> bool:
+        if not getattr(self, "allow_disk_write", True):
+            return False
         with self._db_lock:
             self._sync_if_modified_locked()
             for r in self.known_templates:
@@ -759,6 +863,8 @@ class _BaseFaceDB:
         return False
 
     def delete_record(self, u_id: str) -> bool:
+        if not getattr(self, "allow_disk_write", True):
+            return False
         with self._db_lock:
             self._sync_if_modified_locked()
             before = len(self.known_templates)
@@ -795,7 +901,7 @@ class _BaseFaceDB:
 
         for cam in (cameras_info or []):
             cam_uid = str(cam.get("uuid") or "")
-            cam_name = str(cam.get("name") or cam_uid or "Камера")
+            cam_name = str(cam.get("name") or cam_uid or tr("camera.default_single", "Camera"))
             cam_arch = str(cam.get("archive_dir") or "")
             faces_dir = os.path.join(cam_arch, "faces") if cam_arch else ""
             if not faces_dir or not os.path.isdir(faces_dir):
@@ -879,7 +985,7 @@ class _BaseFaceDB:
                     ev = {
                         "event_id": crop_path,
                         "person_uuid": p_uid,
-                        "person_name": (rec_by_id[p_uid]["name"] if in_db else (meta_name or p_uid or "Невідомо")),
+                        "person_name": (rec_by_id[p_uid]["name"] if in_db else (meta_name or p_uid or tr("ui.people.unknown_person", "Unknown"))),
                         "in_db": in_db,
                         "camera_uuid": cam_uid,
                         "camera_name": cam_name,
@@ -996,9 +1102,11 @@ class _BaseFaceDB:
         Перераховує вектори галереї (gallery), центроїд та мініатюру (thumb) людини u_id
         лише на основі дійсних кропів, що залишилися на диску.
         """
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "recalculated": False, "error": tr("mod.faces.err.operator_write_disabled", "Operator mode: disk writes are disabled.")}
         embedder = self._get_embedder()
         if embedder is None:
-            return {"ok": False, "recalculated": False, "reason": "Нейромережа облич (face_recognizer.onnx / cv2 / onnxruntime) недоступна"}
+            return {"ok": False, "recalculated": False, "reason": tr("mod.faces.err.neural_unavailable", "Face neural engine (face_recognizer.onnx / opencv / onnxruntime) is unavailable.")}
 
         gallery, centroid, best_bgr = self._build_gallery_from_crop_paths(remaining_crop_paths)
         with self._db_lock:
@@ -1009,9 +1117,9 @@ class _BaseFaceDB:
                     target = r
                     break
             if target is None:
-                return {"ok": False, "recalculated": False, "reason": "Особу не знайдено в базі"}
+                return {"ok": False, "recalculated": False, "reason": tr("mod.faces.err.person_not_found", "Person was not found in the database")}
             if not gallery:
-                return {"ok": True, "recalculated": False, "used_crops": 0, "reason": "Не залишилося кропів для перерахунку"}
+                return {"ok": True, "recalculated": False, "used_crops": 0, "reason": tr("mod.faces.err.no_crops_left", "No crops left to recalculate")}
 
             target["gallery"] = gallery
             target["vector"] = centroid
@@ -1033,14 +1141,14 @@ class _BaseFaceDB:
         """
         embedder = self._get_embedder()
         if embedder is None:
-            return {"ok": False, "error": "Нейромережа облич (face_recognizer.onnx / opencv / onnxruntime) недоступна."}
+            return {"ok": False, "error": tr("mod.faces.err.neural_unavailable", "Face neural engine (face_recognizer.onnx / opencv / onnxruntime) is unavailable.")}
 
         if not crop_path or not os.path.exists(crop_path):
-            return {"ok": False, "error": "Файл кропу обличчя не знайдено на диску."}
+            return {"ok": False, "error": tr("mod.faces.err.crop_missing_disk", "Face crop file was not found on disk.")}
 
         target_emb, sh, _ = self._compute_crop_embedding_and_sharpness(crop_path)
         if target_emb is None:
-            return {"ok": False, "error": "Не вдалося прочитати зображення кропу або обчислити вектор."}
+            return {"ok": False, "error": tr("mod.faces.err.crop_read_or_embed", "Failed to read crop image or compute embedding.")}
 
         excl = set(exclude_uids or [])
         with self._db_lock:
@@ -1133,16 +1241,18 @@ class _BaseFaceDB:
         2) Виконує реаналіз кропу проти інших людей (або призначає вказаного target_uid чи нову людину з UUID).
         3) Перейменовує файл кропу та оновлює .json-sidecar під нового власника.
         """
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.faces.err.operator_modify_disabled", "Operator mode: disk writes and file changes are disabled.")}
         embedder = self._get_embedder()
         if embedder is None:
-            return {"ok": False, "error": "Нейромережа облич (face_recognizer.onnx / opencv / onnxruntime) недоступна."}
+            return {"ok": False, "error": tr("mod.faces.err.neural_unavailable", "Face neural engine (face_recognizer.onnx / opencv / onnxruntime) is unavailable.")}
 
         if not crop_path or not os.path.exists(crop_path):
-            return {"ok": False, "error": "Файл кропу обличчя не знайдено."}
+            return {"ok": False, "error": tr("mod.faces.err.crop_not_found", "Face crop file not found.")}
 
         wrong_emb, calc_sh, wrong_bgr = self._compute_crop_embedding_and_sharpness(crop_path)
         if wrong_emb is None:
-            return {"ok": False, "error": "Не вдалося обробити зображення кропу."}
+            return {"ok": False, "error": tr("mod.faces.err.crop_process_failed", "Failed to process crop image.")}
 
         # Попередньо рахуємо нові еталони старого профілю поза блокуванням
         norm_wrong = os.path.normpath(crop_path)
@@ -1188,7 +1298,7 @@ class _BaseFaceDB:
 
             if dest_rec is None:
                 new_id = self._next_unique_id_locked()
-                new_name = f"Особа-{new_id[:8]}"
+                new_name = f"Person-{new_id[:8]}"
                 dest_rec = {
                     "id": new_id,
                     "name": new_name,
@@ -1286,9 +1396,11 @@ class _BaseFaceDB:
 
     def reanalyze_all_profiles_from_disk(self, cameras_info: list) -> dict:
         """Масово перераховує еталонні вектори (faces.txt + thumbs) усіх людей за реальними кропами на диску."""
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.faces.err.operator_modify_disabled", "Operator mode: disk writes and file changes are disabled.")}
         embedder = self._get_embedder()
         if embedder is None:
-            return {"ok": False, "error": "Нейромережа облич (face_recognizer.onnx / opencv / onnxruntime) недоступна."}
+            return {"ok": False, "error": tr("mod.faces.err.neural_unavailable", "Face neural engine (face_recognizer.onnx / opencv / onnxruntime) is unavailable.")}
 
         collected = self.collect_person_events(cameras_info)
         ev_map = collected.get("events_by_person") or {}
@@ -1309,8 +1421,10 @@ class _BaseFaceDB:
 
     def delete_crop_event(self, event_info: dict, remaining_old_crops: list) -> dict:
         """Видаляє вказаний кроп, його sidecar і незалежний _full.jpg, після чого перераховує профіль."""
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.faces.err.operator_delete_disabled", "Operator mode: deletion and disk writes are disabled.")}
         if not isinstance(event_info, dict):
-            return {"ok": False, "error": "Некоректний запис події"}
+            return {"ok": False, "error": tr("mod.faces.err.invalid_event", "Invalid event record")}
 
         crop_path = str(event_info.get("crop_path") or "")
         meta_path = str(event_info.get("meta_path") or (_sidecar_path_for_crop(crop_path) if crop_path else ""))
@@ -1321,7 +1435,7 @@ class _BaseFaceDB:
             try:
                 os.remove(crop_path)
             except Exception as e:
-                return {"ok": False, "error": f"Не вдалося видалити файл кропу: {e}"}
+                return {"ok": False, "error": tr("mod.faces.err.crop_delete_failed", "Failed to delete crop file: {err}", err=e)}
 
         if meta_path and os.path.exists(meta_path):
             try:
@@ -1355,6 +1469,8 @@ class _BaseFaceDB:
         return {"ok": True, "deleted_full": deleted_full, "old_remaining": len(clean_rem)}
 
     def delete_person_completely(self, u_id: str, person_events: list, delete_files: bool = True) -> dict:
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "deleted_files": 0, "error": tr("mod.faces.err.operator_delete_disabled", "Operator mode: deletion and disk writes are disabled.")}
         deleted_files = 0
         if delete_files:
             for ev in list(person_events or []):
@@ -1392,8 +1508,8 @@ class _BaseFaceDB:
 
 
 class FaceRecognizer(_BaseFaceDB):
-    def __init__(self, model_path, db_file_path, providers=None, intra_op_threads=2, thumbs_dir=None):
-        super().__init__(db_file_path=db_file_path, thumbs_dir=thumbs_dir)
+    def __init__(self, model_path, db_file_path, providers=None, intra_op_threads=2, thumbs_dir=None, allow_disk_write: bool = True):
+        super().__init__(db_file_path=db_file_path, thumbs_dir=thumbs_dir, allow_disk_write=allow_disk_write)
         self.model_path = model_path
         self._infer_lock = threading.Lock()
         self.session = _build_ort_session(model_path, providers=providers, intra_op_threads=intra_op_threads)
@@ -1431,7 +1547,7 @@ class FaceRecognizer(_BaseFaceDB):
             if best_sim >= min_similarity and best_idx != -1:
                 rec = self.known_templates[best_idx]
                 return rec["id"], rec["name"], f"{int(round(best_sim * 100))}%", rec.get("ignore", False)
-        return None, "Особа", "", False
+        return None, "Face", "", False
 
     def identify_or_register(
         self,
@@ -1448,6 +1564,9 @@ class FaceRecognizer(_BaseFaceDB):
         - Якщо особа нова та allow_register=True: створює унікальний UUID з Ignore=False.
         Повертає: (UniqueFaceID | None, FaceName, status_tag, is_ignored: bool)
         """
+        if not getattr(self, "allow_disk_write", True):
+            return self.identify_readonly(fused_embedding, min_similarity=min_similarity)
+
         norm_emb = fused_embedding / (np.linalg.norm(fused_embedding) + 1e-10)
         now = time.time()
 
@@ -1488,10 +1607,10 @@ class FaceRecognizer(_BaseFaceDB):
                 return rec["id"], rec["name"], sim_tag, rec.get("ignore", False)
 
             if not allow_register:
-                return None, "Особа", "LOW", False
+                return None, "Face", "LOW", False
 
             new_id = self._next_unique_id_locked()
-            new_name = f"Особа-{new_id[:8]}"
+            new_name = f"Person-{new_id[:8]}"
             new_record = {
                 "id": new_id,
                 "name": new_name,
@@ -1510,13 +1629,19 @@ class FaceRecognizer(_BaseFaceDB):
 
 class FallbackFaceDB(_BaseFaceDB):
     """Резервний менеджер бази облич (коли жодна камера ще не підключила FaceRecognizer або бібліотеки відсутні)."""
-    def __init__(self, db_path: str, base_dir: str = ""):
-        super().__init__(db_file_path=db_path)
+    def __init__(self, db_path: str, base_dir: str = "", allow_disk_write: bool = True):
+        super().__init__(db_file_path=db_path, allow_disk_write=allow_disk_write)
         self.base_dir = os.path.abspath(base_dir) if base_dir else ""
         self._lazy_embedder = None
         self._lazy_tried = False
         with self._db_lock:
             self._load_database_locked()
+
+    def set_allow_disk_write(self, allow: bool):
+        super().set_allow_disk_write(allow)
+        emb = self._lazy_embedder
+        if emb is not None and emb is not self:
+            emb.set_allow_disk_write(allow)
 
     def _sync_if_modified_locked(self):
         # Для легкої БД без 30FPS-циклу перечитуємо завжди при зміні або відсутності
@@ -1539,7 +1664,11 @@ class FallbackFaceDB(_BaseFaceDB):
         if not rec_path:
             return None
         try:
-            self._lazy_embedder = FaceRecognizer(rec_path, self.db_path)
+            self._lazy_embedder = FaceRecognizer(
+                rec_path,
+                self.db_path,
+                allow_disk_write=getattr(self, "allow_disk_write", True),
+            )
             return self._lazy_embedder
         except Exception:
             return None
@@ -1563,7 +1692,7 @@ class FaceTrack:
         self.frames_tracked = 1
 
         self.u_id = None
-        self.face_name = "Особа"
+        self.face_name = "Face"
         self.status_tag = ""
         self.is_ignored = False
         self.last_preview_ts = 0.0
@@ -1605,17 +1734,19 @@ class FaceEngine:
         self.on_saved_callback = on_saved_callback
 
         self.faces_dir = output_dir or os.path.join(base_dir, "faces")
-        os.makedirs(self.faces_dir, exist_ok=True)
         self.db_file = db_file_path or os.path.join(self.faces_dir, "faces.txt")
-
+        self.allow_disk_write = True
+        self._state_lock = threading.Lock()
         self._reload_params()
+        if self.allow_disk_write:
+            os.makedirs(self.faces_dir, exist_ok=True)
 
         if detector is not None:
             self.detector = detector
         else:
             det_path = _find_model_file(base_dir, DETECTOR_CANDIDATES)
             if not det_path:
-                raise FileNotFoundError("Детектор облич SCRFD не знайдено в папці models/")
+                raise FileNotFoundError("SCRFD face detector model not found in models/")
             self.detector = SCRFDDetector(det_path, providers=providers)
 
         if recognizer is not None:
@@ -1623,16 +1754,21 @@ class FaceEngine:
         else:
             rec_path = _find_model_file(base_dir, RECOGNIZER_CANDIDATES)
             if not rec_path:
-                raise FileNotFoundError("Модель розпізнавання облич не знайдено в папці models/")
-            self.recognizer = FaceRecognizer(rec_path, self.db_file, providers=providers)
+                raise FileNotFoundError("Face recognition model not found in models/")
+            self.recognizer = FaceRecognizer(
+                rec_path,
+                self.db_file,
+                providers=providers,
+                allow_disk_write=self.allow_disk_write,
+            )
 
         self.active_tracks = {}
         self.next_track_id = 1
         self.track_timeout = 2.0
         self.recently_saved = {}
-        self._state_lock = threading.Lock()
 
     def _reload_params(self):
+        self.allow_disk_write = _parse_allow_disk_write(self.config)
         self.face_min_similarity = float(self.config.get("faces_min_similarity", self.config.get("min_similarity", 0.48)))
         self.face_det_thresh = float(self.config.get("faces_det_thresh", self.config.get("det_thresh", 0.45)))
         self.face_min_size = int(self.config.get("faces_min_size", self.config.get("min_size", 20)))
@@ -1787,6 +1923,18 @@ class FaceEngine:
         mean_vector = np.mean(embeddings, axis=0)
         fused_vector = mean_vector / (np.linalg.norm(mean_vector) + 1e-10)
 
+        if not self.allow_disk_write:
+            u_id, f_name, status_tag, is_ignored = self.recognizer.identify_readonly(
+                fused_vector,
+                min_similarity=self.face_min_similarity,
+            )
+            track.u_id = u_id
+            track.face_name = f_name
+            track.status_tag = status_tag
+            track.is_ignored = is_ignored
+            track.saved = True
+            return
+
         min_reg_frames = 2 if (is_flush and track.best_sharpness >= 45.0) else 3
         can_register_new = (
             track.frames_tracked >= min_reg_frames
@@ -1887,14 +2035,21 @@ def _resolve_db_path(base_dir: str, app_context: dict = None) -> str:
 def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, app_context: dict = None):
     det_path = _find_model_file(base_dir, DETECTOR_CANDIDATES)
     if not det_path:
-        raise FileNotFoundError("Детектор облич SCRFD не знайдено в папці models/")
+        raise FileNotFoundError("SCRFD face detector model not found in models/")
     rec_path = _find_model_file(base_dir, RECOGNIZER_CANDIDATES)
     if not rec_path:
-        raise FileNotFoundError("Модель розпізнавання облич не знайдено в папці models/")
+        raise FileNotFoundError("Face recognition model not found in models/")
 
     db_path = _resolve_db_path(base_dir, app_context)
+    allow_write = _parse_allow_disk_write(app_context)
     det = SCRFDDetector(det_path, providers=providers, intra_op_threads=ai_threads)
-    rec = FaceRecognizer(rec_path, db_path, providers=providers, intra_op_threads=ai_threads)
+    rec = FaceRecognizer(
+        rec_path,
+        db_path,
+        providers=providers,
+        intra_op_threads=ai_threads,
+        allow_disk_write=allow_write,
+    )
     return {
         "detector": det,
         "recognizer": rec,
@@ -1908,14 +2063,23 @@ def _on_app_context_changed(shared_resources, app_context, base_dir: str, provid
     if not isinstance(shared_resources, dict):
         return shared_resources
     new_db = _resolve_db_path(base_dir, app_context)
+    allow_write = _parse_allow_disk_write(app_context)
     cur_db = shared_resources.get("db_path") or ""
     if os.path.abspath(new_db) != os.path.abspath(cur_db):
         rec_path = shared_resources.get("rec_path") or _find_model_file(base_dir, RECOGNIZER_CANDIDATES)
         if rec_path:
             shared_resources["recognizer"] = FaceRecognizer(
-                rec_path, new_db, providers=providers, intra_op_threads=ai_threads
+                rec_path,
+                new_db,
+                providers=providers,
+                intra_op_threads=ai_threads,
+                allow_disk_write=allow_write,
             )
             shared_resources["db_path"] = new_db
+    else:
+        rec = shared_resources.get("recognizer")
+        if rec is not None and hasattr(rec, "set_allow_disk_write"):
+            rec.set_allow_disk_write(allow_write)
     return shared_resources
 
 
@@ -1924,16 +2088,22 @@ _FALLBACK_DB_CACHE = {}
 
 
 def _get_db_accessor(app_context: dict = None, shared_resources=None):
+    allow_write = _parse_allow_disk_write(app_context)
     if isinstance(shared_resources, dict) and shared_resources.get("recognizer") is not None:
-        return shared_resources["recognizer"]
+        rec = shared_resources["recognizer"]
+        if hasattr(rec, "set_allow_disk_write"):
+            rec.set_allow_disk_write(allow_write)
+        return rec
     base_dir = (app_context or {}).get("base_dir", "")
     db_path = _resolve_db_path(base_dir, app_context)
     cache_key = (os.path.abspath(db_path), os.path.abspath(base_dir) if base_dir else "")
     with _FALLBACK_DB_LOCK:
         inst = _FALLBACK_DB_CACHE.get(cache_key)
         if inst is None:
-            inst = FallbackFaceDB(db_path, base_dir=base_dir)
+            inst = FallbackFaceDB(db_path, base_dir=base_dir, allow_disk_write=allow_write)
             _FALLBACK_DB_CACHE[cache_key] = inst
+        elif hasattr(inst, "set_allow_disk_write"):
+            inst.set_allow_disk_write(allow_write)
         return inst
 
 
@@ -1941,9 +2111,12 @@ def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_sav
     det = shared_resources.get("detector") if isinstance(shared_resources, dict) else None
     rec = shared_resources.get("recognizer") if isinstance(shared_resources, dict) else None
     db_path = _resolve_db_path(base_dir, app_context)
+    eff_cfg = _merge_runtime_write_cfg(flat_cfg, app_context)
+    if rec is not None and hasattr(rec, "set_allow_disk_write"):
+        rec.set_allow_disk_write(_parse_allow_disk_write(eff_cfg))
     return FaceEngine(
         base_dir=base_dir,
-        config=flat_cfg,
+        config=eff_cfg,
         on_saved_callback=on_saved_callback,
         detector=det,
         recognizer=rec,
@@ -1962,7 +2135,10 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
             engine.recognizer = shared_resources["recognizer"]
         if shared_resources.get("db_path"):
             engine.db_file = shared_resources["db_path"]
-    engine.update_config(flat_cfg)
+    eff_cfg = _merge_runtime_write_cfg(flat_cfg, app_context)
+    if engine.recognizer is not None and hasattr(engine.recognizer, "set_allow_disk_write"):
+        engine.recognizer.set_allow_disk_write(_parse_allow_disk_write(eff_cfg))
+    engine.update_config(eff_cfg)
 
 
 def _process_and_pack(engine, frame, prev_state=None):
@@ -2019,11 +2195,11 @@ MODULE_SPEC = {
     "version": "2.0.0",
     "order": 20,
     "kind": "ai",
-    "name": "Обличчя",
+    "name": "Faces",
     "icon": "👤",
-    "short_badge": "О",
-    "description": "Біометричне виявлення, оцінка фронтальності та розпізнавання облич зі спільною базою персон (faces.txt).",
-    "on_help": "Увімкнути біометричне розпізнавання облич і роботу зі спільною базою персон (faces.txt) для цієї камери.",
+    "short_badge": "FAC",
+    "description": "Biometric detection, frontality scoring, and face recognition with a shared person database (faces.txt).",
+    "on_help": "Enable biometric face recognition and shared person database (faces.txt) tracking for this camera.",
     "provides": ["face_db"],
     "library_deps": ["opencv-python", "onnxruntime"],
     "settings_schema": [
@@ -2031,9 +2207,9 @@ MODULE_SPEC = {
             "key": "show_boxes",
             "type": "bool",
             "default": True,
-            "label": "Показувати рамки:",
-            "bool_text": "Малювати блакитні рамки й підписи ID/Ім'я",
-            "help": "Малювати блакитні рамки навколо облич та їхній поточний ID/ім'я і відсоток схожості.",
+            "label": "Show Boxes:",
+            "bool_text": "Draw cyan boxes with ID / Name labels",
+            "help": "Draw cyan boxes around detected faces showing the person's ID/name and similarity percentage.",
         },
         {
             "key": "min_similarity",
@@ -2042,8 +2218,8 @@ MODULE_SPEC = {
             "min": 0.20,
             "max": 0.90,
             "step": 0.02,
-            "label": "Поріг схожості векторів:",
-            "help": "Поріг схожості векторів облич (0.38–0.65; 0.48 оптимум). Вище — менше хибних збігів різних людей, нижче — краще впізнає під іншим кутом.",
+            "label": "Embedding Similarity Threshold:",
+            "help": "Face vector similarity threshold (0.38–0.65; 0.48 optimal). Higher reduces false matches; lower recognizes wider angles.",
         },
         {
             "key": "det_thresh",
@@ -2052,8 +2228,8 @@ MODULE_SPEC = {
             "min": 0.15,
             "max": 0.95,
             "step": 0.02,
-            "label": "Поріг детектора SCRFD:",
-            "help": "Поріг впевненості детектора облич SCRFD (0.35–0.70; 0.45 стандарт).",
+            "label": "SCRFD Detector Threshold:",
+            "help": "SCRFD face detector confidence threshold (0.35–0.70; 0.45 standard).",
         },
         {
             "key": "min_size",
@@ -2062,8 +2238,8 @@ MODULE_SPEC = {
             "min": 12,
             "max": 300,
             "step": 2,
-            "label": "Мін. розмір обличчя (px):",
-            "help": "Мінімальний розмір сторони обличчя в пікселях (20 для далеких камер, 40–50 для входу).",
+            "label": "Min Face Size (px):",
+            "help": "Minimum bounding side length of a face in pixels (20 for distant cameras, 40–50 for entrances).",
         },
         {
             "key": "sleep_time_after_save",
@@ -2072,19 +2248,21 @@ MODULE_SPEC = {
             "min": 0.0,
             "max": 3600.0,
             "step": 1.0,
-            "label": "Таймаут повторів (сек):",
-            "help": "Персональний таймаут повторів збереження одного й того самого обличчя (сек). Більше не прив'язаний до номерів авто.",
+            "disk_write": True,
+            "label": "Repeat Timeout (sec):",
+            "help": "Per-person repeat cooldown in seconds before saving the same person again (independent from license plates).",
         },
         {
             "key": "cooldown_extend_on_seen",
             "type": "bool",
             "default": True,
+            "disk_write": True,
             "label": "Sliding Cooldown:",
-            "bool_text": "Подовжувати таймаут, поки людина не вийде з кадру",
+            "bool_text": "Extend cooldown while the person stays in frame",
             "help": (
-                "Режим присутності (Sliding Cooldown)\n"
-                "Якщо увімкнено: поки людина залишається в полі зору камери, таймаут постійно продовжується і дублікат фото НЕ робиться, доки вона реально не зникне на N секунд.\n"
-                "Якщо вимкнено: фото робитиметься фіксовано раз на кожні N секунд присутності."
+                "Presence Mode (Sliding Cooldown)\n"
+                "When enabled: while the person remains in the camera's view, the cooldown keeps extending and NO duplicate photo is taken until they disappear for N seconds.\n"
+                "When disabled: a snapshot is saved once every N seconds while present."
             ),
         },
         {
@@ -2094,8 +2272,9 @@ MODULE_SPEC = {
             "min": 0.0,
             "max": 3650.0,
             "step": 1.0,
-            "label": "Автовидалення старше (днів):",
-            "help": "Автовидалення фото облич цієї камери, старших за N днів (0 = необмежено).",
+            "disk_write": True,
+            "label": "Auto-delete older than (days):",
+            "help": "Automatically delete face snapshots from this camera older than N days (0 = keep forever).",
         },
         {
             "key": "date_from",
@@ -2103,22 +2282,24 @@ MODULE_SPEC = {
             "type": "date_range",
             "default": "",
             "default_to": "",
-            "label": "Період роботи (дати):",
-            "help": "Початкова та кінцева дата роботи модуля облич (YYYY-MM-DD, порожньо = необмежено).",
+            "label": "Active Schedule (Dates):",
+            "help": "Start and end dates for the faces module (YYYY-MM-DD, empty = unlimited).",
         },
     ],
     "archive": {
         "has_archive": True,
-        "button_label": "👤 Обличчя",
-        "sidebar_title": "Історія облич",
-        "item_preview_label": "Фото обличчя:",
+        "button_label": "👤 Faces",
+        "sidebar_title": "Faces History",
+        "item_preview_label": "Face Snapshot:",
         "icon": "👤",
         "record_type": "pair_image",
         "extensions": (".jpg", ".jpeg", ".png"),
         "parse_record": _parse_archive_record,
     },
+    "is_ready": is_ready,
     "refresh_capabilities": refresh_capabilities,
     "get_status_summary": get_status_summary,
+    "ensure_resources": ensure_resources,
     "create_shared_resources": _create_shared_resources,
     "on_app_context_changed": _on_app_context_changed,
     "get_db_accessor": _get_db_accessor,

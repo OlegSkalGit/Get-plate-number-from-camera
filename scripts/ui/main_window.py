@@ -1,15 +1,32 @@
 import os
 import sys
 import time
+import queue
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
+from scripts.core.i18n import (
+    init_i18n,
+    tr,
+    set_language,
+    get_language,
+    list_languages,
+    get_language_label,
+    parse_language_code,
+)
 from scripts.core.module_registry import ModuleRegistry
 from scripts.core.config_manager import ConfigManager
-from scripts.core.hardware_info import HardwareMonitor
+from scripts.core.hardware_info import (
+    HardwareMonitor,
+    prepare_cuda_dll_environment,
+    check_cuda_libraries_status,
+    download_cuda_libraries,
+    is_onnxruntime_gpu_installed,
+    has_nvidia_gpu,
+)
 from scripts.engine.inference_pool import InferencePool
 from scripts.engine.camera_manager import CameraManager
 from scripts.ui.helpers import WindowGeometryTracker, compute_auto_grid
@@ -61,19 +78,28 @@ class MainGridWindow:
             except Exception:
                 pass
 
-        self.root.title("ANPR Multi-Cam NVR — Головна сітка камер")
         self.root.configure(bg="#0b0c10")
 
         self._is_closing = False
         self._startup_ts = time.time()
 
-        # 1. Автоматичне виявлення незалежних модулів (scripts/modules/) і синхронізація конфігу
+        # 1. Автоматичне виявлення незалежних модулів (scripts/modules/), конфіг і локалізація
+        try:
+            prepare_cuda_dll_environment(self.base_dir, preload=False)
+        except Exception:
+            pass
         self.registry = ModuleRegistry(self.base_dir)
         self.cfg_mgr = ConfigManager(self.base_dir, registry=self.registry)
         self.cfg_mgr.sync_with_registry(self.registry)
+        init_i18n(self.base_dir, lang_code=self.cfg_mgr.get_language())
+        self.root.title(tr("ui.main.window_title", "ANPR Multi-Cam NVR — Camera Grid"))
 
         snap = self.cfg_mgr.get_snapshot()
         gen_cfg = snap.get("general") or {}
+        op_mode = str(gen_cfg.get("operation_mode", "server")).strip().lower()
+        if op_mode not in ("server", "operator"):
+            op_mode = "server"
+        allow_write = (op_mode == "server")
         hw_cfg = snap.get("hardware") or {}
 
         # 2. Телеметрія заліза, спільний пул ресурсів та менеджер камер
@@ -81,7 +107,11 @@ class MainGridWindow:
         self.inference_pool = InferencePool(
             self.base_dir,
             self.registry,
-            app_context={"faces_db_path": self.cfg_mgr.get_faces_db_path()},
+            app_context={
+                "operation_mode": op_mode,
+                "allow_disk_write": allow_write,
+                "faces_db_path": self.cfg_mgr.get_faces_db_path(create=allow_write),
+            },
             ai_backend=hw_cfg.get("ai_backend", "cpu"),
             ai_threads=int(hw_cfg.get("ai_threads", 2)),
         )
@@ -108,7 +138,18 @@ class MainGridWindow:
         self._hide_bar_after_id = None
         self._module_poll_after_id = None
         self._start_after_id = None
+        self._ui_poll_after_id = None
+        self._cuda_note_clear_after_id = None
         self._panel_visible = True
+        self._lang_menu_active = False
+        self._last_total_cams = 0
+
+        # Потокобезпечна черга UI-викликів із фонових потоків
+        self._ui_queue = queue.SimpleQueue()
+        self._cuda_ensure_lock = threading.Lock()
+        self._cuda_downloading = False
+        self._cuda_status_note = ""
+        self._cuda_note_color = "#ffcc00"
 
         # Кеш фонового збору телеметрії (щоб не блокувати UI-потік)
         self._cached_hw_metrics = None
@@ -135,6 +176,7 @@ class MainGridWindow:
         self.root.bind(EVT_MOTION, self._on_mouse_motion)
         self.root.bind(EVT_CONFIGURE, self._on_root_configure)
 
+        self._drain_ui_queue()
         self._start_hw_poll_thread()
         self._schedule_hide_bar(5000)
 
@@ -162,20 +204,27 @@ class MainGridWindow:
         ).pack(side=tk.LEFT, padx=(0, 10))
 
         self.lbl_cam_count = tk.Label(
-            left_box, text="Камер: 0", fg="#00e5ff", bg="#222534",
+            left_box, text=tr("ui.main.cam_count", "Cameras: {n}", n=0), fg="#00e5ff", bg="#222534",
             font=("Segoe UI", 8, "bold"), padx=8, pady=3
         )
-        self.lbl_cam_count.pack(side=tk.LEFT, padx=(0, 10))
+        self.lbl_cam_count.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.lbl_mode_badge = tk.Label(
+            left_box, text="", fg="#75e08b", bg="#1b2e24",
+            font=("Segoe UI", 8, "bold"), padx=8, pady=3
+        )
+        self.lbl_mode_badge.pack(side=tk.LEFT, padx=(0, 10))
+        self._refresh_mode_badge()
 
         self.btn_settings = tk.Button(
-            left_box, text="⚙ Налаштування", command=self.open_settings,
+            left_box, text=tr("ui.main.btn_settings", "⚙ Settings"), command=self.open_settings,
             bg="#007acc", fg="#ffffff", activebackground="#0066ad", activeforeground="#ffffff",
             relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4, cursor="hand2"
         )
         self.btn_settings.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_people = tk.Button(
-            left_box, text="👥 Люди", command=self.open_people,
+            left_box, text=tr("ui.main.btn_people", "👥 People"), command=self.open_people,
             bg="#254c5a", fg="#ffffff", activebackground="#2f6375", activeforeground="#ffffff",
             relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4, cursor="hand2"
         )
@@ -191,7 +240,7 @@ class MainGridWindow:
         self.btn_prev_page.pack(side=tk.LEFT, padx=(0, 4))
 
         self.lbl_page = tk.Label(
-            self.page_box, text="Стор. 1 / 1", fg="#d5dae8", bg="#171923",
+            self.page_box, text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=1, total=1), fg="#d5dae8", bg="#171923",
             font=("Segoe UI", 9, "bold"), padx=6
         )
         self.lbl_page.pack(side=tk.LEFT)
@@ -203,25 +252,95 @@ class MainGridWindow:
         )
         self.btn_next_page.pack(side=tk.LEFT, padx=(4, 0))
 
-        # Правий блок: телеметрія заліза + вихід
+        # Правий блок: швидкий перемикач мови + телеметрія заліза + вихід
         right_box = tk.Frame(self.ctrl_frame, bg="#171923")
         right_box.pack(side=tk.RIGHT)
 
+        lang_box = tk.Frame(right_box, bg="#171923")
+        lang_box.pack(side=tk.LEFT, padx=(0, 10))
+        tk.Label(
+            lang_box, text="🌐", fg="#00e5ff", bg="#171923",
+            font=("Segoe UI", 10)
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        try:
+            style = ttk.Style(self.root)
+            if style.theme_use() in ("vista", "xpnative", "winnative", "default"):
+                style.theme_use("clam")
+            style.configure(
+                "MainLang.TCombobox",
+                fieldbackground="#222534",
+                background="#2b2f40",
+                foreground="#ffffff",
+                arrowcolor="#00e5ff",
+                bordercolor="#2e3347",
+                lightcolor="#2e3347",
+                darkcolor="#222534",
+                selectbackground="#007acc",
+                selectforeground="#ffffff",
+            )
+            style.map(
+                "MainLang.TCombobox",
+                fieldbackground=[("readonly", "#222534")],
+                foreground=[("readonly", "#ffffff")],
+                selectbackground=[("readonly", "#222534")],
+                selectforeground=[("readonly", "#ffffff")],
+            )
+        except Exception:
+            pass
+
+        lang_labels = [m["label"] for m in list_languages()]
+        self.top_lang_var = tk.StringVar(value=get_language_label())
+        self.cmb_top_lang = ttk.Combobox(
+            lang_box,
+            textvariable=self.top_lang_var,
+            values=lang_labels,
+            state="readonly",
+            width=21,
+            font=("Segoe UI", 8, "bold"),
+            style="MainLang.TCombobox",
+        )
+        self.cmb_top_lang.pack(side=tk.LEFT)
+        self.cmb_top_lang.bind("<<ComboboxSelected>>", self._on_top_language_selected)
+        self.cmb_top_lang.bind("<Button-1>", self._on_top_lang_interact)
+        self.cmb_top_lang.bind("<FocusIn>", self._on_top_lang_interact)
+        self.cmb_top_lang.bind("<FocusOut>", self._on_top_lang_leave)
+
         self.lbl_hw_badge = tk.Label(
-            right_box, text="CPU: --% | RAM: -- | AI: CPU",
+            right_box, text=tr("ui.main.hw_badge_init", "CPU: --% | RAM: -- | AI: CPU"),
             fg="#9ee8ff", bg="#222534", font=("Segoe UI", 8, "bold"),
             padx=10, pady=4
         )
         self.lbl_hw_badge.pack(side=tk.LEFT, padx=(0, 10))
 
         self.btn_exit = tk.Button(
-            right_box, text="🚪 Вихід", command=self.on_close,
+            right_box, text=tr("ui.main.btn_exit", "🚪 Exit"), command=self.on_close,
             bg="#64262b", fg="#ffffff", activebackground="#7e2f36", activeforeground="#ffffff",
             relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4, cursor="hand2"
         )
         self.btn_exit.pack(side=tk.LEFT)
+        self._apply_exit_btn_text()
 
         self._show_top_bar()
+
+    def _drain_ui_queue(self):
+        if self._is_closing:
+            return
+        while True:
+            try:
+                cb, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                cb(*args)
+            except Exception:
+                pass
+        if not self._is_closing:
+            try:
+                if self.root.winfo_exists():
+                    self._ui_poll_after_id = self.root.after(40, self._drain_ui_queue)
+            except Exception:
+                pass
 
     def _start_system(self):
         self._start_after_id = None
@@ -232,6 +351,139 @@ class MainGridWindow:
         self._render_grid_tick()
         self._refresh_hw_badge_tick()
         self._module_poll_after_id = self.root.after(3000, self._poll_modules_tick)
+        self._maybe_ensure_cuda_async()
+
+    def _set_cuda_note(self, text: str, color: str = "#ffcc00", clear_after_ms: int = 0):
+        if self._is_closing:
+            return
+        if self._cuda_note_clear_after_id is not None:
+            try:
+                self.root.after_cancel(self._cuda_note_clear_after_id)
+            except Exception:
+                pass
+            self._cuda_note_clear_after_id = None
+        self._cuda_status_note = str(text or "")
+        self._cuda_note_color = str(color or "#ffcc00")
+        if self._cuda_status_note:
+            try:
+                self.lbl_hw_badge.configure(text=self._cuda_status_note, fg=self._cuda_note_color)
+            except Exception:
+                pass
+            if clear_after_ms > 0:
+                self._cuda_note_clear_after_id = self.root.after(int(clear_after_ms), self._clear_cuda_note)
+        else:
+            try:
+                self.lbl_hw_badge.configure(fg="#9ee8ff")
+            except Exception:
+                pass
+
+    def _clear_cuda_note(self):
+        self._cuda_note_clear_after_id = None
+        self._cuda_status_note = ""
+        self._cuda_note_color = "#9ee8ff"
+        if not self._is_closing:
+            try:
+                self.lbl_hw_badge.configure(fg="#9ee8ff")
+            except Exception:
+                pass
+
+    def _maybe_ensure_cuda_async(self):
+        """
+        Автоматично перевіряє наявність CUDA / cuDNN бібліотек при вибраному GPU-режимі ('cuda' або 'auto' з onnxruntime-gpu).
+        Якщо потрібних DLL немає у системі та в <BASE_DIR>/cuda/, фоново завантажує їх у локальну папку cuda/.
+        """
+        if self._is_closing:
+            return
+        hw_cfg = self.cfg_mgr.get_snapshot().get("hardware") or {}
+        backend = str(hw_cfg.get("ai_backend", "cpu")).strip().lower()
+        gpu_ort = is_onnxruntime_gpu_installed()
+        if not (backend == "cuda" or (backend == "auto" and gpu_ort)):
+            return
+
+        with self._cuda_ensure_lock:
+            if self._cuda_downloading:
+                return
+            self._cuda_downloading = True
+
+        def _worker():
+            try:
+                if self._is_closing or not has_nvidia_gpu():
+                    return
+                st = check_cuda_libraries_status(self.base_dir, allow_network=False)
+                if st.get("ready"):
+                    prepare_cuda_dll_environment(self.base_dir, preload=True)
+                    return
+
+                self._ui_queue.put((self._set_cuda_note, (tr("ui.main.cuda_dl_start", "⬇ Checking and downloading CUDA to cuda/..."), "#ffcc00", 0)))
+                last_msg_ts = [0.0]
+
+                def _prog(msg):
+                    if self._is_closing:
+                        return
+                    now_t = time.time()
+                    if now_t - last_msg_ts[0] < 0.35:
+                        return
+                    last_msg_ts[0] = now_t
+                    short_m = f"⬇ CUDA: {msg[:60]}"
+                    self._ui_queue.put((self._set_cuda_note, (short_m, "#ffcc00", 0)))
+
+                res = download_cuda_libraries(
+                    self.base_dir,
+                    progress_cb=_prog,
+                    include_optional=True,
+                    force_into_local=False,
+                )
+                if self._is_closing:
+                    return
+
+                prepare_cuda_dll_environment(self.base_dir, preload=True)
+                caps = self.hw_monitor.probe_acceleration_capabilities(force=True)
+                cuda_ok = bool(((caps.get("ai_backends") or {}).get("cuda") or {}).get("supported"))
+                gpu_pkg_now = is_onnxruntime_gpu_installed()
+
+                def _on_done():
+                    if self._is_closing:
+                        return
+                    if res.get("ok"):
+                        try:
+                            ai_ids = [ent["id"] for ent in self.registry.list_modules(kind="ai")]
+                            self.inference_pool.invalidate_all()
+                            self.camera_manager.sync_from_config()
+                            for u in list(self.camera_manager.units.values()):
+                                u.force_reload_modules(ai_ids)
+                        except Exception as e:
+                            print(f"[CUDA hot-reload error]: {e}")
+
+                        if self.settings_win is not None:
+                            try:
+                                if self.settings_win.win.winfo_exists():
+                                    self.settings_win.on_cuda_libraries_updated(caps=caps)
+                            except Exception:
+                                pass
+
+                        if cuda_ok:
+                            self._set_cuda_note(tr("ui.main.cuda_ok_active", "✔ CUDA libraries downloaded to cuda/ — GPU activated!"), "#75e08b", 8000)
+                        elif not gpu_pkg_now:
+                            self._set_cuda_note(tr("ui.main.cuda_ok_need_pkg", "✔ CUDA DLLs downloaded to cuda/ (onnxruntime-gpu required)"), "#ffcc00", 12000)
+                        else:
+                            self._set_cuda_note(tr("ui.main.cuda_ok_restart", "✔ CUDA DLLs in cuda/ — restart to activate GPU"), "#ffcc00", 12000)
+                    else:
+                        if self.settings_win is not None:
+                            try:
+                                if self.settings_win.win.winfo_exists():
+                                    self.settings_win.on_cuda_libraries_updated(caps=caps)
+                            except Exception:
+                                pass
+                        self._set_cuda_note(tr("ui.main.cuda_dl_fail", "⚠ Failed to download CUDA DLLs (CPU fallback active)"), "#ff8888", 10000)
+
+                self._ui_queue.put((_on_done, ()))
+            except Exception as e:
+                print(f"[CUDA auto-ensure error]: {e}")
+            finally:
+                with self._cuda_ensure_lock:
+                    self._cuda_downloading = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Автоматичне виявлення нових/оновлених модулів і бібліотек
@@ -257,6 +509,7 @@ class MainGridWindow:
             except Exception:
                 pass
             self.cfg_mgr.sync_with_registry(self.registry)
+            self._refresh_mode_badge()
 
             added = list(res.get("added") or [])
             updated = list(res.get("updated") or [])
@@ -357,6 +610,23 @@ class MainGridWindow:
             print(f"[Restart error]: {e}")
         sys.exit(0)
 
+    def _apply_exit_btn_text(self):
+        if hasattr(self, "btn_exit"):
+            if getattr(self, "_kiosk_mode", False):
+                self.btn_exit.configure(
+                    text=tr("ui.main.btn_kiosk", "🔒 Kiosk (Ctrl+Alt+Shift+Q)"),
+                    bg="#2e3142",
+                    fg="#9ba3b8",
+                    command=self._kiosk_hint,
+                )
+            else:
+                self.btn_exit.configure(
+                    text=tr("ui.main.btn_exit", "🚪 Exit"),
+                    bg="#64262b",
+                    fg="#ffffff",
+                    command=self.on_close,
+                )
+
     def _apply_kiosk_mode(self, kiosk_on: bool):
         self._kiosk_mode = bool(kiosk_on)
         if self._kiosk_mode:
@@ -371,19 +641,18 @@ class MainGridWindow:
                 except Exception:
                     pass
 
-        if hasattr(self, "btn_exit"):
-            if self._kiosk_mode:
-                self.btn_exit.configure(text="🔒 Кіоск (Ctrl+Alt+Shift+Q)", bg="#2e3142", fg="#9ba3b8", command=self._kiosk_hint)
-            else:
-                self.btn_exit.configure(text="🚪 Вихід", bg="#64262b", fg="#ffffff", command=self.on_close)
+        self._apply_exit_btn_text()
 
     def _prevent_close(self):
         pass
 
     def _kiosk_hint(self):
         messagebox.showinfo(
-            "Режим кіоску",
-            "Увімкнено блокування виходу.\nЩоб завершити програму, натисніть Ctrl+Alt+Shift+Q або вимкніть режим кіоску в Налаштуваннях.",
+            tr("ui.main.kiosk_hint_title", "Kiosk Mode"),
+            tr(
+                "ui.main.kiosk_hint_msg",
+                "Exit lock is enabled.\nTo exit the application, press Ctrl+Alt+Shift+Q or disable Kiosk Mode in Settings.",
+            ),
             parent=self.root,
         )
 
@@ -391,8 +660,107 @@ class MainGridWindow:
         self.on_close()
 
     # ------------------------------------------------------------------
-    # Автоприховувана верхня панель
+    # Автоприховувана верхня панель і швидкий перемикач мови
     # ------------------------------------------------------------------
+    def _on_top_lang_interact(self, event=None):
+        self._lang_menu_active = True
+        self._show_top_bar()
+        self._schedule_hide_bar(6000)
+
+    def _on_top_lang_leave(self, event=None):
+        self._lang_menu_active = False
+        if self._panel_visible:
+            self._schedule_hide_bar(4500)
+
+    def _on_top_language_selected(self, event=None):
+        self._lang_menu_active = False
+        try:
+            selected = self.top_lang_var.get()
+        except Exception:
+            return
+        code = parse_language_code(selected, fallback=get_language())
+        if code:
+            self.change_language(code, source="topbar")
+        if self._panel_visible:
+            self._schedule_hide_bar(4500)
+
+    def _sync_top_lang_combo(self):
+        if not hasattr(self, "cmb_top_lang") or not hasattr(self, "top_lang_var"):
+            return
+        try:
+            self.cmb_top_lang.configure(values=[m["label"] for m in list_languages()])
+            self.top_lang_var.set(get_language_label(get_language()))
+        except Exception:
+            pass
+
+    def apply_language(self):
+        if self._is_closing:
+            return
+        try:
+            self.root.title(tr("ui.main.window_title", "ANPR Multi-Cam NVR — Camera Grid"))
+            self.lbl_cam_count.configure(text=tr("ui.main.cam_count", "Cameras: {n}", n=getattr(self, "_last_total_cams", 0)))
+            self._refresh_mode_badge()
+            self.btn_settings.configure(text=tr("ui.main.btn_settings", "⚙ Settings"))
+            self.btn_people.configure(text=tr("ui.main.btn_people", "👥 People"))
+            self._apply_exit_btn_text()
+            self.lbl_page.configure(
+                text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages)
+            )
+            self._sync_top_lang_combo()
+            if hasattr(self, "_empty_lbl") and self._empty_lbl.winfo_exists():
+                self._empty_lbl.configure(
+                    text=tr(
+                        "ui.main.empty_cams",
+                        "No enabled cameras.\nOpen ⚙ Settings above to add or enable cameras.",
+                    )
+                )
+            self._render_hw_badge_once()
+            for t in self._tiles.values():
+                t["last_lbl_text"] = None
+                t["last_st_key"] = None
+                t["last_warn_text"] = None
+            self._last_layout_key = None
+            self._relayout_grid(force=True)
+            self._render_tiles_once()
+        except Exception:
+            pass
+
+    def change_language(self, lang_code: str, source: str = "topbar") -> str:
+        saved_code = self.cfg_mgr.set_language(lang_code)
+        eff_code = set_language(saved_code)
+        try:
+            self.hw_monitor.relocalize_cached_caps()
+        except Exception:
+            pass
+
+        self.apply_language()
+
+        if self.settings_win is not None:
+            try:
+                if self.settings_win.win.winfo_exists() and not getattr(self.settings_win, "_is_closing", False):
+                    if source == "topbar":
+                        self.settings_win.on_external_language_changed(eff_code)
+                    else:
+                        self.settings_win.apply_language()
+            except Exception:
+                pass
+
+        if self.people_win is not None:
+            try:
+                if self.people_win.win.winfo_exists():
+                    self.people_win.apply_language()
+            except Exception:
+                pass
+
+        for dwin in list(self.detail_windows.values()):
+            try:
+                if dwin.win.winfo_exists():
+                    dwin.apply_language()
+            except Exception:
+                pass
+
+        return eff_code
+
     def _show_top_bar(self):
         if self._is_closing:
             return
@@ -405,6 +773,16 @@ class MainGridWindow:
         self._hide_bar_after_id = None
         if self._is_closing:
             return
+        try:
+            focused = self.root.focus_get()
+            if self._lang_menu_active or (
+                focused is not None
+                and (focused is getattr(self, "cmb_top_lang", None) or "popdown" in str(focused).lower())
+            ):
+                self._schedule_hide_bar(2500)
+                return
+        except Exception:
+            pass
         try:
             px, py = self.root.winfo_pointerxy()
             rx = self.root.winfo_rootx()
@@ -495,6 +873,25 @@ class MainGridWindow:
     def _on_people_closed(self):
         self.people_win = None
 
+    def _refresh_mode_badge(self):
+        if not hasattr(self, "lbl_mode_badge"):
+            return
+        try:
+            if self.cfg_mgr.is_operator_mode():
+                self.lbl_mode_badge.configure(
+                    text=tr("ui.mode.operator_badge", "👤 Operator (no recording)"),
+                    fg="#ffcc00",
+                    bg="#332917",
+                )
+            else:
+                self.lbl_mode_badge.configure(
+                    text=tr("ui.mode.server_badge", "🖥 Server"),
+                    fg="#75e08b",
+                    bg="#1b2e24",
+                )
+        except Exception:
+            pass
+
     def on_settings_applied(self):
         if self._is_closing:
             return
@@ -502,6 +899,11 @@ class MainGridWindow:
         gen_cfg = snap.get("general") or {}
         hw_cfg = snap.get("hardware") or {}
 
+        new_lang = self.cfg_mgr.get_language()
+        if new_lang != get_language():
+            self.change_language(new_lang, source="settings")
+
+        self._refresh_mode_badge()
         self._sync_windows_startup(bool(gen_cfg.get("autostart_os_and_play", False)))
         self._apply_kiosk_mode(bool(gen_cfg.get("kiosk_mode", False)))
         self.camera_manager.sync_from_config()
@@ -531,6 +933,7 @@ class MainGridWindow:
 
         self._last_layout_key = None
         self._relayout_grid(force=True)
+        self._maybe_ensure_cuda_async()
 
     def open_camera_detail(self, cam_uuid: str):
         if self._is_closing or not cam_uuid:
@@ -569,7 +972,7 @@ class MainGridWindow:
         if self._is_closing:
             return
         try:
-            self.root.after(0, lambda: self._dispatch_saved_to_ui(cam_uuid, mod_name))
+            self._ui_queue.put((self._dispatch_saved_to_ui, (cam_uuid, mod_name)))
         except Exception:
             pass
 
@@ -633,7 +1036,8 @@ class MainGridWindow:
         grid_cfg = snap.get("grid") or {}
         units = self.camera_manager.get_ordered_enabled_units()
         total_cams = len(units)
-        self.lbl_cam_count.configure(text=f"Камер: {total_cams}")
+        self._last_total_cams = total_cams
+        self.lbl_cam_count.configure(text=tr("ui.main.cam_count", "Cameras: {n}", n=total_cams))
 
         mode = str(grid_cfg.get("mode", "auto")).lower()
         if mode == "manual":
@@ -652,7 +1056,9 @@ class MainGridWindow:
             visible_units = units
 
         if self._total_pages > 1:
-            self.lbl_page.configure(text=f"Стор. {self._current_page + 1} / {self._total_pages}")
+            self.lbl_page.configure(
+                text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages)
+            )
             if not self.page_box.winfo_ismapped():
                 self.page_box.pack(side=tk.LEFT, padx=14)
         elif self.page_box.winfo_ismapped():
@@ -686,12 +1092,18 @@ class MainGridWindow:
 
         if not visible_units:
             self._clear_tiles()
+            empty_txt = tr(
+                "ui.main.empty_cams",
+                "No enabled cameras.\nOpen ⚙ Settings above to add or enable cameras.",
+            )
             if not hasattr(self, "_empty_lbl") or not self._empty_lbl.winfo_exists():
                 self._empty_lbl = tk.Label(
                     self.grid_area,
-                    text="Немає увімкнених камер.\nВідкрийте ⚙ Налаштування вгорі, щоб додати або увімкнути камери.",
+                    text=empty_txt,
                     fg="#9ba3b8", bg="#0b0c10", font=("Segoe UI", 13)
                 )
+            else:
+                self._empty_lbl.configure(text=empty_txt)
             self._empty_lbl.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
             return
         elif hasattr(self, "_empty_lbl") and self._empty_lbl.winfo_exists():
@@ -707,7 +1119,10 @@ class MainGridWindow:
                 canvas.pack(fill=tk.BOTH, expand=True, padx=bw, pady=bw)
 
                 img_id = canvas.create_image(1, 1, anchor=tk.CENTER, tags="vid_img")
-                ph_id = canvas.create_text(1, 1, text="Підключення...", fill="#ffcc00", font=("Segoe UI", 10, "bold"), tags="placeholder")
+                ph_id = canvas.create_text(
+                    1, 1, text=tr("ui.main.tile.connecting", "Connecting..."),
+                    fill="#ffcc00", font=("Segoe UI", 10, "bold"), tags="placeholder"
+                )
 
                 lbl_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, tags="ov_lbl")
                 lbl_txt_id = canvas.create_text(10, 10, text="", fill="#ffffff", font=("Segoe UI", 9, "bold"), anchor=tk.NW, tags="ov_lbl")
@@ -796,9 +1211,9 @@ class MainGridWindow:
                 except Exception:
                     pass
 
-    def _render_grid_tick(self):
+    def _render_tiles_once(self):
         if self._is_closing:
-            return
+            return 83
 
         if not self._tiles and self.camera_manager.get_ordered_enabled_units():
             self._relayout_grid(force=False)
@@ -855,20 +1270,24 @@ class MainGridWindow:
             else:
                 cv.itemconfigure(t["img_id"], state=tk.HIDDEN)
                 st_map = {
-                    "offline": ("Немає сигналу (offline)", "#ff6666"),
-                    "reconnecting": ("Перепідключення субпотоку...", "#ffcc00"),
-                    "connecting": ("Підключення субпотоку...", "#ffcc00"),
-                    "fallback_main": ("Очікування основного потоку...", "#ffcc00"),
+                    "offline": (tr("ui.main.tile.offline", "No signal (offline)"), "#ff6666"),
+                    "reconnecting": (tr("ui.main.tile.reconnecting", "Reconnecting sub-stream..."), "#ffcc00"),
+                    "connecting": (tr("ui.main.tile.connecting_sub", "Connecting sub-stream..."), "#ffcc00"),
+                    "fallback_main": (tr("ui.main.tile.waiting_main", "Waiting for main stream..."), "#ffcc00"),
                 }
-                p_txt, p_col = st_map.get(gs.get("sub_status", ""), ("Запуск...", "#9ba3b8"))
+                p_txt, p_col = st_map.get(
+                    gs.get("sub_status", ""),
+                    (tr("ui.main.tile.starting", "Starting..."), "#9ba3b8"),
+                )
                 cv.itemconfigure(t["ph_id"], text=p_txt, fill=p_col, state=tk.NORMAL)
                 cv.coords(t["ph_id"], iw // 2, ih // 2)
 
             # 3. Оверлей назви камери (верхній лівий кут)
             if show_labels:
-                name_txt = f"📹 {gs.get('name', 'Камера')}"
+                cam_nm = str(gs.get("name") or "").strip() or tr("camera.default_single", "Camera")
+                name_txt = f"📹 {cam_nm}"
                 if uid in self.detail_windows:
-                    name_txt += "  [ВІДКРИТО]"
+                    name_txt += "  " + tr("ui.main.tile.open_tag", "[OPEN]")
                 if t["last_lbl_text"] != name_txt:
                     t["last_lbl_text"] = name_txt
                     cv.itemconfigure(t["lbl_txt_id"], text=name_txt, state=tk.NORMAL)
@@ -887,25 +1306,31 @@ class MainGridWindow:
             if show_status or show_fps:
                 parts = []
                 rec_on = bool(gs.get("recording"))
+                op_mode = str(gs.get("operation_mode") or "server")
                 if show_status:
                     if rec_on:
                         enc = gs.get("encoder") or "rec"
                         parts.append(f"● REC ({enc})")
+                    elif op_mode == "operator":
+                        parts.append(tr("ui.main.tile.no_rec_badge", "👤 NO RECORDING"))
                     m_on = gs.get("modules_on") or {}
                     m_tags = []
                     for ent in ai_entries:
                         mid = ent["id"]
                         if m_on.get(mid):
-                            badge = ent["spec"].get("short_badge") or mid[:2].upper()
-                            if badge:
-                                m_tags.append(str(badge))
+                            raw_badge = ent["spec"].get("short_badge")
+                            if raw_badge != "":
+                                default_badge = raw_badge if raw_badge is not None else mid[:2].upper()
+                                badge = tr(f"mod.{mid}.short_badge", str(default_badge))
+                                if badge:
+                                    m_tags.append(str(badge))
                     if m_tags:
                         parts.append(" ".join(m_tags))
                 if show_fps and gs.get("sub_status") == "active":
                     parts.append(f"{float(gs.get('fps', 0.0)):.1f} FPS")
 
                 st_txt = "  |  ".join(parts)
-                st_col = "#75e08b" if rec_on else "#9ee8ff"
+                st_col = "#75e08b" if rec_on else ("#ffcc00" if op_mode == "operator" else "#9ee8ff")
                 st_key = (st_txt, st_col, iw)
                 if st_txt:
                     if t["last_st_key"] != st_key:
@@ -930,7 +1355,7 @@ class MainGridWindow:
             # 5. Нижній бейдж при втраті зв'язку (коли останній кадр ще висить)
             warn_txt = ""
             if rgb is not None and gs.get("sub_status") in ("offline", "reconnecting"):
-                warn_txt = "⚠ Втрата потоку (перепідключення...)"
+                warn_txt = tr("ui.main.tile.stream_lost", "⚠ Stream lost (reconnecting...)")
             if t["last_warn_text"] != (warn_txt, ih):
                 t["last_warn_text"] = (warn_txt, ih)
                 if warn_txt:
@@ -948,6 +1373,12 @@ class MainGridWindow:
             cv.tag_raise("ov_st")
             cv.tag_raise("ov_warn")
 
+        return interval_ms
+
+    def _render_grid_tick(self):
+        if self._is_closing:
+            return
+        interval_ms = self._render_tiles_once()
         if not self._is_closing:
             self._render_after_id = self.root.after(interval_ms, self._render_grid_tick)
 
@@ -968,26 +1399,54 @@ class MainGridWindow:
 
         threading.Thread(target=_loop, daemon=True).start()
 
-    def _refresh_hw_badge_tick(self):
-        if self._is_closing:
+    def _render_hw_badge_once(self):
+        if self._is_closing or not hasattr(self, "lbl_hw_badge"):
+            return
+        if self._cuda_status_note:
+            try:
+                self.lbl_hw_badge.configure(text=self._cuda_status_note, fg=self._cuda_note_color)
+            except Exception:
+                pass
             return
         m = self._cached_hw_metrics
-        if m is not None:
+        if m is None:
             try:
-                cpu_pct = float(m["cpu"]["usage_pct"])
-                ram_used = float(m["ram"]["used_gb"])
-                ram_tot = float(m["ram"]["total_gb"])
-                ai_sum = self.inference_pool.get_active_summary()
-                gpu_bit = ""
-                for g in (m.get("gpus") or []):
-                    if g.get("live_metrics") and g.get("gpu_util_pct") is not None:
-                        gpu_bit = f" | GPU: {g['gpu_util_pct']:.0f}%"
-                        break
                 self.lbl_hw_badge.configure(
-                    text=f"CPU: {cpu_pct:.0f}%{gpu_bit} | RAM: {ram_used:.1f}/{ram_tot:.1f} ГБ | AI: {ai_sum}"
+                    text=tr("ui.main.hw_badge_init", "CPU: --% | RAM: -- | AI: CPU"),
+                    fg="#9ee8ff",
                 )
             except Exception:
                 pass
+            return
+        try:
+            cpu_pct = float(m["cpu"]["usage_pct"])
+            ram_used = float(m["ram"]["used_gb"])
+            ram_tot = float(m["ram"]["total_gb"])
+            ai_sum = self.inference_pool.get_active_summary()
+            gpu_bit = ""
+            for g in (m.get("gpus") or []):
+                if g.get("live_metrics") and g.get("gpu_util_pct") is not None:
+                    gpu_bit = f" | GPU: {g['gpu_util_pct']:.0f}%"
+                    break
+            self.lbl_hw_badge.configure(
+                text=tr(
+                    "ui.main.hw_badge_fmt",
+                    "CPU: {cpu:.0f}%{gpu_bit} | RAM: {ram_used:.1f}/{ram_tot:.1f} GB | AI: {ai}",
+                    cpu=cpu_pct,
+                    gpu_bit=gpu_bit,
+                    ram_used=ram_used,
+                    ram_tot=ram_tot,
+                    ai=ai_sum,
+                ),
+                fg="#9ee8ff",
+            )
+        except Exception:
+            pass
+
+    def _refresh_hw_badge_tick(self):
+        if self._is_closing:
+            return
+        self._render_hw_badge_once()
         if not self._is_closing:
             self._hw_after_id = self.root.after(1500, self._refresh_hw_badge_tick)
 
@@ -1007,6 +1466,8 @@ class MainGridWindow:
             "_hide_bar_after_id",
             "_relayout_after_id",
             "_module_poll_after_id",
+            "_ui_poll_after_id",
+            "_cuda_note_clear_after_id",
         ):
             aid = getattr(self, attr, None)
             if aid is not None:

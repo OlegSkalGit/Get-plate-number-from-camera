@@ -3,6 +3,7 @@ import time
 import threading
 import numpy as np
 
+from scripts.core.i18n import tr
 from scripts.core.module_registry import is_date_range_active
 
 try:
@@ -86,28 +87,36 @@ def open_video_capture(source, decode_mode: str = "cpu"):
 def probe_stream_info(raw_source, decode_mode: str = "cpu"):
     """Швидкий тест підключення потоку для кнопки 'Тест' у налаштуваннях камери."""
     if cv2 is None:
-        return False, "Бібліотеку OpenCV (cv2) не встановлено"
+        return False, tr("cam.probe.no_cv2", "OpenCV (cv2) library is not installed")
     src = parse_source_value(raw_source)
     if src == "":
-        return False, "Джерело порожнє"
+        return False, tr("cam.probe.empty_source", "Source is empty")
     t0 = time.time()
     cap, used_mode = open_video_capture(src, decode_mode=decode_mode)
     if cap is None or not cap.isOpened():
-        return False, f"Не вдалося відкрити джерело ({raw_source})"
+        return False, tr("cam.probe.open_failed", "Failed to open source ({src})", src=raw_source)
     try:
         ret, frame = cap.read()
         if not ret or frame is None:
-            return False, "Потік відкрився, але кадр не отримано"
+            return False, tr("cam.probe.no_frame", "Stream opened, but no frame was received")
         h, w = frame.shape[:2]
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         if fps <= 0 or fps > 120 or np.isnan(fps):
-            fps_str = "авто"
+            fps_str = tr("cam.probe.fps_auto", "auto")
         else:
             fps_str = f"{fps:.1f} FPS"
         ms = int((time.time() - t0) * 1000)
-        return True, f"OK: {w}×{h}, {fps_str}, декодер={used_mode.upper()} ({ms} мс)"
+        return True, tr(
+            "cam.probe.ok",
+            "OK: {w}×{h}, {fps_str}, decoder={dec} ({ms} ms)",
+            w=w,
+            h=h,
+            fps_str=fps_str,
+            dec=used_mode.upper(),
+            ms=ms,
+        )
     except Exception as e:
-        return False, f"Помилка читання: {e}"
+        return False, tr("cam.probe.read_error", "Read error: {err}", err=e)
     finally:
         try:
             cap.release()
@@ -149,6 +158,7 @@ class CameraUnit:
         registry,
         hardware_cfg: dict,
         on_saved_event=None,
+        allow_disk_write: bool = True,
     ):
         self.cam_cfg = dict(cam_cfg)
         self.uuid = str(cam_cfg["uuid"])
@@ -157,8 +167,8 @@ class CameraUnit:
         self.registry = registry
         self.hardware_cfg = dict(hardware_cfg or {})
         self.on_saved_event = on_saved_event
+        self.allow_disk_write = bool(allow_disk_write)
 
-        os.makedirs(self.archive_dir, exist_ok=True)
         self._write_camera_meta()
 
         self.lock = threading.Lock()
@@ -200,8 +210,15 @@ class CameraUnit:
 
         self._init_engines()
 
+    def _effective_allow_disk_write(self) -> bool:
+        ctx = getattr(self.inference_pool, "app_context", None) or {}
+        return bool(self.allow_disk_write) and bool(ctx.get("allow_disk_write", True))
+
     def _write_camera_meta(self):
+        if not self._effective_allow_disk_write():
+            return
         try:
+            os.makedirs(self.archive_dir, exist_ok=True)
             meta_path = os.path.join(self.archive_dir, "camera_info.txt")
             with open(meta_path, "w", encoding="utf-8") as f:
                 f.write(f"UUID: {self.uuid}\n")
@@ -252,6 +269,15 @@ class CameraUnit:
     def _init_engines(self, force_reload_ids=None):
         force_set = set(force_reload_ids or [])
         flat_cfg = self._flatten_cfg(self.cam_cfg)
+        eff_allow_write = self._effective_allow_disk_write()
+        ctx_base = getattr(self.inference_pool, "app_context", None) or {}
+        eff_ctx = dict(ctx_base)
+        eff_ctx["allow_disk_write"] = eff_allow_write
+        eff_ctx["operation_mode"] = "server" if eff_allow_write else "operator"
+        flat_cfg_eff = dict(flat_cfg)
+        flat_cfg_eff["allow_disk_write"] = eff_allow_write
+        flat_cfg_eff["operation_mode"] = eff_ctx["operation_mode"]
+
         mods = self.cam_cfg.get("modules") or {}
         main_src = parse_source_value(self.cam_cfg.get("main_source", ""))
         entries = self.registry.list_modules()
@@ -270,8 +296,9 @@ class CameraUnit:
                 m_cfg = mods.get(mid) or {}
                 default_on = bool(spec.get("default_enabled", True))
                 is_on = bool(m_cfg.get("on", default_on))
+                blocked_by_operator = (spec.get("kind") == "recorder" or bool(spec.get("writes_to_disk"))) and (not eff_allow_write)
 
-                if not is_on:
+                if not is_on or blocked_by_operator:
                     if mid in self.engines:
                         self._teardown_engine_locked(mid)
                     self._module_runtime_errors.pop(mid, None)
@@ -292,10 +319,10 @@ class CameraUnit:
                         if callable(upd_fn):
                             upd_fn(
                                 self.engines[mid],
-                                flat_cfg,
+                                flat_cfg_eff,
                                 source=main_src,
                                 shared_resources=shared_res,
-                                app_context=self.inference_pool.app_context,
+                                app_context=eff_ctx,
                             )
                         self._engine_specs[mid] = spec
                     else:
@@ -305,12 +332,12 @@ class CameraUnit:
                         if callable(create_fn):
                             eng = create_fn(
                                 self.inference_pool.base_dir,
-                                flat_cfg,
+                                flat_cfg_eff,
                                 mod_out_dir,
                                 shared_resources=shared_res,
                                 on_saved_callback=self._make_saved_cb(mid),
                                 source=main_src,
-                                app_context=self.inference_pool.app_context,
+                                app_context=eff_ctx,
                             )
                             self.engines[mid] = eng
                             self._engine_sigs[mid] = sig_now
@@ -331,6 +358,7 @@ class CameraUnit:
             self._sync_recorders_state()
 
     def _sync_recorders_state(self):
+        eff_allow_write = self._effective_allow_disk_write()
         mods = self.cam_cfg.get("modules") or {}
         for ent in self.registry.list_modules(kind="recorder"):
             mid = ent["id"]
@@ -340,8 +368,10 @@ class CameraUnit:
             if eng is None:
                 continue
             m_cfg = mods.get(mid) or {}
-            allowed = bool(m_cfg.get("on", spec.get("default_enabled", True))) and is_date_range_active(
-                m_cfg.get("date_from", ""), m_cfg.get("date_to", "")
+            allowed = (
+                eff_allow_write
+                and bool(m_cfg.get("on", spec.get("default_enabled", True)))
+                and is_date_range_active(m_cfg.get("date_from", ""), m_cfg.get("date_to", ""))
             )
             set_allowed = spec.get("set_allowed")
             if callable(set_allowed):
@@ -362,8 +392,15 @@ class CameraUnit:
                         rst_fn(eng)
                     except Exception:
                         pass
+            else:
+                stop_fn = spec.get("stop_engine")
+                if callable(stop_fn):
+                    try:
+                        stop_fn(eng, wait=False)
+                    except Exception:
+                        pass
 
-    def update_config(self, cam_cfg: dict, hardware_cfg: dict):
+    def update_config(self, cam_cfg: dict, hardware_cfg: dict, allow_disk_write=None):
         old_main = parse_source_value(self.cam_cfg.get("main_source", ""))
         old_sub = parse_source_value(self.cam_cfg.get("sub_source", ""))
         old_enabled = bool(self.cam_cfg.get("enabled", True))
@@ -371,6 +408,8 @@ class CameraUnit:
 
         self.cam_cfg = dict(cam_cfg)
         self.hardware_cfg = dict(hardware_cfg or {})
+        if allow_disk_write is not None:
+            self.allow_disk_write = bool(allow_disk_write)
         self._write_camera_meta()
 
         new_main = parse_source_value(self.cam_cfg.get("main_source", ""))
@@ -478,6 +517,8 @@ class CameraUnit:
             self._grid_target_size = (max(64, int(w)), max(48, int(h)))
 
     def _get_recorder_status(self):
+        if not self._effective_allow_disk_write():
+            return False, ""
         rec_on = False
         rec_enc = ""
         for ent in self.registry.list_modules(kind="recorder"):
@@ -527,6 +568,7 @@ class CameraUnit:
             ent["id"]: bool((mods.get(ent["id"]) or {}).get("on", False))
             for ent in self.registry.list_modules()
         }
+        eff_allow_write = self._effective_allow_disk_write()
         rec_on, rec_enc = self._get_recorder_status()
         return {
             "uuid": self.uuid,
@@ -539,6 +581,8 @@ class CameraUnit:
             "fps": sub_fps,
             "recording": rec_on,
             "encoder": rec_enc,
+            "allow_disk_write": eff_allow_write,
+            "operation_mode": "server" if eff_allow_write else "operator",
             "detail_open": subs > 0,
             "modules_on": modules_on,
         }
@@ -552,6 +596,7 @@ class CameraUnit:
             main_fps = self._main_fps
         with self._overlay_lock:
             overlay = {mid: dict(st) for mid, st in self._overlay_state.items() if isinstance(st, dict)}
+        eff_allow_write = self._effective_allow_disk_write()
         rec_on, rec_enc = self._get_recorder_status()
         return {
             "frame": frame,
@@ -560,6 +605,8 @@ class CameraUnit:
             "fps": main_fps,
             "recording": rec_on,
             "encoder": rec_enc,
+            "allow_disk_write": eff_allow_write,
+            "operation_mode": "server" if eff_allow_write else "operator",
             "overlay": overlay,
         }
 
@@ -580,6 +627,9 @@ class CameraUnit:
             mc = mods.get(ent["id"]) or {}
             if mc.get("on", False) and is_date_range_active(mc.get("date_from", ""), mc.get("date_to", "")):
                 return True
+
+        if not self._effective_allow_disk_write():
+            return False
 
         for ent in self.registry.list_modules(kind="recorder"):
             mid = ent["id"]
@@ -714,6 +764,7 @@ class CameraUnit:
 
         try:
             while self.running:
+                eff_allow_write = self._effective_allow_disk_write()
                 mods = self.cam_cfg.get("modules") or {}
                 active_rec_feed = []
 
@@ -725,8 +776,10 @@ class CameraUnit:
                     if eng is None:
                         continue
                     mc = mods.get(mid) or {}
-                    allowed = bool(mc.get("on", False)) and is_date_range_active(
-                        mc.get("date_from", ""), mc.get("date_to", "")
+                    allowed = (
+                        eff_allow_write
+                        and bool(mc.get("on", False))
+                        and is_date_range_active(mc.get("date_from", ""), mc.get("date_to", ""))
                     )
                     set_fn = spec.get("set_allowed")
                     if callable(set_fn):
@@ -734,7 +787,14 @@ class CameraUnit:
                             set_fn(eng, allowed)
                         except Exception:
                             pass
-                    if allowed:
+                    if not eff_allow_write:
+                        stop_fn = spec.get("stop_engine")
+                        if callable(stop_fn):
+                            try:
+                                stop_fn(eng, wait=False)
+                            except Exception:
+                                pass
+                    elif allowed:
                         if not getattr(eng, "is_running", True):
                             st_fn = spec.get("start_engine")
                             if callable(st_fn):
@@ -945,6 +1005,11 @@ class CameraManager:
 
     def sync_from_config(self):
         snap = self.cfg_mgr.get_snapshot()
+        gen_cfg = snap.get("general") or {}
+        op_mode = str(gen_cfg.get("operation_mode", "server")).strip().lower()
+        if op_mode not in ("server", "operator"):
+            op_mode = "server"
+        allow_write = (op_mode == "server")
         hw_cfg = snap.get("hardware") or {}
         cams = snap.get("cameras") or []
 
@@ -958,7 +1023,11 @@ class CameraManager:
         self.inference_pool.configure(
             ai_backend=hw_cfg.get("ai_backend", "cpu"),
             ai_threads=int(hw_cfg.get("ai_threads", 2)),
-            app_context={"faces_db_path": self.cfg_mgr.get_faces_db_path()},
+            app_context={
+                "operation_mode": op_mode,
+                "allow_disk_write": allow_write,
+                "faces_db_path": self.cfg_mgr.get_faces_db_path(create=allow_write),
+            },
         )
 
         new_map = {c["uuid"]: c for c in cams}
@@ -972,7 +1041,7 @@ class CameraManager:
                 uid = c["uuid"]
                 arch_dir = self.cfg_mgr.get_camera_archive_dir(uid)
                 if uid in self.units:
-                    self.units[uid].update_config(c, hw_cfg)
+                    self.units[uid].update_config(c, hw_cfg, allow_disk_write=allow_write)
                 else:
                     unit = CameraUnit(
                         c,
@@ -981,6 +1050,7 @@ class CameraManager:
                         registry=self.registry,
                         hardware_cfg=hw_cfg,
                         on_saved_event=self.on_saved_event,
+                        allow_disk_write=allow_write,
                     )
                     self.units[uid] = unit
                     if self._running and c.get("enabled", True):
@@ -1112,6 +1182,8 @@ class CameraManager:
         self._schedule_cleanup(delay_sec=86400.0)
 
     def trigger_cleanup_now(self):
+        if self.cfg_mgr.is_operator_mode():
+            return
         with self._lock:
             if self._cleanup_running:
                 return
@@ -1120,6 +1192,8 @@ class CameraManager:
         def _worker():
             deleted_total = 0
             try:
+                if self.cfg_mgr.is_operator_mode():
+                    return
                 cams = self.cfg_mgr.get_cameras()
                 now = time.time()
                 reg_mod_ids = [ent["id"] for ent in self.registry.list_modules()]

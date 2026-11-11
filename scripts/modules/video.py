@@ -9,6 +9,8 @@ import subprocess
 from datetime import datetime
 import numpy as np
 
+from scripts.core.i18n import tr
+
 try:
     import cv2
 except ImportError:
@@ -32,17 +34,17 @@ ALLOWED_X264_PRESETS = (
 )
 
 KNOWN_ENCODER_CATALOG = (
-    ("copy", "copy — Прямий запис потоку RTSP/HTTP (0% CPU, без перекодування)"),
-    ("libx264", "libx264 — Програмне стиснення CPU H.264 (баланс розмір/якість)"),
-    ("libx265", "libx265 — Програмне стиснення CPU H.265 / HEVC (менший розмір)"),
-    ("h264_nvenc", "h264_nvenc — Апаратне GPU NVIDIA NVENC H.264"),
-    ("hevc_nvenc", "hevc_nvenc — Апаратне GPU NVIDIA NVENC H.265 / HEVC"),
-    ("av1_nvenc", "av1_nvenc — Апаратне GPU NVIDIA NVENC AV1"),
-    ("h264_qsv", "h264_qsv — Апаратне Intel QuickSync H.264"),
-    ("hevc_qsv", "hevc_qsv — Апаратне Intel QuickSync H.265 / HEVC"),
-    ("h264_amf", "h264_amf — Апаратне AMD Radeon AMF H.264"),
-    ("hevc_amf", "hevc_amf — Апаратне AMD Radeon AMF H.265 / HEVC"),
-    ("mp4v", "mp4v — Резервний OpenCV кодек"),
+    ("copy", "copy — Direct RTSP/HTTP stream recording (0% CPU, no re-encoding)"),
+    ("libx264", "libx264 — Software CPU H.264 compression (size/quality balance)"),
+    ("libx265", "libx265 — Software CPU H.265 / HEVC compression (smaller size)"),
+    ("h264_nvenc", "h264_nvenc — Hardware GPU NVIDIA NVENC H.264"),
+    ("hevc_nvenc", "hevc_nvenc — Hardware GPU NVIDIA NVENC H.265 / HEVC"),
+    ("av1_nvenc", "av1_nvenc — Hardware GPU NVIDIA NVENC AV1"),
+    ("h264_qsv", "h264_qsv — Hardware Intel QuickSync H.264"),
+    ("hevc_qsv", "hevc_qsv — Hardware Intel QuickSync H.265 / HEVC"),
+    ("h264_amf", "h264_amf — Hardware AMD Radeon AMF H.264"),
+    ("hevc_amf", "hevc_amf — Hardware AMD Radeon AMF H.265 / HEVC"),
+    ("mp4v", "mp4v — Fallback OpenCV codec"),
 )
 
 BASE_CODEC_KEYS = ("copy", "libx264", "h264_nvenc", "hevc_nvenc", "h264_qsv", "h264_amf", "mp4v")
@@ -57,6 +59,29 @@ _CACHED_FFMPEG_ENCODERS = None
 
 def _creation_flags():
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _parse_allow_disk_write(config: dict = None, app_context: dict = None) -> bool:
+    for src in (app_context, config):
+        if not isinstance(src, dict):
+            continue
+        if "allow_disk_write" in src and src.get("allow_disk_write") is not None:
+            val = src.get("allow_disk_write")
+            if isinstance(val, str):
+                return val.strip().lower() not in ("false", "0", "no", "off")
+            return bool(val)
+        mode = src.get("operation_mode")
+        if mode is not None and str(mode).strip() != "":
+            return str(mode).strip().lower() != "operator"
+    return True
+
+
+def _merge_runtime_write_cfg(flat_cfg: dict, app_context: dict = None) -> dict:
+    cfg = dict(flat_cfg or {})
+    allow_write = _parse_allow_disk_write(cfg, app_context)
+    cfg["allow_disk_write"] = allow_write
+    cfg["operation_mode"] = "server" if allow_write else "operator"
+    return cfg
 
 
 def _is_network_stream(source) -> bool:
@@ -112,7 +137,7 @@ def get_codec_choices() -> list:
     choices = []
     for key, label in KNOWN_ENCODER_CATALOG:
         if key in BASE_CODEC_KEYS or key in detected:
-            choices.append((key, label))
+            choices.append((key, tr(f"mod.video.field.codec.choice.{key}", label)))
     return choices
 
 
@@ -135,18 +160,88 @@ def refresh_capabilities():
     probe_available_ffmpeg_encoders(force=True)
 
 
+def is_ready(base_dir: str = "") -> bool:
+    return bool(_get_ffmpeg_exe()) and (cv2 is not None)
+
+
 def get_status_summary(base_dir: str = "") -> str:
     ffmpeg_exe = _get_ffmpeg_exe()
     if ffmpeg_exe and cv2 is not None:
         encs = probe_available_ffmpeg_encoders(force=False)
         hw = [e for e in ("h264_nvenc", "hevc_nvenc", "h264_qsv", "h264_amf") if e in encs]
         hw_str = f", HW: {', '.join(hw)}" if hw else ""
-        return f"Готовий (FFmpeg + copy{hw_str})"
+        return tr("mod.video.status.ready", "Ready (FFmpeg + copy{hw_str})", hw_str=hw_str)
     if cv2 is not None:
-        return "Резервний режим (лише OpenCV mp4v, без FFmpeg)"
+        return tr("mod.video.status.fallback_opencv", "Fallback mode (OpenCV mp4v only, no FFmpeg)")
     if ffmpeg_exe:
-        return "Частково (лише FFmpeg copy, немає cv2)"
-    return "Потребує imageio-ffmpeg та opencv-python"
+        return tr("mod.video.status.partial_copy", "Partial (FFmpeg copy only, no cv2)")
+    return tr("mod.video.status.missing_deps", "Requires imageio-ffmpeg and opencv-python")
+
+
+def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None) -> dict:
+    """Перевіряє наявність FFmpeg та OpenCV для модуля відеозапису."""
+    refresh_capabilities()
+    missing = []
+    if not _get_ffmpeg_exe():
+        missing.append("imageio-ffmpeg (ffmpeg)")
+    if cv2 is None:
+        missing.append("opencv-python")
+    ok = len(missing) == 0
+    return {
+        "ok": ok,
+        "downloaded": [],
+        "missing": missing,
+        "message": get_status_summary(base_dir) if ok else tr(
+            "mod.video.res.missing",
+            "Missing video components: {items}",
+            items=", ".join(missing),
+        ),
+    }
+
+
+def recommend_settings(caps: dict, cam_cfg: dict = None, cur_mod_cfg: dict = None, active_cam_count: int = 1) -> dict:
+    """
+    Підбирає найоптимальніший кодек запису для камери або шаблону нових камер:
+    - для мережевих RTSP/HTTP-камер з FFmpeg: 'copy' (~0% CPU/GPU);
+    - для локальних файлів / вебкамер / шаблону: найкращий тестований GPU-кодек (NVENC -> QSV -> AMF) або libx264 / mp4v.
+    """
+    encoders = (caps or {}).get("video_encoders") or {}
+
+    def _enc_supported(key: str) -> bool:
+        if key in encoders:
+            return bool((encoders.get(key) or {}).get("supported"))
+        if key == "copy":
+            return bool(_get_ffmpeg_exe())
+        if key == "mp4v":
+            return cv2 is not None
+        return key in probe_available_ffmpeg_encoders(force=False)
+
+    main_src = str((cam_cfg or {}).get("main_source") or "").strip()
+    is_net = _is_network_stream(main_src) if cam_cfg is not None else False
+
+    if is_net and _enc_supported("copy"):
+        chosen = "copy"
+        reason = tr("mod.video.rec_reason.copy", "direct RTSP/HTTP stream recording without re-encoding (~0% CPU)")
+    elif _enc_supported("h264_nvenc"):
+        chosen = "h264_nvenc"
+        reason = tr("mod.video.rec_reason.nvenc", "hardware NVIDIA NVENC H.264 encoding")
+    elif _enc_supported("h264_qsv"):
+        chosen = "h264_qsv"
+        reason = tr("mod.video.rec_reason.qsv", "hardware Intel QuickSync H.264 encoding")
+    elif _enc_supported("h264_amf"):
+        chosen = "h264_amf"
+        reason = tr("mod.video.rec_reason.amf", "hardware AMD AMF H.264 encoding")
+    elif _enc_supported("libx264"):
+        chosen = "libx264"
+        reason = tr("mod.video.rec_reason.libx264", "software H.264 (FFmpeg libx264)")
+    else:
+        chosen = "mp4v"
+        reason = tr("mod.video.rec_reason.mp4v", "fallback OpenCV mp4v")
+
+    return {
+        "updates": {"codec": chosen},
+        "notes": [tr("mod.video.rec_note", "Codec: {chosen} ({reason})", chosen=chosen, reason=reason)],
+    }
 
 
 class VideoEngine:
@@ -172,8 +267,10 @@ class VideoEngine:
         self.source = source
 
         self.video_dir = output_dir or os.path.join(self.base_dir, "video")
-        os.makedirs(self.video_dir, exist_ok=True)
         self._staging_dir = os.path.join(self.video_dir, "_staging")
+        self.allow_disk_write = _parse_allow_disk_write(self.config)
+        if self.allow_disk_write:
+            os.makedirs(self.video_dir, exist_ok=True)
 
         self.ffmpeg_exe = _get_ffmpeg_exe()
         if not self.ffmpeg_exe:
@@ -183,7 +280,7 @@ class VideoEngine:
         self.is_running = False
         self.latest_frame = None
         self.latest_frame_ts = 0.0
-        self.recording_allowed = True
+        self.recording_allowed = self.allow_disk_write
 
         self.writer_thread = None
         self.finalizer_threads = []
@@ -209,6 +306,7 @@ class VideoEngine:
 
     def _reload_params(self):
         self.ffmpeg_exe = _get_ffmpeg_exe()
+        self.allow_disk_write = _parse_allow_disk_write(self.config)
         self.duration_min = max(0.05, float(self.config.get("video_duration_min", self.config.get("duration_min", 5.0))))
         self.segment_duration_sec = self.duration_min * 60.0
         self.fps = max(1.0, min(60.0, float(self.config.get("video_fps", self.config.get("fps", 15.0)))))
@@ -242,7 +340,7 @@ class VideoEngine:
 
     def is_currently_recording(self) -> bool:
         with self.lock:
-            if not self.is_running or not self.recording_allowed:
+            if not self.is_running or not self.recording_allowed or not self.allow_disk_write:
                 return False
             return (self.ffmpeg_proc is not None) or (self.cv_writer is not None)
 
@@ -251,16 +349,18 @@ class VideoEngine:
             old_sig = (
                 self.codec, self.preset, self.crf, self.fps,
                 self.segment_duration_sec, self.keyframe_sec,
-                self.max_bitrate_kbps, self.max_height, self.source,
+                self.max_bitrate_kbps, self.max_height, self.source, self.allow_disk_write,
             )
             self.config = dict(config or {})
             if source is not None:
                 self.source = source
             self._reload_params()
+            if not self.allow_disk_write:
+                self.recording_allowed = False
             new_sig = (
                 self.codec, self.preset, self.crf, self.fps,
                 self.segment_duration_sec, self.keyframe_sec,
-                self.max_bitrate_kbps, self.max_height, self.source,
+                self.max_bitrate_kbps, self.max_height, self.source, self.allow_disk_write,
             )
             if old_sig != new_sig and self.is_running:
                 self._copy_restart_requested = True
@@ -269,6 +369,9 @@ class VideoEngine:
         """Запуск фонового потоку запису відео."""
         old_thread = None
         with self.lock:
+            if not self.allow_disk_write:
+                self.recording_allowed = False
+                return
             if self.is_running:
                 return
             if self.writer_thread is not None and self.writer_thread.is_alive():
@@ -278,6 +381,9 @@ class VideoEngine:
             old_thread.join(timeout=3.0)
 
         with self.lock:
+            if not self.allow_disk_write:
+                self.recording_allowed = False
+                return
             if self.is_running:
                 return
             self.is_running = True
@@ -311,24 +417,27 @@ class VideoEngine:
         """Перезапускає воркер при перемиканні між 'copy' і покадровим кодуванням."""
         with self.lock:
             was_running = self.is_running
+            allow_write = self.allow_disk_write
         if was_running:
             self.stop(wait=True)
-            self.start()
+            if allow_write:
+                self.start()
 
     def push_frame(self, clean_frame: np.ndarray, allowed: bool = True):
         """Передача чистого кадру (без рамок детекції) у буфер запису."""
         if clean_frame is None:
             return
         with self.lock:
-            self.recording_allowed = allowed
-            if allowed and not self.is_direct_copy_active():
+            eff_allowed = bool(allowed) and bool(self.allow_disk_write)
+            self.recording_allowed = eff_allowed
+            if eff_allowed and not self.is_direct_copy_active():
                 self.latest_frame = clean_frame
                 self.latest_frame_ts = time.time()
 
     def set_allowed(self, allowed: bool):
         """Оновлення дозволу запису (наприклад, за межами дат або пауза)."""
         with self.lock:
-            self.recording_allowed = allowed
+            self.recording_allowed = bool(allowed) and bool(self.allow_disk_write)
 
     def is_file_busy(self, fpath: str) -> bool:
         """Перевірка, чи файл ще записується або фіналізується."""
@@ -361,6 +470,8 @@ class VideoEngine:
             self._finalize_copied_segment(src)
 
     def _finalize_copied_segment(self, src_path: str):
+        if not self.allow_disk_write:
+            return
         if not src_path or not os.path.exists(src_path):
             return
         try:
@@ -406,6 +517,10 @@ class VideoEngine:
                 pass
 
     def _direct_copy_loop(self):
+        with self.lock:
+            allow_write_init = self.allow_disk_write
+        if not allow_write_init:
+            return
         os.makedirs(self._staging_dir, exist_ok=True)
         self._flush_staging_files()
         creationflags = _creation_flags()
@@ -415,11 +530,12 @@ class VideoEngine:
                 with self.lock:
                     running = self.is_running
                     allowed = self.recording_allowed
+                    allow_write = self.allow_disk_write
                     src_url = str(self.source or "").strip()
                     seg_sec = max(3.0, float(self.segment_duration_sec))
                     self._copy_restart_requested = False
 
-                if not running:
+                if not running or not allow_write:
                     break
                 if not allowed or not _is_network_stream(src_url) or self.codec != "copy" or not self.ffmpeg_exe:
                     if self.codec != "copy":
@@ -490,9 +606,10 @@ class VideoEngine:
                     with self.lock:
                         r_now = self.is_running
                         a_now = self.recording_allowed
+                        w_now = self.allow_disk_write
                         rst_now = self._copy_restart_requested
                         codec_now = self.codec
-                    if (not r_now) or (not a_now) or rst_now or (codec_now != "copy"):
+                    if (not r_now) or (not a_now) or (not w_now) or rst_now or (codec_now != "copy"):
                         try:
                             if proc.stdin:
                                 proc.stdin.write("q\n")
@@ -523,9 +640,10 @@ class VideoEngine:
 
                 with self.lock:
                     still_running = self.is_running
+                    still_allow = self.allow_disk_write
                     cur_codec = self.codec
 
-                if not still_running:
+                if not still_running or not still_allow:
                     break
                 if cur_codec != "copy":
                     self._writer_loop()
@@ -613,6 +731,8 @@ class VideoEngine:
         return args
 
     def _open_segment(self, width: int, height: int):
+        if not self.allow_disk_write:
+            return False
         even_w = width - (width % 2)
         even_h = height - (height % 2)
         if even_w < 16 or even_h < 16:
@@ -785,12 +905,13 @@ class VideoEngine:
                 with self.lock:
                     running = self.is_running
                     allowed = self.recording_allowed
+                    allow_write = self.allow_disk_write
                     frame = self.latest_frame
                     frame_ts = self.latest_frame_ts
                     restart_req = self._copy_restart_requested
                     self._copy_restart_requested = False
 
-                if not running:
+                if not running or not allow_write:
                     break
 
                 if self.is_direct_copy_active():
@@ -866,9 +987,10 @@ class VideoEngine:
 #  Контракт незалежного модуля для ModuleRegistry
 # ------------------------------------------------------------------
 def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_saved_callback=None, source=None, app_context=None):
+    eff_cfg = _merge_runtime_write_cfg(flat_cfg, app_context)
     return VideoEngine(
         base_dir=base_dir,
-        config=flat_cfg,
+        config=eff_cfg,
         on_saved_callback=on_saved_callback,
         output_dir=output_dir,
         source=source,
@@ -877,7 +999,11 @@ def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_sav
 
 def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, app_context=None):
     if engine is not None:
-        engine.update_config(flat_cfg, source=source)
+        eff_cfg = _merge_runtime_write_cfg(flat_cfg, app_context)
+        engine.update_config(eff_cfg, source=source)
+        if not engine.allow_disk_write:
+            engine.set_allowed(False)
+            engine.stop(wait=False)
 
 
 def _parse_archive_record(fpath: str, base_name: str, root_dir: str, rel_dir: str) -> dict:
@@ -889,7 +1015,7 @@ def _parse_archive_record(fpath: str, base_name: str, root_dir: str, rel_dir: st
         mb = 0.0
     return {
         "time": time_disp,
-        "name": f"Відео ({mb:.1f} МБ)",
+        "name": tr("mod.video.archive.record_name", "Video ({mb:.1f} MB)", mb=mb),
     }
 
 
@@ -1020,11 +1146,12 @@ MODULE_SPEC = {
     "version": "2.0.0",
     "order": 40,
     "kind": "recorder",
-    "name": "Відеозапис",
+    "writes_to_disk": True,
+    "name": "Video Recording",
     "icon": "🎬",
     "short_badge": "",
-    "description": "Постійний циклічний фоновий відеозапис основного потоку (main_source) без рамок.",
-    "on_help": "Увімкнути постійний циклічний фоновий відеозапис основного потоку (main_source) цієї камери без рамок.",
+    "description": "Continuous cyclic background video recording of the main stream (main_source) without overlays.",
+    "on_help": "Enable continuous cyclic background video recording of this camera's main stream (main_source) without overlays.",
     "provides": ["video_recorder"],
     "library_deps": ["imageio-ffmpeg", "opencv-python"],
     "settings_schema": [
@@ -1032,17 +1159,17 @@ MODULE_SPEC = {
             "key": "codec",
             "type": "choice",
             "default": "libx264",
-            "label": "Процесор / Кодек запису:",
+            "label": "Encoder / Codec:",
             "choices_provider": get_codec_choices,
             "help": (
-                "Процесор та кодек відеозапису\n"
-                "• copy — ПРЯМИЙ ЗАПИС ПОТОКУ RTSP/HTTP без перекодування! Майже 0% навантаження CPU і GPU. "
-                "Ігнорує CRF/FPS/Preset/Scale, ріжеться по ключових кадрах камери (не підходить для USB-вебкамер 0).\n"
-                "• h264_nvenc / hevc_nvenc / av1_nvenc — апаратне кодування на відеокарті NVIDIA (мінімум CPU).\n"
-                "• h264_qsv / hevc_qsv — апаратне кодування Intel QuickSync.\n"
-                "• h264_amf / hevc_amf — апаратне кодування AMD Radeon.\n"
-                "• libx264 / libx265 — програмне стиснення CPU.\n"
-                "• mp4v — резервний OpenCV кодек."
+                "Video Recording Processor & Codec\n"
+                "• copy — DIRECT RTSP/HTTP STREAM RECORDING without re-encoding! Almost 0% CPU and GPU load. "
+                "Ignores CRF/FPS/Preset/Scale and splits on camera keyframes (not suitable for USB webcams like 0).\n"
+                "• h264_nvenc / hevc_nvenc / av1_nvenc — NVIDIA GPU hardware encoding (minimal CPU).\n"
+                "• h264_qsv / hevc_qsv — Intel QuickSync hardware encoding.\n"
+                "• h264_amf / hevc_amf — AMD Radeon hardware encoding.\n"
+                "• libx264 / libx265 — software CPU compression.\n"
+                "• mp4v — fallback OpenCV codec."
             ),
         },
         {
@@ -1052,17 +1179,17 @@ MODULE_SPEC = {
             "min": 0.05,
             "max": 180.0,
             "step": 1.0,
-            "label": "Тривалість сегмента (хв):",
-            "help": "Тривалість одного відеофайлу-фрагмента у хвилинах (типово 5 хв; можна 1 або 10).",
+            "label": "Segment Duration (min):",
+            "help": "Duration of a single video segment file in minutes (default 5 min; 1 or 10 supported).",
         },
         {
             "key": "preset",
             "type": "choice",
             "default": "veryfast",
-            "label": "Пресет швидкості стиснення:",
+            "label": "Compression Speed Preset:",
             "choices": [(p, p) for p in ALLOWED_X264_PRESETS],
             "disable_when": {"codec": "copy"},
-            "help": "Швидкість/ефективність стиснення (veryfast оптимально; ultrafast дає у 4–5× більші файли). Не діє в режимі 'copy'.",
+            "help": "Compression speed/efficiency (veryfast is optimal; ultrafast yields 4–5× larger files). Inactive in 'copy' mode.",
         },
         {
             "key": "crf",
@@ -1071,9 +1198,9 @@ MODULE_SPEC = {
             "min": 0,
             "max": 51,
             "step": 1,
-            "label": "Якість CRF / CQ (0–51):",
+            "label": "Quality CRF / CQ (0–51):",
             "disable_when": {"codec": "copy"},
-            "help": "Якість відео (0–51; менше = чіткіше і важчий файл). Для CCTV оптимально 28–31. Не діє в режимі 'copy'.",
+            "help": "Video quality (0–51; lower = sharper and larger file). 28–31 is optimal for CCTV. Inactive in 'copy' mode.",
         },
         {
             "key": "fps",
@@ -1082,9 +1209,9 @@ MODULE_SPEC = {
             "min": 1.0,
             "max": 60.0,
             "step": 1.0,
-            "label": "Частота кадрів (FPS):",
+            "label": "Frame Rate (FPS):",
             "disable_when": {"codec": "copy"},
-            "help": "Цільова частота кадрів архівного MP4 (1–60; 12–15 к/с оптимум для економії диска/CPU). Не діє в режимі 'copy'.",
+            "help": "Target frame rate of archived MP4 (1–60; 12–15 fps saves disk and CPU). Inactive in 'copy' mode.",
         },
         {
             "key": "keyframe_sec",
@@ -1093,9 +1220,9 @@ MODULE_SPEC = {
             "min": 0.5,
             "max": 60.0,
             "step": 0.5,
-            "label": "Ключовий кадр (сек):",
+            "label": "Keyframe Interval (sec):",
             "disable_when": {"codec": "copy"},
-            "help": "Інтервал між ключовими кадрами (сек; 5–8 с оптимум). Частіші ключові кадри дають швидше перемотування, але +25% розміру. Не діє в 'copy'.",
+            "help": "Interval between keyframes in seconds (5–8 s optimal). More frequent keyframes allow faster seeking (+25% size). Inactive in 'copy'.",
         },
         {
             "key": "max_bitrate_kbps",
@@ -1104,9 +1231,9 @@ MODULE_SPEC = {
             "min": 0,
             "max": 50000,
             "step": 100,
-            "label": "Макс. бітрейт (kbps, 0=без):",
+            "label": "Max Bitrate (kbps, 0=unlimited):",
             "disable_when": {"codec": "copy"},
-            "help": "Верхня стеля бітрейту (кбіт/с, 0 = без обмеження). Захищає від роздуття файлів уночі від шуму матриці. Не діє в 'copy'.",
+            "help": "Bitrate cap (kbps, 0 = unlimited). Prevents night sensor noise from inflating file size. Inactive in 'copy'.",
         },
         {
             "key": "max_height",
@@ -1115,9 +1242,9 @@ MODULE_SPEC = {
             "min": 0,
             "max": 4320,
             "step": 120,
-            "label": "Макс. висота (px, 0=оригінал):",
+            "label": "Max Height (px, 0=original):",
             "disable_when": {"codec": "copy"},
-            "help": "Максимальна висота архівного MP4 (px; 0 = оригінал камери, 720 чи 480 зменшує розмір і CPU без впливу на AI). Не діє в 'copy'.",
+            "help": "Maximum height of archived MP4 (px; 0 = original camera height; 720 or 480 lowers size and CPU without affecting AI). Inactive in 'copy'.",
         },
         {
             "key": "delete_older_days",
@@ -1126,8 +1253,9 @@ MODULE_SPEC = {
             "min": 0.0,
             "max": 3650.0,
             "step": 1.0,
-            "label": "Автовидалення старше (днів):",
-            "help": "Автовидалення відеофрагментів цієї камери, старших за N днів (0 = необмежено).",
+            "disk_write": True,
+            "label": "Auto-delete older than (days):",
+            "help": "Automatically delete video clips from this camera older than N days (0 = keep forever).",
         },
         {
             "key": "date_from",
@@ -1135,8 +1263,8 @@ MODULE_SPEC = {
             "type": "date_range",
             "default": "",
             "default_to": "",
-            "label": "Період роботи (дати):",
-            "help": "Початкова та кінцева дати відеозапису (YYYY-MM-DD, порожньо = необмежено).",
+            "label": "Active Schedule (Dates):",
+            "help": "Start and end dates for video recording (YYYY-MM-DD, empty = unlimited).",
         },
     ],
     "notices": [
@@ -1144,8 +1272,8 @@ MODULE_SPEC = {
             "after_key": "codec",
             "when": {"codec": "copy"},
             "text": (
-                "⚡ АКТИВНИЙ ПРЯМИЙ ЗАПИС ПОТОКУ (copy): FFmpeg зберігає вхідний RTSP/HTTP-потік без декодування та перекодування (~0% CPU/GPU). "
-                "Параметри Preset, CRF, FPS, Keyframe, Макс. бітрейт та Обмеження висоти не застосовуються. Не використовуйте 'copy' для вебкамер (0)."
+                "⚡ DIRECT STREAM COPY ACTIVE (copy): FFmpeg saves the incoming RTSP/HTTP stream without decoding or re-encoding (~0% CPU/GPU). "
+                "Preset, CRF, FPS, Keyframe, Max Bitrate, and Max Height do not apply. Do not use 'copy' for webcams (0)."
             ),
             "fg": "#00e5ff",
             "bg": "#1b2c3b",
@@ -1153,16 +1281,19 @@ MODULE_SPEC = {
     ],
     "archive": {
         "has_archive": True,
-        "button_label": "🎬 Відео",
-        "sidebar_title": "Архів відеозаписів",
+        "button_label": "🎬 Video",
+        "sidebar_title": "Video Recording Archive",
         "icon": "🎬",
         "record_type": "video",
         "extensions": (".mp4", ".avi", ".mkv"),
         "parse_record": _parse_archive_record,
         "list_segments": list_video_segments,
     },
+    "is_ready": is_ready,
     "refresh_capabilities": refresh_capabilities,
     "get_status_summary": get_status_summary,
+    "ensure_resources": ensure_resources,
+    "recommend_settings": recommend_settings,
     "create_shared_resources": None,
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,

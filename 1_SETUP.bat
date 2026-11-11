@@ -111,6 +111,9 @@ if "!ORT_CHOICE!"=="2" (
     if !ERRORLEVEL! neq 0 (
         echo [УВАГА] Не вдалося встановити onnxruntime-gpu, повертаємо базовий onnxruntime ^(CPU^)...
         ".venv\Scripts\python.exe" -m pip install onnxruntime
+    ) else (
+        echo Перевірка наявності бібліотек CUDA / cuDNN та завантаження відсутніх у папку cuda\...
+        ".venv\Scripts\python.exe" -m scripts.core.hardware_info --ensure-cuda .
     )
 ) else (
     echo Залишаємо поточний варіант ONNX Runtime ^(перемикання також доступне у Налаштування - Залізо та графіка^).

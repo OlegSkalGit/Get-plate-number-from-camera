@@ -95,6 +95,10 @@ xcopy /e /y /i "models\*" "dist\ANPR_Monitor\models\" >nul
 if not exist "dist\ANPR_Monitor\scripts\modules" mkdir "dist\ANPR_Monitor\scripts\modules"
 xcopy /e /y /i "scripts\modules\*" "dist\ANPR_Monitor\scripts\modules\" >nul
 if exist "dist\ANPR_Monitor\scripts\modules\__pycache__" rd /s /q "dist\ANPR_Monitor\scripts\modules\__pycache__"
+if exist "lang" (
+    if not exist "dist\ANPR_Monitor\lang" mkdir "dist\ANPR_Monitor\lang"
+    xcopy /e /y /i "lang\*" "dist\ANPR_Monitor\lang\" >nul
+)
 if exist "_redist_" (
     if not exist "dist\ANPR_Monitor\_redist_" mkdir "dist\ANPR_Monitor\_redist_"
     xcopy /e /y /i "_redist_\*" "dist\ANPR_Monitor\_redist_\" >nul
@@ -102,8 +106,13 @@ if exist "_redist_" (
     if not exist "dist\ANPR_Monitor\_redist_" mkdir "dist\ANPR_Monitor\_redist_"
     xcopy /e /y /i "..\_redist_\*" "dist\ANPR_Monitor\_redist_\" >nul
 )
+if exist "cuda\*.dll" (
+    echo Копіювання локальних бібліотек CUDA/cuDNN з cuda\...
+    if not exist "dist\ANPR_Monitor\cuda" mkdir "dist\ANPR_Monitor\cuda"
+    copy /y "cuda\*.dll" "dist\ANPR_Monitor\cuda\" >nul
+    if exist "cuda\cuda_manifest.json" copy /y "cuda\cuda_manifest.json" "dist\ANPR_Monitor\cuda\" >nul
+)
 if exist "config.json" copy /y "config.json" "dist\ANPR_Monitor\config.json" >nul
-if exist "config.ini" copy /y "config.ini" "dist\ANPR_Monitor\config.ini" >nul
 if exist "README.md" copy /y "README.md" "dist\ANPR_Monitor\" >nul
 
 if exist "build" rd /s /q "build"

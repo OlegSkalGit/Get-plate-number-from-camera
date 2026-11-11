@@ -10,6 +10,8 @@ from collections import Counter
 from datetime import datetime
 import numpy as np
 
+from scripts.core.i18n import tr
+
 try:
     import cv2
 except ImportError:
@@ -60,6 +62,20 @@ def refresh_capabilities():
         DefaultOCR = None
 
 
+def is_ready(base_dir: str = "") -> bool:
+    if cv2 is None or DefaultOCR is None:
+        return False
+    if base_dir:
+        req_files = (
+            os.path.join(base_dir, "models", "best.onnx"),
+            os.path.join(base_dir, "models", "cct_xs_v2_global.onnx"),
+            os.path.join(base_dir, "models", "cct_xs_v2_global_plate_config.yaml"),
+        )
+        if any(not os.path.exists(p) for p in req_files):
+            return False
+    return True
+
+
 def get_status_summary(base_dir: str = "") -> str:
     missing_libs = []
     if cv2 is None:
@@ -67,7 +83,7 @@ def get_status_summary(base_dir: str = "") -> str:
     if DefaultOCR is None:
         missing_libs.append("fast-alpr")
     if missing_libs:
-        return f"Потрібні бібліотеки: {', '.join(missing_libs)}"
+        return tr("mod.common.libs_needed", "Required libraries: {libs}", libs=", ".join(missing_libs))
 
     if base_dir:
         req_files = (
@@ -77,8 +93,64 @@ def get_status_summary(base_dir: str = "") -> str:
         )
         missing_m = [os.path.basename(p) for p in req_files if not os.path.exists(p)]
         if missing_m:
-            return f"Відсутні моделі: {', '.join(missing_m)}"
-    return "Готовий (YOLO best.onnx + CCT OCR)"
+            return tr("mod.common.models_missing", "Missing models: {models}", models=", ".join(missing_m))
+    return tr("mod.plates.status.ready", "Ready (YOLO best.onnx + CCT OCR)")
+
+
+def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None) -> dict:
+    """Перевіряє та за потреби довантажує CCT OCR модель номерів у <base_dir>/models/."""
+    refresh_capabilities()
+    missing = []
+    downloaded = []
+
+    if cv2 is None:
+        missing.append("opencv-python")
+    if DefaultOCR is None:
+        missing.append("fast-alpr / fast-plate-ocr")
+
+    if base_dir:
+        models_dir = os.path.join(base_dir, "models")
+        os.makedirs(models_dir, exist_ok=True)
+        det_p = os.path.join(models_dir, "best.onnx")
+        ocr_p = os.path.join(models_dir, "cct_xs_v2_global.onnx")
+        cfg_p = os.path.join(models_dir, "cct_xs_v2_global_plate_config.yaml")
+
+        if download and (not os.path.exists(ocr_p) or not os.path.exists(cfg_p)):
+            try:
+                from pathlib import Path
+                from fast_plate_ocr.inference.hub import download_model
+                if progress_cb:
+                    progress_cb(tr("mod.plates.res.downloading", "Downloading CCT OCR model (cct-xs-v2-global-model)..."))
+                dl_model, dl_cfg = download_model(
+                    model_name="cct-xs-v2-global-model",
+                    save_directory=Path(models_dir),
+                    force_download=False,
+                )
+                if os.path.exists(str(dl_model)):
+                    downloaded.append(os.path.basename(str(dl_model)))
+                if os.path.exists(str(dl_cfg)):
+                    downloaded.append(os.path.basename(str(dl_cfg)))
+            except Exception as e:
+                if progress_cb:
+                    progress_cb(tr("mod.plates.res.dl_failed", "Failed to download CCT OCR: {err}", err=e))
+
+        for req_p in (det_p, ocr_p, cfg_p):
+            if not os.path.exists(req_p):
+                missing.append(os.path.basename(req_p))
+
+    ok = len(missing) == 0
+    if ok and downloaded:
+        msg = tr("mod.plates.res.downloaded", "Downloaded OCR resources: {items}", items=", ".join(downloaded))
+    elif ok:
+        msg = tr("mod.plates.res.ready", "License plate models (best.onnx + CCT OCR) are ready.")
+    else:
+        msg = tr("mod.common.res_missing", "Missing resources: {items}", items=", ".join(missing))
+    return {
+        "ok": ok,
+        "downloaded": downloaded,
+        "missing": missing,
+        "message": msg,
+    }
 
 
 def async_write_image(path, img):
@@ -356,6 +428,10 @@ class ONNXDetector:
 
         try:
             import onnxruntime as ort
+            try:
+                ort.set_default_logger_severity(3)
+            except Exception:
+                pass
             opts = ort.SessionOptions()
             opts.log_severity_level = 3
             cpu_cnt = os.cpu_count() or 4
@@ -375,7 +451,7 @@ class ONNXDetector:
             self.use_ort = True
         except Exception:
             if cv2 is None:
-                raise ImportError("Немає onnxruntime або opencv-python для ONNXDetector")
+                raise ImportError("onnxruntime or opencv-python is required for ONNXDetector")
             self.net = cv2.dnn.readNetFromONNX(model_path)
             self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
             self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
@@ -473,7 +549,7 @@ class ThreadSafePlateOCR:
     def __init__(self, model_path: str, config_path: str, providers=None):
         _ensure_deps()
         if DefaultOCR is None:
-            raise ImportError("Пакет 'fast-alpr' / DefaultOCR не встановлено")
+            raise ImportError("Package 'fast-alpr' / DefaultOCR is not installed")
         self.model_path = model_path
         self.config_path = config_path
         self._lock = threading.Lock()
@@ -487,40 +563,90 @@ class ThreadSafePlateOCR:
         use_cpu_only = req_providers == ["CPUExecutionProvider"]
         device = "cpu" if use_cpu_only else ("cuda" if use_cuda else "auto")
 
+        opts = None
         try:
-            sig = inspect.signature(DefaultOCR.__init__)
+            import onnxruntime as ort
+            try:
+                ort.set_default_logger_severity(3)
+            except Exception:
+                pass
+            opts = ort.SessionOptions()
+            opts.log_severity_level = 3
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        except Exception:
+            opts = None
+
+        sig = inspect.signature(DefaultOCR.__init__)
+        try:
             kwargs = {
                 "hub_ocr_model": None,
                 "device": device,
                 "model_path": model_path,
                 "config_path": config_path,
             }
-            if "providers" in sig.parameters and providers:
+            if "providers" in sig.parameters:
                 kwargs["providers"] = req_providers
+            if opts is not None and "sess_options" in sig.parameters:
+                kwargs["sess_options"] = opts
             return DefaultOCR(**kwargs)
         except Exception:
-            return DefaultOCR(
-                hub_ocr_model=None,
-                device="cpu",
-                model_path=model_path,
-                config_path=config_path,
-            )
+            fb_kwargs = {
+                "hub_ocr_model": None,
+                "device": "cpu",
+                "model_path": model_path,
+                "config_path": config_path,
+            }
+            if "providers" in sig.parameters:
+                fb_kwargs["providers"] = ["CPUExecutionProvider"]
+            if opts is not None and "sess_options" in sig.parameters:
+                fb_kwargs["sess_options"] = opts
+            return DefaultOCR(**fb_kwargs)
 
     def _detect_active_providers(self):
         for attr in ("ocr_model", "model", "session"):
             obj = getattr(self.ocr, attr, None)
-            if obj is not None:
-                sess = getattr(obj, "session", obj)
-                if hasattr(sess, "get_providers"):
+            if obj is None:
+                continue
+            for inner_attr in ("session", "model"):
+                sess = getattr(obj, inner_attr, None)
+                if sess is not None and hasattr(sess, "get_providers"):
                     try:
                         return sess.get_providers()
                     except Exception:
                         pass
+            if hasattr(obj, "get_providers"):
+                try:
+                    return obj.get_providers()
+                except Exception:
+                    pass
         return ["CPUExecutionProvider"]
 
     def predict(self, img):
         with self._lock:
             return self.ocr.predict(img)
+
+
+def _parse_allow_disk_write(config: dict = None, app_context: dict = None) -> bool:
+    for src in (app_context, config):
+        if not isinstance(src, dict):
+            continue
+        if "allow_disk_write" in src and src.get("allow_disk_write") is not None:
+            val = src.get("allow_disk_write")
+            if isinstance(val, str):
+                return val.strip().lower() not in ("false", "0", "no", "off")
+            return bool(val)
+        mode = src.get("operation_mode")
+        if mode is not None and str(mode).strip() != "":
+            return str(mode).strip().lower() != "operator"
+    return True
+
+
+def _merge_runtime_write_cfg(flat_cfg: dict, app_context: dict = None) -> dict:
+    cfg = dict(flat_cfg or {})
+    allow_write = _parse_allow_disk_write(cfg, app_context)
+    cfg["allow_disk_write"] = allow_write
+    cfg["operation_mode"] = "server" if allow_write else "operator"
+    return cfg
 
 
 class PlateEngine:
@@ -540,14 +666,18 @@ class PlateEngine:
         self.on_saved_callback = on_saved_callback
 
         self.plates_dir = output_dir or os.path.join(self.base_dir, "plates")
-        os.makedirs(self.plates_dir, exist_ok=True)
+        self.allow_disk_write = True
+        self._state_lock = threading.Lock()
+        self._reload_params()
+        if self.allow_disk_write:
+            os.makedirs(self.plates_dir, exist_ok=True)
 
         if detector is not None:
             self.detector = detector
         else:
             model_path = os.path.join(self.base_dir, "models", "best.onnx")
             if not os.path.exists(model_path):
-                raise FileNotFoundError(f"Файл детектора не знайдено: {model_path}")
+                raise FileNotFoundError(f"Plate detector file not found: {model_path}")
             self.detector = ONNXDetector(model_path, providers=providers)
 
         if ocr is not None:
@@ -556,17 +686,16 @@ class PlateEngine:
             ocr_model_path = os.path.join(self.base_dir, "models", "cct_xs_v2_global.onnx")
             ocr_config_path = os.path.join(self.base_dir, "models", "cct_xs_v2_global_plate_config.yaml")
             if not os.path.exists(ocr_model_path) or not os.path.exists(ocr_config_path):
-                raise FileNotFoundError(f"Файли CCT OCR відсутні в {os.path.join(self.base_dir, 'models')}")
+                raise FileNotFoundError(f"CCT OCR files are missing in {os.path.join(self.base_dir, 'models')}")
             self.ocr = ThreadSafePlateOCR(ocr_model_path, ocr_config_path, providers=providers)
 
         self.active_tracks = {}
         self.next_track_id = 1
         self.track_timeout = 1.2
         self.recently_saved_plates = {}
-        self._state_lock = threading.Lock()
-        self._reload_params()
 
     def _reload_params(self):
+        self.allow_disk_write = _parse_allow_disk_write(self.config)
         self.plates_det_thresh = float(self.config.get("plates_det_thresh", self.config.get("det_thresh", 0.18)))
         self.min_percent_to_save = int(self.config.get("plates_min_percent_to_save", self.config.get("min_percent_to_save", 80)))
         self.sleep_timeout = float(self.config.get("plates_sleep_time_after_save", self.config.get("sleep_time_after_save", 5.0)))
@@ -734,6 +863,8 @@ class PlateEngine:
                 del self.active_tracks[t_id]
 
     def _save_tracked_plate_locked(self, track: PlateTrack, reason="track_exit"):
+        if not self.allow_disk_write:
+            return
         text, conf = track.get_consensus_text_and_conf()
         conf_pct = int(round(conf * 100))
 
@@ -767,6 +898,7 @@ class PlateEngine:
         day_folder = now_dt.strftime("%Y-%m-%d")
         time_prefix = now_dt.strftime("%H-%M-%S") + f"-{int(now_dt.microsecond / 1000):03d}"
 
+        os.makedirs(self.plates_dir, exist_ok=True)
         day_dir = os.path.join(self.plates_dir, day_folder)
         os.makedirs(day_dir, exist_ok=True)
 
@@ -821,11 +953,11 @@ class PlateEngine:
 def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, app_context: dict = None):
     det_path = os.path.join(base_dir, "models", "best.onnx")
     if not os.path.exists(det_path):
-        raise FileNotFoundError(f"Файл детектора номерів не знайдено: {det_path}")
+        raise FileNotFoundError(f"Plate detector file not found: {det_path}")
     ocr_path = os.path.join(base_dir, "models", "cct_xs_v2_global.onnx")
     cfg_path = os.path.join(base_dir, "models", "cct_xs_v2_global_plate_config.yaml")
     if not os.path.exists(ocr_path) or not os.path.exists(cfg_path):
-        raise FileNotFoundError("Файли CCT OCR відсутні в models/")
+        raise FileNotFoundError("CCT OCR files are missing in models/")
 
     det = ONNXDetector(det_path, providers=providers, intra_op_threads=ai_threads)
     ocr = ThreadSafePlateOCR(ocr_path, cfg_path, providers=providers)
@@ -839,9 +971,10 @@ def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, ap
 def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_saved_callback=None, source=None, app_context=None):
     det = shared_resources.get("detector") if isinstance(shared_resources, dict) else None
     ocr = shared_resources.get("ocr") if isinstance(shared_resources, dict) else None
+    cfg_copy = _merge_runtime_write_cfg(flat_cfg, app_context)
     return PlateEngine(
         base_dir=base_dir,
-        config=flat_cfg,
+        config=cfg_copy,
         on_saved_callback=on_saved_callback,
         detector=det,
         ocr=ocr,
@@ -857,7 +990,8 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
             engine.detector = shared_resources["detector"]
         if shared_resources.get("ocr") is not None:
             engine.ocr = shared_resources["ocr"]
-    engine.update_config(flat_cfg)
+    cfg_copy = _merge_runtime_write_cfg(flat_cfg, app_context)
+    engine.update_config(cfg_copy)
 
 
 def _process_and_pack(engine, frame, prev_state=None):
@@ -931,29 +1065,30 @@ MODULE_SPEC = {
     "version": "2.0.0",
     "order": 10,
     "kind": "ai",
-    "name": "Номери",
+    "name": "License Plates",
     "icon": "🚘",
-    "short_badge": "Н",
-    "description": "Виявлення, вирівнювання та OCR-розпізнавання автомобільних номерних знаків.",
-    "on_help": "Увімкнути виявлення, OCR-розпізнавання й архівування автомобільних номерів для цієї камери.",
+    "short_badge": "LPR",
+    "description": "Detection, perspective rectification, and OCR recognition of vehicle license plates.",
+    "on_help": "Enable detection, OCR recognition, and archiving of vehicle license plates for this camera.",
     "provides": ["anpr"],
-    "library_deps": ["opencv-python", "onnxruntime", "fast-alpr"],
+    "library_deps": ["opencv-python", "onnxruntime", "fast-alpr", "fast-plate-ocr"],
     "settings_schema": [
         {
             "key": "show_boxes",
             "type": "bool",
             "default": True,
-            "label": "Показувати рамки:",
-            "bool_text": "Малювати зелені рамки та збільшений номер у куті",
-            "help": "Малювати зелену рамку навколо виявлених номерів та показувати збільшений номер у куті вікна повного перегляду.",
+            "label": "Show Boxes:",
+            "bool_text": "Draw green boxes and zoomed plate in corner",
+            "help": "Draw a green box around detected plates and show an enlarged crop in the corner of the detail view.",
         },
         {
             "key": "debug",
             "type": "bool",
             "default": False,
-            "label": "Debug-логи:",
-            "bool_text": "Зберігати текстові *_debug.txt із голосуванням символів",
-            "help": "Зберігати текстовий лог по кожному зафіксованому треку (*_debug.txt) зі статистикою голосування символів.",
+            "disk_write": True,
+            "label": "Debug Logs:",
+            "bool_text": "Save text *_debug.txt logs with character voting",
+            "help": "Save a text log for each tracked plate (*_debug.txt) with character voting statistics.",
         },
         {
             "key": "det_thresh",
@@ -962,8 +1097,8 @@ MODULE_SPEC = {
             "min": 0.05,
             "max": 0.95,
             "step": 0.01,
-            "label": "Поріг детектора:",
-            "help": "Поріг впевненості детектора номерів (0.12–0.45; 0.18 оптимум). Нижче — бачить дальші/брудні номери, вище — менше хибних рамок.",
+            "label": "Detector Threshold:",
+            "help": "Plate detector confidence threshold (0.12–0.45; 0.18 optimal). Lower catches distant/dirty plates; higher avoids false boxes.",
         },
         {
             "key": "min_percent_to_save",
@@ -972,8 +1107,9 @@ MODULE_SPEC = {
             "min": 10,
             "max": 100,
             "step": 1,
-            "label": "Мін. точність OCR (%):",
-            "help": "Мінімальна впевненість OCR (%) для збереження номера в архів (рекомендовано 75–90%).",
+            "disk_write": True,
+            "label": "Min OCR Confidence (%):",
+            "help": "Minimum OCR confidence (%) required to archive a plate (75–90% recommended).",
         },
         {
             "key": "sleep_time_after_save",
@@ -982,8 +1118,9 @@ MODULE_SPEC = {
             "min": 0.0,
             "max": 3600.0,
             "step": 0.5,
-            "label": "Пауза повторів (сек):",
-            "help": "Пауза (сек), протягом якої повтор тієї самої таблички ігнорується (з похибкою в 1 символ), щоб припарковане авто не спамило архів.",
+            "disk_write": True,
+            "label": "Repeat Cooldown (sec):",
+            "help": "Cooldown (sec) ignoring repeats of the same plate (with 1-char tolerance) so parked cars do not spam the archive.",
         },
         {
             "key": "view_time",
@@ -992,8 +1129,8 @@ MODULE_SPEC = {
             "min": 1,
             "max": 600,
             "step": 1,
-            "label": "Час показу у куті (сек):",
-            "help": "Скільки секунд показувати збільшений знімок останнього розпізнаного номера в кутку екрану.",
+            "label": "Corner Display Time (sec):",
+            "help": "How many seconds to show the zoomed crop of the last recognized plate in the corner.",
         },
         {
             "key": "rect_scale",
@@ -1002,8 +1139,8 @@ MODULE_SPEC = {
             "min": 1.0,
             "max": 15.0,
             "step": 0.5,
-            "label": "Масштаб у куті:",
-            "help": "Масштаб збільшеної плашки номера в кутку вікна (базово 5.0).",
+            "label": "Corner Zoom Scale:",
+            "help": "Scale of the enlarged plate thumbnail in the window corner (default 5.0).",
         },
         {
             "key": "delete_older_days",
@@ -1012,8 +1149,9 @@ MODULE_SPEC = {
             "min": 0.0,
             "max": 3650.0,
             "step": 1.0,
-            "label": "Автовидалення старше (днів):",
-            "help": "Автовидалення фото номерів цієї камери, старших за N днів (0 = зберігати безстроково; можна дробові напр. 0.5).",
+            "disk_write": True,
+            "label": "Auto-delete older than (days):",
+            "help": "Automatically delete plate snapshots from this camera older than N days (0 = keep forever; decimals like 0.5 allowed).",
         },
         {
             "key": "date_from",
@@ -1021,23 +1159,26 @@ MODULE_SPEC = {
             "type": "date_range",
             "default": "",
             "default_to": "",
-            "label": "Період роботи (дати):",
-            "help": "Початкова та кінцева дата роботи модуля номерів (YYYY-MM-DD, порожньо = без обмеження).",
+            "label": "Active Schedule (Dates):",
+            "help": "Start and end dates for the plates module (YYYY-MM-DD, empty = unlimited).",
         },
     ],
     "archive": {
         "has_archive": True,
-        "button_label": "🚘 Номери",
-        "sidebar_title": "Історія номерів",
-        "item_preview_label": "Фото номера:",
+        "button_label": "🚘 Plates",
+        "sidebar_title": "Plates History",
+        "item_preview_label": "Plate Snapshot:",
         "icon": "🚘",
         "record_type": "pair_image",
         "extensions": (".jpg", ".jpeg", ".png"),
         "parse_record": _parse_archive_record,
     },
+    "is_ready": is_ready,
     "refresh_capabilities": refresh_capabilities,
     "get_status_summary": get_status_summary,
+    "ensure_resources": ensure_resources,
     "create_shared_resources": _create_shared_resources,
+    "on_app_context_changed": lambda res, ctx, *a, **kw: res,
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,
     "process_and_pack": _process_and_pack,

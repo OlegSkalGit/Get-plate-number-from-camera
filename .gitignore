@@ -28,6 +28,8 @@ archive/
 data/
 **/data/
 setup/
+cuda/
+**/cuda/
 config.json
 plates/
 **/plates/

@@ -11,6 +11,7 @@ try:
 except ImportError:
     cv2 = None
 
+from scripts.core.i18n import tr
 from scripts.core.module_registry import is_date_range_active
 from scripts.ui.helpers import (
     WindowGeometryTracker,
@@ -52,7 +53,7 @@ class CameraDetailWindow:
         self.archive_dir = cfg_mgr.get_camera_archive_dir(self.cam_uuid)
 
         self.win = tk.Toplevel(master)
-        self.win.title(f"{self.cam_cfg.get('name', 'Камера')} — Детальний перегляд")
+        self.win.title(tr("ui.detail.window_title", "{name} — Detail View", name=self._get_cam_display_name()))
         self.win.configure(bg="#0d0d11")
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -65,6 +66,8 @@ class CameraDetailWindow:
 
         self._last_drawn_seq = -1
         self._last_draw_ts = 0.0
+        self._last_detail_snap = None
+        self._last_main_offline = False
         self.img_main_tk = None
         self.preview_photo_tk = None
         self.screen_photo_tk = None
@@ -85,7 +88,9 @@ class CameraDetailWindow:
         self.current_item_preview_pil = None
         self.current_item_base_name = ""
         self.current_item_disp_h = 40
-        self._screen_placeholder_info = ("[Виберіть запис зі списку]", "#707080")
+        self._item_placeholder_key = ("ui.detail.ph.select_record", "[Select a record from list]")
+        self._screen_placeholder_spec = ("ui.detail.ph.select_record", "[Select a record from list]", "#707080")
+        self._screen_placeholder_info = (tr("ui.detail.ph.select_record", "[Select a record from list]"), "#707080")
         self._preview_revision = 0
         self.last_roi_crop_bgr = None
         self.current_roi_coords = None
@@ -189,6 +194,9 @@ class CameraDetailWindow:
         arch = self._get_archive_spec(mode or self.sidebar_mode)
         return str(arch.get("record_type") or "single_image")
 
+    def _get_cam_display_name(self) -> str:
+        return str((self.cam_cfg or {}).get("name") or "").strip() or tr("camera.default_single", "Camera")
+
     def _resolve_archive_text(self, arch: dict, key: str, mod_id: str, fallback: str = "") -> str:
         val = (arch or {}).get(key)
         if callable(val):
@@ -197,7 +205,9 @@ class CameraDetailWindow:
                 return str(val(mod_cfg))
             except Exception:
                 return str(fallback)
-        return str(val or fallback)
+        if val:
+            return tr(f"mod.{mod_id}.archive.{key}", str(val))
+        return str(fallback)
 
     def _pick_default_sidebar_mode(self) -> str:
         mods = (self.cam_cfg or {}).get("modules") or {}
@@ -237,15 +247,59 @@ class CameraDetailWindow:
 
         self.archive_dir = self.cfg_mgr.get_camera_archive_dir(self.cam_uuid)
         try:
-            name = self.cam_cfg.get("name", "Камера")
-            self.win.title(f"{name} — Детальний перегляд")
+            name = self._get_cam_display_name()
+            self.win.title(tr("ui.detail.window_title", "{name} — Detail View", name=name))
             self.cam_title_lbl.configure(text=f"📹 {name}")
             self._sync_module_buttons()
             if self.sidebar_visible and self.sidebar_mode:
                 arch = self._get_archive_spec(self.sidebar_mode)
                 self.side_header_lbl.configure(
-                    text=self._resolve_archive_text(arch, "sidebar_title", self.sidebar_mode, f"Архів: {self.sidebar_mode}")
+                    text=self._resolve_archive_text(
+                        arch, "sidebar_title", self.sidebar_mode,
+                        tr("ui.detail.archive_title_fmt", "Archive: {mod}", mod=self.sidebar_mode),
+                    )
                 )
+        except Exception:
+            pass
+
+    def apply_language(self):
+        if self._is_closing:
+            return
+        try:
+            name = self._get_cam_display_name()
+            self.win.title(tr("ui.detail.window_title", "{name} — Detail View", name=name))
+            self.cam_title_lbl.configure(text=f"📹 {name}")
+            self._sync_module_buttons()
+            self._sync_sort_button_text()
+            self.btn_expand_preview.configure(text=tr("ui.detail.btn_expand_preview", "❐ Window"))
+
+            if self.sidebar_mode:
+                arch = self._get_archive_spec(self.sidebar_mode)
+                self.side_header_lbl.configure(
+                    text=self._resolve_archive_text(
+                        arch, "sidebar_title", self.sidebar_mode,
+                        tr("ui.detail.archive_title_fmt", "Archive: {mod}", mod=self.sidebar_mode),
+                    )
+                )
+                self._update_preview_layout(self.sidebar_mode)
+            else:
+                self.side_header_lbl.configure(text=tr("ui.detail.archive_default", "Archive"))
+
+            if self.current_item_preview_pil is not None:
+                self._render_item_preview_image()
+            else:
+                self._clear_item_preview_by_key(*self._item_placeholder_key)
+
+            if self.current_screen_img_cv is None:
+                k, dflt, col = self._screen_placeholder_spec
+                self._set_screen_canvas_placeholder(tr(k, dflt), color=col)
+
+            self._update_status_bar_from_snapshot(self._last_detail_snap)
+            if self.img_main_tk is None:
+                self._update_main_video_placeholder()
+
+            self._update_roi_toolbar_labels()
+            self._render_current_roi_view()
         except Exception:
             pass
 
@@ -272,7 +326,10 @@ class CameraDetailWindow:
             if self.sidebar_visible and self.sidebar_mode:
                 arch = self._get_archive_spec(self.sidebar_mode)
                 self.side_header_lbl.configure(
-                    text=self._resolve_archive_text(arch, "sidebar_title", self.sidebar_mode, f"Архів: {self.sidebar_mode}")
+                    text=self._resolve_archive_text(
+                        arch, "sidebar_title", self.sidebar_mode,
+                        tr("ui.detail.archive_title_fmt", "Archive: {mod}", mod=self.sidebar_mode),
+                    )
                 )
                 self._update_preview_layout(self.sidebar_mode)
                 self.refresh_saved_list()
@@ -296,7 +353,7 @@ class CameraDetailWindow:
         self.ctrl_frame = tk.Frame(self.win, bg="#1e1e24", padx=10, pady=8)
         self.ctrl_frame.pack(fill=tk.X, side=tk.TOP)
 
-        cam_name = self.cam_cfg.get("name", "Камера")
+        cam_name = self._get_cam_display_name()
         self.cam_title_lbl = tk.Label(
             self.ctrl_frame,
             text=f"📹 {cam_name}",
@@ -317,7 +374,7 @@ class CameraDetailWindow:
 
         self.status_lbl = tk.Label(
             self.ctrl_frame,
-            text="Підключення...",
+            text=tr("ui.detail.status_connecting", "Connecting..."),
             fg="#ffcc00",
             bg="#1e1e24",
             font=("Segoe UI", 9, "bold"),
@@ -336,7 +393,7 @@ class CameraDetailWindow:
         self.side_header = tk.Frame(self.side_panel, bg="#282832", padx=10, pady=6)
         self.side_header.pack(fill=tk.X, side=tk.TOP)
         self.side_header_lbl = tk.Label(
-            self.side_header, text="Архів", fg="#00e5ff", bg="#282832",
+            self.side_header, text=tr("ui.detail.archive_default", "Archive"), fg="#00e5ff", bg="#282832",
             font=("Segoe UI", 10, "bold"), anchor=tk.W, width=1
         )
         self.side_header_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
@@ -364,7 +421,7 @@ class CameraDetailWindow:
         ).pack(side=tk.LEFT, padx=(0, 4))
 
         self.btn_sort = tk.Button(
-            self.search_frame, text="▼ Час", command=self._toggle_sort,
+            self.search_frame, text=tr("ui.detail.sort_time_desc", "▼ Time"), command=self._toggle_sort,
             bg="#333342", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=5, cursor="hand2"
         )
         self.btn_sort.pack(side=tk.RIGHT)
@@ -373,13 +430,13 @@ class CameraDetailWindow:
         self.preview_container.pack(fill=tk.X, side=tk.BOTTOM)
 
         self.preview_info_lbl = tk.Label(
-            self.preview_container, text="Знімок об'єкта:", fg="#9e9ea8", bg="#14141a",
+            self.preview_container, text=tr("ui.detail.item_preview_default", "Snapshot:"), fg="#9e9ea8", bg="#14141a",
             font=("Segoe UI", 9), anchor=tk.W, width=1
         )
         self.preview_info_lbl.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
 
         self.preview_label = tk.Label(
-            self.preview_container, bg="#1a1a22", text="[Виберіть запис зі списку]",
+            self.preview_container, bg="#1a1a22", text=tr("ui.detail.ph.select_record", "[Select a record from list]"),
             fg="#707080", font=("Segoe UI", 9), pady=8, relief=tk.SOLID, borderwidth=1
         )
         self.preview_label.pack(side=tk.TOP, fill=tk.X)
@@ -389,7 +446,7 @@ class CameraDetailWindow:
         self.screen_header_frame.pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
 
         self.btn_expand_preview = tk.Button(
-            self.screen_header_frame, text="❐ У вікні",
+            self.screen_header_frame, text=tr("ui.detail.btn_expand_preview", "❐ Window"),
             command=lambda: self._open_roi_viewer(crop_mode=False),
             bg="#2d2d3a", fg="#00e5ff", font=("Segoe UI", 8, "bold"),
             relief=tk.FLAT, padx=6, pady=1, cursor="hand2"
@@ -397,7 +454,7 @@ class CameraDetailWindow:
         self.btn_expand_preview.pack(side=tk.RIGHT)
 
         self.screen_info_lbl = tk.Label(
-            self.screen_header_frame, text="Фото скріну (кроп / 2x клік):",
+            self.screen_header_frame, text=tr("ui.detail.screen_header_photo", "Screenshot (crop / 2x click):"),
             fg="#9e9ea8", bg="#14141a", font=("Segoe UI", 9), anchor=tk.W, width=1
         )
         self.screen_info_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
@@ -481,7 +538,7 @@ class CameraDetailWindow:
         self.video_container = tk.Frame(self.main_body, bg="#0d0d11")
         self.video_container.pack(fill=tk.BOTH, expand=True)
         self.main_video_label = tk.Label(
-            self.video_container, bg="#0d0d11", text="Очікування основного потоку...",
+            self.video_container, bg="#0d0d11", text=tr("ui.detail.waiting_main", "Waiting for main stream..."),
             fg="#8c92a4", font=("Segoe UI", 12, "bold")
         )
         self.main_video_label.pack(fill=tk.BOTH, expand=True)
@@ -517,7 +574,7 @@ class CameraDetailWindow:
         self.roi_btn_max.pack(side=tk.RIGHT, padx=(0, 3))
 
         self.roi_title_lbl = tk.Label(
-            self.roi_header, text="Перегляд", fg="#00e5ff", bg="#20202c",
+            self.roi_header, text=tr("ui.detail.roi.view_title", "Preview"), fg="#00e5ff", bg="#20202c",
             font=("Segoe UI", 9, "bold"), anchor=tk.W, width=1, cursor="fleur"
         )
         self.roi_title_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
@@ -526,23 +583,23 @@ class CameraDetailWindow:
         self.roi_toolbar.pack(fill=tk.X, side=tk.TOP)
 
         self.roi_btn_prev = tk.Button(
-            self.roi_toolbar, text="◀ Назад", command=lambda: self._navigate_items(-1),
+            self.roi_toolbar, text=tr("ui.detail.roi.prev_short", "◀ Back"), command=lambda: self._navigate_items(-1),
             bg="#2e2e3c", fg="#ffffff", font=("Segoe UI", 8, "bold"), relief=tk.FLAT, padx=6, pady=2, cursor="hand2"
         )
         self.roi_btn_prev.pack(side=tk.LEFT, padx=(0, 4))
 
         self.roi_btn_next = tk.Button(
-            self.roi_toolbar, text="Далі ▶", command=lambda: self._navigate_items(1),
+            self.roi_toolbar, text=tr("ui.detail.roi.next_short", "Next ▶"), command=lambda: self._navigate_items(1),
             bg="#2e2e3c", fg="#ffffff", font=("Segoe UI", 8, "bold"), relief=tk.FLAT, padx=6, pady=2, cursor="hand2"
         )
         self.roi_btn_next.pack(side=tk.LEFT, padx=(0, 6))
 
         self.roi_btn_crop_mode = tk.Button(
-            self.roi_toolbar, text="🖼 Кадр", command=self._toggle_roi_crop_mode,
+            self.roi_toolbar, text=tr("ui.detail.roi.frame_short", "🖼 Frame"), command=self._toggle_roi_crop_mode,
             bg="#2d3b4e", fg="#00e5ff", font=("Segoe UI", 8, "bold"), relief=tk.FLAT, padx=6, pady=2, cursor="hand2"
         )
         self.roi_btn_clear_crop = tk.Button(
-            self.roi_toolbar, text="✕ Скинути", command=self._clear_roi_crop,
+            self.roi_toolbar, text=tr("ui.detail.roi.reset_short", "✕ Reset"), command=self._clear_roi_crop,
             bg="#44333a", fg="#ffaaaa", font=("Segoe UI", 8, "bold"), relief=tk.FLAT, padx=6, pady=2, cursor="hand2"
         )
 
@@ -601,10 +658,17 @@ class CameraDetailWindow:
         self.roi_resize_grip.bind(EVT_B1_MOTION, self._on_roi_resize_motion)
         self.roi_resize_grip.bind(EVT_BTN_RELEASE, self._on_roi_resize_release)
 
+    def _is_operator_mode(self) -> bool:
+        try:
+            return bool(self.cfg_mgr and self.cfg_mgr.is_operator_mode())
+        except Exception:
+            return False
+
     def _sync_module_buttons(self):
         mods = (self.cam_cfg or {}).get("modules") or {}
         entries = self._get_archive_entries()
         active_ids = {e["id"] for e in entries}
+        is_op_mode = self._is_operator_mode()
 
         for old_mid in list(self._archive_buttons.keys()):
             btn = self._archive_buttons[old_mid]
@@ -642,7 +706,10 @@ class CameraDetailWindow:
                 btn.configure(text=btn_text)
 
             is_on = bool((mods.get(mid) or {}).get("on", False))
-            if is_on or self._has_archive_files(mid):
+            is_writer = (spec.get("kind") == "recorder") or bool(spec.get("writes_to_disk"))
+            has_files = self._has_archive_files(mid)
+            show_btn = has_files if (is_op_mode and is_writer) else (is_on or has_files)
+            if show_btn:
                 btn.pack(side=tk.LEFT, padx=3, before=self.status_lbl)
                 if self.sidebar_visible and self.sidebar_mode == mid:
                     btn.configure(bg="#007acc")
@@ -757,6 +824,58 @@ class CameraDetailWindow:
     # ------------------------------------------------------------------
     # Потік рендеру живого основного потоку
     # ------------------------------------------------------------------
+    def _update_status_bar_from_snapshot(self, snap: dict = None):
+        if snap is None:
+            if not hasattr(self, "status_lbl"):
+                return
+            self.status_lbl.configure(
+                text=tr("ui.detail.status_connecting", "Connecting..."),
+                fg="#ffcc00",
+            )
+            return
+        st = snap.get("main_status", "standby")
+        fps = float(snap.get("fps", 0.0))
+        rec_on = bool(snap.get("recording", False))
+        rec_enc = str(snap.get("encoder", "") or "")
+        op_mode = (snap.get("operation_mode") == "operator") or self._is_operator_mode()
+
+        rec_tag = (
+            f"● REC ({rec_enc})"
+            if rec_on else
+            (
+                tr("ui.detail.rec.operator", "👤 Operator (no recording)")
+                if op_mode else
+                tr("ui.detail.rec.off", "Recording off")
+            )
+        )
+        if st == "active":
+            st_txt = tr("ui.detail.status.active", "{rec_tag}  |  Main stream: {fps:.1f} fps", rec_tag=rec_tag, fps=fps)
+            st_col = "#75e08b" if rec_on else ("#ffcc00" if op_mode else "#00e5ff")
+        elif st in ("connecting", "reconnecting"):
+            st_txt = tr("ui.detail.status.reconnecting", "{rec_tag}  |  Reconnecting stream...", rec_tag=rec_tag)
+            st_col = "#ffcc00"
+        elif st == "offline":
+            st_txt = tr("ui.detail.status.offline", "{rec_tag}  |  Stream unavailable", rec_tag=rec_tag)
+            st_col = "#ff5555"
+        else:
+            st_txt = tr("ui.detail.status.init", "{rec_tag}  |  Initializing...", rec_tag=rec_tag)
+            st_col = "#ffcc00"
+
+        self.status_lbl.configure(text=st_txt, fg=st_col)
+
+    def _update_main_video_placeholder(self):
+        if self.img_main_tk is not None or not hasattr(self, "main_video_label"):
+            return
+        if self._last_main_offline:
+            msg = (
+                tr("ui.detail.err.no_cv2", "OpenCV (cv2) is not installed")
+                if cv2 is None else
+                tr("ui.detail.err.no_signal_main", "No signal from main stream...\nWaiting for reconnection")
+            )
+        else:
+            msg = tr("ui.detail.waiting_main", "Waiting for main stream...")
+        self.main_video_label.configure(image="", text=msg)
+
     def _render_tick(self):
         if self._is_closing:
             return
@@ -766,42 +885,23 @@ class CameraDetailWindow:
         try:
             if self.camera_unit is not None:
                 snap = self.camera_unit.get_detail_snapshot()
+                self._last_detail_snap = snap
+                self._update_status_bar_from_snapshot(snap)
+
                 st = snap.get("main_status", "standby")
-                fps = float(snap.get("fps", 0.0))
-                rec_on = bool(snap.get("recording", False))
-                rec_enc = str(snap.get("encoder", "") or "")
-
-                rec_tag = f"● REC ({rec_enc})" if rec_on else "Запис вимк."
-                if st == "active":
-                    st_txt = f"{rec_tag}  |  Основний потік: {fps:.1f} к/с"
-                    st_col = "#75e08b" if rec_on else "#00e5ff"
-                elif st in ("connecting", "reconnecting"):
-                    st_txt = f"{rec_tag}  |  Перепідключення потоку..."
-                    st_col = "#ffcc00"
-                elif st == "offline":
-                    st_txt = f"{rec_tag}  |  Потік недоступний"
-                    st_col = "#ff5555"
-                else:
-                    st_txt = f"{rec_tag}  |  Ініціалізація..."
-                    st_col = "#ffcc00"
-
-                self.status_lbl.configure(text=st_txt, fg=st_col)
-
                 frame_ref = snap.get("frame")
                 seq = int(snap.get("seq", 0))
                 now = time.time()
                 if frame_ref is not None and (seq != self._last_drawn_seq or (now - self._last_draw_ts) >= 0.25):
                     self._last_drawn_seq = seq
                     self._last_draw_ts = now
+                    self._last_main_offline = False
                     frame = frame_ref.copy()
                     self._draw_overlays_and_present(frame, snap.get("overlay") or {}, now)
                 elif frame_ref is None and st in ("offline", "reconnecting"):
-                    msg = (
-                        "OpenCV (cv2) не встановлено"
-                        if cv2 is None else
-                        "Немає сигналу від основного потоку...\nОчікування перепідключення"
-                    )
-                    self.main_video_label.configure(image="", text=msg)
+                    self.img_main_tk = None
+                    self._last_main_offline = True
+                    self._update_main_video_placeholder()
         except Exception as e:
             print(f"[DetailWindow render error]: {e}")
 
@@ -1262,22 +1362,45 @@ class CameraDetailWindow:
                 self.preview_label.pack(side=tk.TOP, fill=tk.X, before=self.screen_header_frame)
 
         if rtype == "video":
-            self.screen_info_lbl.configure(text="Відеоперегляд (кроп / 2x клік):")
+            self.screen_info_lbl.configure(text=tr("ui.detail.screen_header_video", "Video preview (crop / 2x click):"))
             if str(self.video_controls_frame.winfo_manager()) != "pack":
                 self.video_controls_frame.pack(side=tk.TOP, fill=tk.X, pady=(4, 0), after=self.screen_canvas)
         else:
             self.video_controls_frame.pack_forget()
-            self.screen_info_lbl.configure(text="Фото скріну (кроп / 2x клік):")
+            self.screen_info_lbl.configure(text=tr("ui.detail.screen_header_photo", "Screenshot (crop / 2x click):"))
 
-    def _clear_item_preview(self, placeholder="[Виберіть запис зі списку]"):
+    def _clear_item_preview_by_key(self, key: str, default_text: str):
+        self._item_placeholder_key = (key, default_text)
         self.current_item_preview_pil = None
         self.current_item_base_name = ""
         self.preview_photo_tk = None
-        self.preview_info_lbl.configure(text="Знімок об'єкта:")
+        arch = self._get_archive_spec(self.sidebar_mode)
+        lbl_type = self._resolve_archive_text(
+            arch, "item_preview_label", self.sidebar_mode,
+            tr("ui.detail.item_preview_default", "Snapshot:")
+        )
+        self.preview_info_lbl.configure(text=lbl_type)
+        self.preview_label.configure(image="", text=tr(key, default_text), pady=8)
+        self.current_item_disp_h = 38
+
+    def _clear_item_preview(self, placeholder=None):
+        if placeholder is None:
+            self._clear_item_preview_by_key("ui.detail.ph.select_record", "[Select a record from list]")
+            return
+        self.current_item_preview_pil = None
+        self.current_item_base_name = ""
+        self.preview_photo_tk = None
+        self.preview_info_lbl.configure(text=tr("ui.detail.item_preview_default", "Snapshot:"))
         self.preview_label.configure(image="", text=placeholder, pady=8)
         self.current_item_disp_h = 38
 
-    def _set_screen_canvas_placeholder(self, text="[Виберіть запис зі списку]", color="#707080"):
+    def _set_screen_canvas_placeholder_key(self, key: str, default_text: str, color: str = "#707080"):
+        self._screen_placeholder_spec = (key, default_text, color)
+        self._set_screen_canvas_placeholder(tr(key, default_text), color=color)
+
+    def _set_screen_canvas_placeholder(self, text=None, color="#707080"):
+        if text is None:
+            text = tr("ui.detail.ph.select_record", "[Select a record from list]")
         self._screen_placeholder_info = (text, color)
         self.screen_canvas.delete("all")
         self.screen_canvas_img_id = None
@@ -1301,9 +1424,9 @@ class CameraDetailWindow:
 
     def _clear_screen_preview(self, clear_item=True):
         if clear_item:
-            self._clear_item_preview()
+            self._clear_item_preview_by_key("ui.detail.ph.select_record", "[Select a record from list]")
         self.current_preview_fpath = None
-        self._set_screen_canvas_placeholder("[Виберіть запис зі списку]", color="#707080")
+        self._set_screen_canvas_placeholder_key("ui.detail.ph.select_record", "[Select a record from list]", color="#707080")
 
     def toggle_side_panel(self, mode=None):
         mode = mode or self.sidebar_mode or self._pick_default_sidebar_mode()
@@ -1329,7 +1452,10 @@ class CameraDetailWindow:
             self._sync_module_buttons()
 
             arch = self._get_archive_spec(mode)
-            header_title = self._resolve_archive_text(arch, "sidebar_title", mode, f"Архів: {mode}")
+            header_title = self._resolve_archive_text(
+                arch, "sidebar_title", mode,
+                tr("ui.detail.archive_title_fmt", "Archive: {mod}", mod=mode),
+            )
             self.side_header_lbl.configure(text=header_title)
 
             self._update_preview_layout(mode)
@@ -1343,14 +1469,17 @@ class CameraDetailWindow:
             self.refresh_saved_list()
             self._relayout_sidebar_previews(force=True)
 
+    def _sync_sort_button_text(self):
+        if self.sort_mode == 0:
+            self.btn_sort.configure(text=tr("ui.detail.sort_time_desc", "▼ Time"))
+        elif self.sort_mode == 1:
+            self.btn_sort.configure(text=tr("ui.detail.sort_time_asc", "▲ Time"))
+        else:
+            self.btn_sort.configure(text=tr("ui.detail.sort_name", "🔤 Name"))
+
     def _toggle_sort(self):
         self.sort_mode = (self.sort_mode + 1) % 3
-        if self.sort_mode == 0:
-            self.btn_sort.configure(text="▼ Час")
-        elif self.sort_mode == 1:
-            self.btn_sort.configure(text="▲ Час")
-        else:
-            self.btn_sort.configure(text="🔤 Назва")
+        self._sync_sort_button_text()
         self._apply_search_and_sort()
 
     def refresh_saved_list(self):
@@ -1470,7 +1599,7 @@ class CameraDetailWindow:
 
     def _show_item_in_preview(self, fpath):
         if not fpath or not os.path.exists(fpath):
-            self._clear_item_preview("[Знімок відсутній]")
+            self._clear_item_preview_by_key("ui.detail.ph.item_missing", "[Snapshot missing]")
             return
         try:
             with Image.open(fpath) as pil_src:
@@ -1479,7 +1608,7 @@ class CameraDetailWindow:
             self.current_item_base_name = os.path.splitext(os.path.basename(fpath))[0]
             self._render_item_preview_image()
         except Exception:
-            self._clear_item_preview("[Помилка читання знімка]")
+            self._clear_item_preview_by_key("ui.detail.ph.item_read_err", "[Error reading snapshot]")
 
     def _render_item_preview_image(self):
         if self.current_item_preview_pil is None:
@@ -1496,7 +1625,10 @@ class CameraDetailWindow:
         self.current_item_disp_h = target_h
 
         arch = self._get_archive_spec(self.sidebar_mode)
-        lbl_type = str(arch.get("item_preview_label") or "Знімок:")
+        lbl_type = self._resolve_archive_text(
+            arch, "item_preview_label", self.sidebar_mode,
+            tr("ui.detail.item_preview_default", "Snapshot:"),
+        )
         self.preview_info_lbl.configure(text=f"{lbl_type} {self.current_item_base_name}")
         self.preview_label.configure(image=self.preview_photo_tk, text="", pady=0)
 
@@ -1605,7 +1737,7 @@ class CameraDetailWindow:
 
     def _show_screenshot_in_canvas(self, screen_path):
         if not screen_path or not os.path.exists(screen_path):
-            self._set_screen_canvas_placeholder("[Скріншот відсутній]", color="#707080")
+            self._set_screen_canvas_placeholder_key("ui.detail.ph.screen_missing", "[Screenshot missing]", color="#707080")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
@@ -1620,7 +1752,7 @@ class CameraDetailWindow:
                     cv_img = rgb_arr[:, :, ::-1].copy()
 
             if cv_img is None:
-                self._set_screen_canvas_placeholder("[Помилка читання скріншоту]", color="#ff5555")
+                self._set_screen_canvas_placeholder_key("ui.detail.ph.screen_read_err", "[Error reading screenshot]", color="#ff5555")
                 return
             is_open = bool(self.roi_visible or self.roi_panel.winfo_ismapped())
             keep = bool(is_open and self.current_roi_coords is not None)
@@ -1696,18 +1828,18 @@ class CameraDetailWindow:
     def _load_archive_video(self, fpath, auto_play=True):
         self._stop_archive_player()
         if not fpath or not os.path.exists(fpath):
-            self._set_screen_canvas_placeholder("[Відеофайл відсутній]", color="#707080")
+            self._set_screen_canvas_placeholder_key("ui.detail.ph.video_missing", "[Video file missing]", color="#707080")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
             return
 
         if cv2 is None:
-            self._set_screen_canvas_placeholder("[OpenCV не встановлено]", color="#ff5555")
+            self._set_screen_canvas_placeholder_key("ui.detail.ph.no_cv2", "[OpenCV not installed]", color="#ff5555")
             return
 
         if self.camera_unit and self.camera_unit.is_archive_file_busy(self.sidebar_mode, fpath):
-            self._set_screen_canvas_placeholder("[Файл ще записується...]", color="#ffcc00")
+            self._set_screen_canvas_placeholder_key("ui.detail.ph.video_recording", "[File is still recording...]", color="#ffcc00")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
@@ -1715,7 +1847,7 @@ class CameraDetailWindow:
 
         cap = cv2.VideoCapture(fpath)
         if not cap.isOpened():
-            self._set_screen_canvas_placeholder("[Не вдалося відкрити відео]", color="#ff5555")
+            self._set_screen_canvas_placeholder_key("ui.detail.ph.video_open_err", "[Failed to open video]", color="#ff5555")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
@@ -2000,13 +2132,23 @@ class CameraDetailWindow:
     def _update_roi_toolbar_labels(self, panel_width=None):
         w = int(panel_width) if panel_width is not None else max(self.roi_user_width, int(self.roi_panel.winfo_width() or 0))
         wide = (w >= 460) or self.roi_maximized
-        self.roi_btn_prev.configure(text="◀ Попередній" if wide else "◀ Назад")
-        self.roi_btn_next.configure(text="Наступний ▶" if wide else "Далі ▶")
-        self.roi_btn_clear_crop.configure(text="✕ Скинути кроп" if wide else "✕ Скинути")
+        self.roi_btn_prev.configure(
+            text=tr("ui.detail.roi.prev_wide", "◀ Previous") if wide else tr("ui.detail.roi.prev_short", "◀ Back")
+        )
+        self.roi_btn_next.configure(
+            text=tr("ui.detail.roi.next_wide", "Next ▶") if wide else tr("ui.detail.roi.next_short", "Next ▶")
+        )
+        self.roi_btn_clear_crop.configure(
+            text=tr("ui.detail.roi.reset_wide", "✕ Reset crop") if wide else tr("ui.detail.roi.reset_short", "✕ Reset")
+        )
         if self.roi_crop_mode:
-            self.roi_btn_crop_mode.configure(text="🖼 Повний кадр" if wide else "🖼 Кадр")
+            self.roi_btn_crop_mode.configure(
+                text=tr("ui.detail.roi.frame_wide", "🖼 Full frame") if wide else tr("ui.detail.roi.frame_short", "🖼 Frame")
+            )
         else:
-            self.roi_btn_crop_mode.configure(text="🔍 Показати кроп" if wide else "🔍 Кроп")
+            self.roi_btn_crop_mode.configure(
+                text=tr("ui.detail.roi.crop_wide", "🔍 Show crop") if wide else tr("ui.detail.roi.crop_short", "🔍 Crop")
+            )
 
     def _sync_roi_controls_visibility(self):
         has_crop = self.current_roi_coords is not None
@@ -2061,8 +2203,12 @@ class CameraDetailWindow:
         if self.current_screen_img_cv is None:
             self.roi_canvas.delete("all")
             self.roi_canvas_img_id = None
-            self.roi_canvas.create_text(cw // 2, ch // 2, text="[Немає зображення]", fill="#707080", font=("Segoe UI", 11), tags="placeholder")
-            self.roi_title_lbl.configure(text="Перегляд")
+            self.roi_canvas.create_text(
+                cw // 2, ch // 2,
+                text=tr("ui.detail.roi.no_image", "[No image]"),
+                fill="#707080", font=("Segoe UI", 11), tags="placeholder",
+            )
+            self.roi_title_lbl.configure(text=tr("ui.detail.roi.view_title", "Preview"))
             return
 
         is_crop = False
@@ -2128,7 +2274,11 @@ class CameraDetailWindow:
             self.roi_canvas.tag_raise("roi_drag")
 
         fname = os.path.basename(self.current_preview_fpath) if self.current_preview_fpath else ""
-        tag = f"Кроп ({orig_w}x{orig_h})" if is_crop else f"Повний кадр ({orig_w}x{orig_h})"
+        tag = (
+            tr("ui.detail.roi.tag_crop", "Crop ({w}x{h})", w=orig_w, h=orig_h)
+            if is_crop else
+            tr("ui.detail.roi.tag_frame", "Full frame ({w}x{h})", w=orig_w, h=orig_h)
+        )
         title_txt = f"{fname} — {tag}" if fname else tag
         if self.roi_title_lbl.cget("text") != title_txt:
             self.roi_title_lbl.configure(text=title_txt)

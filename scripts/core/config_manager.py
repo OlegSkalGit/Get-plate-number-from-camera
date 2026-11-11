@@ -6,6 +6,8 @@ import shutil
 import threading
 import configparser
 
+from scripts.core.i18n import tr, normalize_language_code, DEFAULT_LANGUAGE
+
 
 def make_default_camera_modules(registry=None) -> dict:
     """Формує типові налаштування модулів камери динамічно з ModuleRegistry."""
@@ -15,7 +17,7 @@ def make_default_camera_modules(registry=None) -> dict:
 
 
 def make_camera_entry(
-    name="Камера 1",
+    name=None,
     main_source="0",
     sub_source="",
     enabled=True,
@@ -28,9 +30,13 @@ def make_camera_entry(
     else:
         mods = make_default_camera_modules(registry=registry)
 
+    default_name = tr("camera.default_numbered", "Camera {num}", num=1) if name is None else str(name or "").strip()
+    if not default_name:
+        default_name = tr("camera.default_single", "Camera")
+
     return {
         "uuid": str(cam_uuid or uuid.uuid4()),
-        "name": str(name or "Камера"),
+        "name": default_name,
         "enabled": bool(enabled),
         "main_source": str(main_source or "").strip(),
         "sub_source": str(sub_source or "").strip(),
@@ -65,89 +71,99 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 SETTINGS_HELP = {
-    # Загальні
+    # General
+    "general.language": (
+        "Interface Language\n"
+        "Selects the application language loaded from JSON files in the lang/ folder (<code>.json).\n"
+        "Default on first launch is English (en). You can also switch language from the top bar in the main window."
+    ),
+    "general.operation_mode": (
+        "System Operation Mode\n"
+        "• server (Server Mode) — all options, archive, video recording, saving plate/face/people snapshots, face DB updates, and auto-cleanup are enabled.\n"
+        "• operator (Operator Mode) — full live viewing and on-screen AI analysis (plates, recognizing already known faces, people/vehicles) WITHOUT any disk writes (recording, screenshots, auto-registering faces, cleanup, and window position auto-save are disabled)."
+    ),
     "general.archive_root": (
-        "Коренева папка архіву\n"
-        "Шлях на диску (рекомендовано місткий або швидкий диск для відеоархіву), "
-        "куди зберігаються підпапки камер (<UUID>/<модуль>) та спільна база облич (faces_db/faces.txt)."
+        "Archive Root Folder\n"
+        "Disk directory (a spacious or fast drive is recommended for the video archive) "
+        "where per-camera folders (<UUID>/<module>) and the shared faces database (faces_db/faces.txt) are stored."
     ),
     "general.autostart_os_and_play": (
-        "Автозапуск із Windows та автоматичний старт моніторингу\n"
-        "Додає програму в автозавантаження поточного користувача Windows (HKCU\\...\\Run) "
-        "та автоматично запускає опитування усіх увімкнених камер після старту."
+        "Windows Autostart & Automatic Monitoring\n"
+        "Adds the application to the current Windows user's startup (HKCU\\...\\Run) "
+        "and automatically starts polling all enabled cameras on launch."
     ),
     "general.kiosk_mode": (
-        "Режим кіоску (блокування виходу)\n"
-        "Коли увімкнено: блокує Alt+F4 / Esc / хрестик вікна в головному вікні; вихід можливий лише комбінацією Ctrl+Alt+Shift+Q.\n"
-        "Коли вимкнено (типово): усі вікна можна вільно перетягувати на інші монітори, змінювати розмір та закривати стандартно."
+        "Kiosk Mode (Lock Exit)\n"
+        "When enabled: blocks Alt+F4 / Esc / close button on the main window; exit is only possible with Ctrl+Alt+Shift+Q.\n"
+        "When disabled (default): all windows can be freely moved across monitors, resized, and closed normally."
     ),
 
-    # Сітка
+    # Grid
     "grid.mode": (
-        "Режим сітки камер\n"
-        "• auto — автоматично підбирає кількість рядків і колонок під число активних камер і пропорції вікна (1x1, 2x1, 2x2, 3x2, 3x3 тощо).\n"
-        "• manual — фіксована сітка (Рядки × Колонки). Якщо камер більше, з'являється перемикач сторінок ◀ / ▶."
+        "Camera Grid Mode\n"
+        "• auto — automatically calculates rows and columns for the active cameras and window aspect ratio (1x1, 2x1, 2x2, 3x2, 3x3, etc.).\n"
+        "• manual — fixed grid (Rows × Columns). If there are more cameras than slots, a ◀ / ▶ page switcher appears."
     ),
-    "grid.rows": "Кількість рядків у ручному режимі сітки (1–8).",
-    "grid.cols": "Кількість колонок у ручному режимі сітки (1–8).",
-    "grid.border_color": "Базовий колір рамки кожної плитки камери у сітці (HEX, наприклад #00e5ff).",
-    "grid.active_border_color": "Колір рамки тієї камери, для якої зараз відкрите вікно повного перегляду (наприклад #00ff88).",
-    "grid.offline_border_color": "Колір рамки плитки, коли втрачено зв'язок із потоком камери (наприклад #ff4444).",
-    "grid.border_width": "Товщина рамки плиток у пікселях (1–10 px).",
-    "grid.tile_gap": "Проміжок між плитками камер у сітці в пікселях (0–20 px).",
-    "grid.show_labels": "Показувати назву/опис камери у верхньому лівому куті плитки сітки.",
-    "grid.show_status": "Показувати індикатори стану на плитці: ● REC (запис), активні модулі та статус підключення.",
-    "grid.show_fps": "Показувати поточний FPS субпотоку на плитці в сітці.",
+    "grid.rows": "Number of rows in manual grid mode (1–8).",
+    "grid.cols": "Number of columns in manual grid mode (1–8).",
+    "grid.border_color": "Default border color of each camera tile in the grid (HEX, e.g. #00e5ff).",
+    "grid.active_border_color": "Border color of the camera tile currently open in a detailed view window (e.g. #00ff88).",
+    "grid.offline_border_color": "Border color of a tile when connection to the camera stream is lost (e.g. #ff4444).",
+    "grid.border_width": "Tile border thickness in pixels (1–10 px).",
+    "grid.tile_gap": "Spacing between camera tiles in the grid in pixels (0–20 px).",
+    "grid.show_labels": "Show the camera name/description in the top-left corner of each grid tile.",
+    "grid.show_status": "Show status badges on each tile: ● REC (recording), active modules, and connection state.",
+    "grid.show_fps": "Show current sub-stream FPS on each tile in the grid.",
 
-    # Залізо та графіка
+    # Hardware & Graphics
     "hardware.ai_backend": (
-        "Процесор/прискорювач нейромереж (ONNX Runtime)\n"
-        "• cpu — максимальна сумісність на будь-якому ПК (використовується за замовчуванням).\n"
-        "• auto — автоматично обирає найшвидший доступний прискорювач (CUDA -> DirectML -> OpenVINO -> CPU).\n"
-        "• cuda — NVIDIA CUDA GPU (найвища швидкість на картах GeForce/RTX; потребує пакет onnxruntime-gpu і CUDA/cuDNN).\n"
-        "• directml — DirectX 12 GPU (працює на NVIDIA, AMD та Intel без встановлення CUDA Toolkit; потребує пакет onnxruntime-directml).\n"
-        "• openvino — прискорення на процесорах та інтегрованій графіці Intel."
+        "Neural Network Accelerator (ONNX Runtime)\n"
+        "• cpu — maximum compatibility on any PC (default).\n"
+        "• auto — automatically picks the fastest available accelerator (CUDA -> DirectML -> OpenVINO -> CPU).\n"
+        "• cuda — NVIDIA CUDA GPU (highest speed on GeForce/RTX cards; requires onnxruntime-gpu and CUDA/cuDNN).\n"
+        "• directml — DirectX 12 GPU (works on NVIDIA, AMD, and Intel without CUDA Toolkit; requires onnxruntime-directml).\n"
+        "• openvino — acceleration on Intel CPUs and integrated graphics."
     ),
     "hardware.ai_threads": (
-        "Кількість потоків на ONNX-сесію та AI-воркерів (1–8)\n"
-        "Для GPU зазвичай вистачає 1–2 воркери. Для CPU збільшуйте обережно, залишаючи ядра під декодування, кодування відео та інтерфейс."
+        "Threads per ONNX Session & AI Workers (1–8)\n"
+        "1–2 workers are usually enough for GPU. For CPU, increase cautiously while leaving cores for decoding, video encoding, and UI."
     ),
     "hardware.ai_max_fps_per_cam": (
-        "Макс. частота AI-аналізу на 1 камеру (кадр/сек, 1–30)\n"
-        "Обмежує, скільки разів за секунду кожна камера відправляє кадр у нейромережі. Значення 6–10 к/с на камеру "
-        "повністю достатньо для впевненого читання номерів і облич, при цьому економить 60–80% ресурсів CPU/GPU при кількох камерах."
+        "Max AI Analysis Rate per Camera (FPS, 1–30)\n"
+        "Limits how many times per second each camera sends frames to neural networks. 6–10 FPS per camera "
+        "is enough for reliable plate and face recognition while saving 60–80% CPU/GPU resources with multiple cameras."
     ),
     "hardware.video_decode_mode": (
-        "Спосіб декодування вхідних потоків\n"
-        "• cpu — стандартний OpenCV VideoCapture (найстабільніше для вебкамер і файлів).\n"
-        "• auto / d3d11va / cuda / qsv — апаратне декодування FFmpeg GPU для мережевих RTSP/HTTP потоків (з автоматичним fallback на CPU, якщо камера або драйвер не підтримує)."
+        "Input Stream Decoding Mode\n"
+        "• cpu — standard OpenCV VideoCapture (most reliable for webcams and local files).\n"
+        "• auto / d3d11va / cuda / qsv — FFmpeg GPU hardware decoding for RTSP/HTTP network streams (with automatic CPU fallback if unsupported)."
     ),
-    "hardware.display_grid_fps": "Макс. частота оновлення плиток у сітці (3–30 FPS). Значення 10–15 FPS різко знижує навантаження на UI та CPU на 8–16 камерах.",
-    "hardware.display_detail_fps": "Макс. частота оновлення у вікні повного перегляду обраної камери (5–60 FPS).",
+    "hardware.display_grid_fps": "Max refresh rate for grid tiles (3–30 FPS). Using 10–15 FPS drastically lowers UI and CPU load with 8–16 cameras.",
+    "hardware.display_detail_fps": "Max refresh rate in the detailed view window of a selected camera (5–60 FPS).",
     "hardware.display_resize_method": (
-        "Алгоритм масштабування кадрів для відображення\n"
-        "• nearest — найшвидший (мінімум CPU);\n"
-        "• linear — оптимальний баланс якості й швидкості;\n"
-        "• lanczos — найвища чіткість для дрібних деталей (вище навантаження CPU)."
+        "Frame Scaling Algorithm for Display\n"
+        "• nearest — fastest (lowest CPU usage);\n"
+        "• linear — optimal balance of quality and speed;\n"
+        "• lanczos — sharpest fine details (higher CPU usage)."
     ),
     "hardware.use_opencv_opencl": (
         "OpenCV OpenCL (Transparent API / UMat)\n"
-        "Дозволяє прискорювати ресайз/обробку кадрів у OpenCV засобами GPU (якщо драйвер OpenCL доступний і стабільний)."
+        "Enables GPU-accelerated frame resizing and image processing in OpenCV when an OpenCL driver is available and stable."
     ),
 
-    # Камера
-    "camera.uuid": "Унікальний ідентифікатор камери (UUID v4). Генерується автоматично при створенні й прив'язує папку архіву — можна міняти назву камери без втрати історії.",
-    "camera.name": "Зручний опис камери (наприклад: 'В'їзд КПП', 'Склад північ'). Використовується у сітці, заголовку вікна та пошуку.",
-    "camera.enabled": "Увімкнути чи повністю вимкнути цю камеру (вимкнена камера не підключається до потоку і не займає слот у сітці).",
+    # Camera
+    "camera.uuid": "Unique camera identifier (UUID v4). Generated automatically on creation and binds the archive folder so you can rename the camera without losing history.",
+    "camera.name": "Friendly camera name (e.g., 'Gate Entrance', 'North Warehouse'). Used in the grid, window title, and search.",
+    "camera.enabled": "Enable or completely disable this camera (disabled cameras do not connect to streams and do not take a grid slot).",
     "camera.main_source": (
-        "Основний потік (висока якість)\n"
-        "Завжди використовується для відеозапису, AI-розпізнавання та у вікні повного перегляду. "
-        "Може бути: rtsp://логін:пароль@ip:554/stream1, http://..., індекс вебкамери (0, 1) або локальний .mp4 файл."
+        "Main Stream (High Quality)\n"
+        "Always used for video recording, AI recognition, and detailed view. "
+        "Accepts: rtsp://user:pass@ip:554/stream1, http://..., webcam index (0, 1), or local .mp4 file."
     ),
     "camera.sub_source": (
-        "Стиснутий субпотік (низька роздільність для сітки)\n"
-        "Відображається ТІЛЬКИ в плитці загальної сітки (наприклад rtsp://.../stream2 або channel=1&subtype=1), щоб не декодувати 4K/FullHD для десятків мініатюр. "
-        "Якщо залишити порожнім (для вебкамери 0 або локального файлу), сітка автоматично масштабує кадр з основного потоку."
+        "Compressed Sub-Stream (Low Resolution for Grid)\n"
+        "Displayed ONLY in the main grid tiles (e.g., rtsp://.../stream2 or channel=1&subtype=1) to avoid decoding 4K/FullHD for dozens of thumbnails. "
+        "If left empty (e.g., webcam 0 or local file), the grid automatically scales frames from the main stream."
     ),
 }
 
@@ -171,6 +187,8 @@ class ConfigManager:
         return {
             "version": 2,
             "general": {
+                "language": DEFAULT_LANGUAGE,
+                "operation_mode": "server",
                 "archive_root": os.path.join(self.base_dir, "archive"),
                 "autostart_os_and_play": False,
                 "kiosk_mode": False,
@@ -212,13 +230,13 @@ class ConfigManager:
         reg_mods = self._get_registry_default_modules()
         parser = configparser.ConfigParser(interpolation=None)
         if not os.path.exists(self.legacy_ini_path):
-            cfg["cameras"] = [make_camera_entry(name="Камера 1", main_source="0", sub_source="", modules=reg_mods)]
+            cfg["cameras"] = [make_camera_entry(name="Camera 1", main_source="0", sub_source="", modules=reg_mods)]
             return cfg
 
         try:
             parser.read(self.legacy_ini_path, encoding="utf-8-sig")
         except Exception:
-            cfg["cameras"] = [make_camera_entry(name="Камера 1", main_source="0", sub_source="", modules=reg_mods)]
+            cfg["cameras"] = [make_camera_entry(name="Camera 1", main_source="0", sub_source="", modules=reg_mods)]
             return cfg
 
         def _g_bool(key, default):
@@ -316,7 +334,7 @@ class ConfigManager:
         })
 
         cam = make_camera_entry(
-            name="Камера 1",
+            name="Camera 1",
             main_source=_g_str("source", "0"),
             sub_source="",
             enabled=True,
@@ -347,8 +365,13 @@ class ConfigManager:
         defaults = self._make_defaults()
         reg_mods = self._get_registry_default_modules()
         cfg = _deep_merge(defaults, raw)
-        if not cfg.get("general", {}).get("archive_root"):
-            cfg["general"]["archive_root"] = defaults["general"]["archive_root"]
+        gen = cfg.setdefault("general", {})
+        raw_lang = normalize_language_code(gen.get("language")) or DEFAULT_LANGUAGE
+        gen["language"] = raw_lang
+        raw_mode = str(gen.get("operation_mode", "server") or "server").strip().lower()
+        gen["operation_mode"] = "operator" if raw_mode == "operator" else "server"
+        if not gen.get("archive_root"):
+            gen["archive_root"] = defaults["general"]["archive_root"]
 
         # default_camera_modules: зливаємо схеми активних модулів і зберігаємо невідомі/тимчасово вимкнені
         raw_tpl_mods = (raw or {}).get("default_camera_modules") or {}
@@ -369,7 +392,7 @@ class ConfigManager:
             merged_mods = _deep_merge(reg_mods, raw_mods)
 
             base_cam = make_camera_entry(
-                name=c.get("name") or f"Камера {idx + 1}",
+                name=c.get("name") or f"Camera {idx + 1}",
                 main_source=c.get("main_source", ""),
                 sub_source=c.get("sub_source", ""),
                 enabled=c.get("enabled", True),
@@ -381,7 +404,7 @@ class ConfigManager:
             norm_cams.append(base_cam)
 
         if not norm_cams:
-            norm_cams = [make_camera_entry(name="Камера 1", main_source="0", sub_source="", modules=reg_mods)]
+            norm_cams = [make_camera_entry(name="Camera 1", main_source="0", sub_source="", modules=reg_mods)]
         cfg["cameras"] = norm_cams
         return cfg
 
@@ -398,7 +421,8 @@ class ConfigManager:
             after = json.dumps(norm, sort_keys=True, ensure_ascii=False)
             if after != before:
                 self.data = norm
-                self._save_dict_atomic(norm)
+                if not self._is_operator_mode_locked():
+                    self._save_dict_atomic(norm)
                 return True
             return False
 
@@ -441,14 +465,47 @@ class ConfigManager:
         with self._lock:
             self._save_dict_atomic(self.data)
 
+    def get_language(self) -> str:
+        with self._lock:
+            raw = (self.data.get("general") or {}).get("language", DEFAULT_LANGUAGE)
+            return normalize_language_code(raw) or DEFAULT_LANGUAGE
+
+    def set_language(self, lang_code: str) -> str:
+        norm = normalize_language_code(lang_code) or DEFAULT_LANGUAGE
+        with self._lock:
+            self.data.setdefault("general", {})["language"] = norm
+            self._save_dict_atomic(self.data)
+        return norm
+
+    def _is_operator_mode_locked(self) -> bool:
+        raw_mode = str((self.data.get("general") or {}).get("operation_mode", "server") or "server").strip().lower()
+        return raw_mode == "operator"
+
+    def get_operation_mode(self) -> str:
+        with self._lock:
+            return "operator" if self._is_operator_mode_locked() else "server"
+
+    def is_operator_mode(self) -> bool:
+        return self.get_operation_mode() == "operator"
+
+    def is_server_mode(self) -> bool:
+        return self.get_operation_mode() == "server"
+
     def get_archive_root(self) -> str:
         with self._lock:
             root = self.data.get("general", {}).get("archive_root") or os.path.join(self.base_dir, "archive")
             return os.path.abspath(root)
 
-    def get_faces_db_path(self) -> str:
-        db_dir = os.path.join(self.get_archive_root(), "faces_db")
-        os.makedirs(db_dir, exist_ok=True)
+    def get_faces_db_path(self, create: bool = None) -> str:
+        with self._lock:
+            root = self.data.get("general", {}).get("archive_root") or os.path.join(self.base_dir, "archive")
+            if create is None:
+                should_create = not self._is_operator_mode_locked()
+            else:
+                should_create = bool(create)
+        db_dir = os.path.join(os.path.abspath(root), "faces_db")
+        if should_create:
+            os.makedirs(db_dir, exist_ok=True)
         return os.path.join(db_dir, "faces.txt")
 
     def get_camera_archive_dir(self, cam_uuid: str) -> str:
@@ -471,6 +528,8 @@ class ConfigManager:
 
     def set_window_geometry(self, win_key: str, geom: dict):
         with self._lock:
+            if self._is_operator_mode_locked():
+                return
             self.data.setdefault("windows", {})[win_key] = copy.deepcopy(geom)
             self._save_dict_atomic(self.data)
 
@@ -483,6 +542,8 @@ class ConfigManager:
 
     def set_camera_window_geometry(self, cam_uuid: str, kind: str, geom: dict):
         with self._lock:
+            if self._is_operator_mode_locked():
+                return
             for c in self.data.get("cameras", []):
                 if c.get("uuid") == cam_uuid:
                     c[kind] = copy.deepcopy(geom)
@@ -502,10 +563,12 @@ class ConfigManager:
 
     @staticmethod
     def get_help_text(help_key: str, registry=None) -> str:
-        if help_key in SETTINGS_HELP:
-            return SETTINGS_HELP[help_key]
         if registry is not None:
-            mod_help = registry.get_all_help_entries()
-            if help_key in mod_help:
-                return mod_help[help_key]
-        return "Додатковий опис для цього параметра відсутній."
+            get_help_fn = getattr(registry, "get_all_help_entries", None)
+            if callable(get_help_fn):
+                mod_help = get_help_fn() or {}
+                if help_key in mod_help:
+                    return mod_help[help_key]
+        if help_key in SETTINGS_HELP:
+            return tr(f"help.{help_key}", SETTINGS_HELP[help_key])
+        return tr("help.missing", "Additional description for this parameter is unavailable.")

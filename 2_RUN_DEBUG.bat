@@ -9,4 +9,3 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 ".venv\Scripts\python.exe" "app.py"
-pause

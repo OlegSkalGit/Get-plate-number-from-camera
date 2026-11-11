@@ -6,6 +6,8 @@ import threading
 from datetime import datetime
 import numpy as np
 
+from scripts.core.i18n import tr
+
 try:
     import cv2
 except ImportError:
@@ -37,19 +39,52 @@ def refresh_capabilities():
         cv2 = None
 
 
-def get_status_summary(base_dir: str = "") -> str:
+def is_ready(base_dir: str = "") -> bool:
     if cv2 is None:
-        return "Потрібні бібліотеки: opencv-python"
+        return False
     if base_dir:
         mp = os.path.join(base_dir, "models", "yolo11n.onnx")
         if not os.path.exists(mp):
-            return "Відсутня модель: yolo11n.onnx"
+            return False
+    return True
+
+
+def get_status_summary(base_dir: str = "") -> str:
+    if cv2 is None:
+        return tr("mod.common.libs_needed", "Required libraries: {libs}", libs="opencv-python")
+    if base_dir:
+        mp = os.path.join(base_dir, "models", "yolo11n.onnx")
+        if not os.path.exists(mp):
+            return tr("mod.people.status.missing_model", "Missing model: yolo11n.onnx")
     try:
         import onnxruntime  # noqa: F401
         rt = "ONNX Runtime"
     except ImportError:
         rt = "OpenCV DNN fallback"
-    return f"Готовий (YOLO11n, {rt})"
+    return tr("mod.people.status.ready", "Ready (YOLO11n, {rt})", rt=rt)
+
+
+def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None) -> dict:
+    """Перевіряє бібліотеки та ONNX-модель детектора людей/транспорту."""
+    refresh_capabilities()
+    missing = []
+    if cv2 is None:
+        missing.append("opencv-python")
+    if base_dir:
+        mp = os.path.join(base_dir, "models", "yolo11n.onnx")
+        if not os.path.exists(mp):
+            missing.append("yolo11n.onnx")
+    ok = len(missing) == 0
+    return {
+        "ok": ok,
+        "downloaded": [],
+        "missing": missing,
+        "message": tr("mod.people.res.ready", "People/vehicles model (yolo11n.onnx) is ready.") if ok else tr(
+            "mod.common.res_missing",
+            "Missing resources: {items}",
+            items=", ".join(missing),
+        ),
+    }
 
 
 def async_write_image(path, img):
@@ -85,7 +120,7 @@ class PersonDetector:
     def __init__(self, model_path: str, detect_vehicles: bool = False, providers=None, intra_op_threads: int = 2):
         _ensure_deps()
         if cv2 is None:
-            raise ImportError("Пакет 'opencv-python' не встановлено для PersonDetector")
+            raise ImportError("Package 'opencv-python' is not installed for PersonDetector")
         self.model_path = model_path
         self.detect_vehicles = detect_vehicles
         self.use_ort = False
@@ -94,6 +129,10 @@ class PersonDetector:
 
         try:
             import onnxruntime as ort
+            try:
+                ort.set_default_logger_severity(3)
+            except Exception:
+                pass
             opts = ort.SessionOptions()
             opts.log_severity_level = 3
             cpu_cnt = os.cpu_count() or 4
@@ -222,6 +261,29 @@ class PersonDetector:
         return detections
 
 
+def _parse_allow_disk_write(config: dict = None, app_context: dict = None) -> bool:
+    for src in (app_context, config):
+        if not isinstance(src, dict):
+            continue
+        if "allow_disk_write" in src and src.get("allow_disk_write") is not None:
+            val = src.get("allow_disk_write")
+            if isinstance(val, str):
+                return val.strip().lower() not in ("false", "0", "no", "off")
+            return bool(val)
+        mode = src.get("operation_mode")
+        if mode is not None and str(mode).strip() != "":
+            return str(mode).strip().lower() != "operator"
+    return True
+
+
+def _merge_runtime_write_cfg(flat_cfg: dict, app_context: dict = None) -> dict:
+    cfg = dict(flat_cfg or {})
+    allow_write = _parse_allow_disk_write(cfg, app_context)
+    cfg["allow_disk_write"] = allow_write
+    cfg["operation_mode"] = "server" if allow_write else "operator"
+    return cfg
+
+
 class PersonEngine:
     """Модуль детекції людей та транспорту (підтримує спільний детектор і per-camera стан)."""
     def __init__(
@@ -238,22 +300,24 @@ class PersonEngine:
         self.on_saved_callback = on_saved_callback
 
         self.people_dir = output_dir or os.path.join(base_dir, "people")
-        os.makedirs(self.people_dir, exist_ok=True)
-
         self._state_lock = threading.Lock()
+        self.allow_disk_write = True
         self._reload_params()
+        if self.allow_disk_write:
+            os.makedirs(self.people_dir, exist_ok=True)
 
         if detector is not None:
             self.detector = detector
         else:
             model_path = os.path.join(base_dir, "models", "yolo11n.onnx")
             if not os.path.exists(model_path):
-                raise FileNotFoundError(f"Файл моделі не знайдено: {model_path}")
+                raise FileNotFoundError(f"Model file not found: {model_path}")
             self.detector = PersonDetector(model_path, detect_vehicles=self.detect_vehicles, providers=providers)
 
         self.last_shot_time = 0.0
 
     def _reload_params(self):
+        self.allow_disk_write = _parse_allow_disk_write(self.config)
         self.conf_thresh = float(self.config.get("people_det_thresh", self.config.get("det_thresh", 0.45)))
         self.timer_ms = int(self.config.get("people_timer_ms", self.config.get("timer_ms", 1000)))
         self.interval_sec = max(0.1, float(self.timer_ms) / 1000.0)
@@ -286,6 +350,7 @@ class PersonEngine:
             conf_t = self.conf_thresh
             det_veh = self.detect_vehicles
             interval = self.interval_sec
+            allow_write = self.allow_disk_write
 
         detections = self.detector.predict(frame, conf_thresh=conf_t, detect_vehicles=det_veh)
         if not detections:
@@ -293,10 +358,11 @@ class PersonEngine:
 
         now = time.time()
         should_save = False
-        with self._state_lock:
-            if (now - self.last_shot_time) >= interval:
-                self.last_shot_time = now
-                should_save = True
+        if allow_write:
+            with self._state_lock:
+                if self.allow_disk_write and (now - self.last_shot_time) >= interval:
+                    self.last_shot_time = now
+                    should_save = True
 
         if should_save:
             self._save_screenshot(frame, detections)
@@ -305,6 +371,9 @@ class PersonEngine:
         return display_boxes
 
     def _save_screenshot(self, frame: np.ndarray, detections: list):
+        if not self.allow_disk_write:
+            return
+        os.makedirs(self.people_dir, exist_ok=True)
         now_dt = datetime.now()
         day_folder = now_dt.strftime("%Y-%m-%d")
         day_dir = os.path.join(self.people_dir, day_folder)
@@ -337,7 +406,7 @@ class PersonEngine:
 def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, app_context: dict = None):
     model_path = os.path.join(base_dir, "models", "yolo11n.onnx")
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Файл моделі YOLO11n не знайдено: {model_path}")
+        raise FileNotFoundError(f"YOLO11n model file not found: {model_path}")
     det = PersonDetector(model_path, detect_vehicles=True, providers=providers, intra_op_threads=ai_threads)
     return {
         "detector": det,
@@ -347,9 +416,10 @@ def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, ap
 
 def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_saved_callback=None, source=None, app_context=None):
     det = shared_resources.get("detector") if isinstance(shared_resources, dict) else None
+    cfg_copy = _merge_runtime_write_cfg(flat_cfg, app_context)
     return PersonEngine(
         base_dir=base_dir,
-        config=flat_cfg,
+        config=cfg_copy,
         on_saved_callback=on_saved_callback,
         detector=det,
         output_dir=output_dir,
@@ -361,7 +431,8 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
         return
     if isinstance(shared_resources, dict) and shared_resources.get("detector") is not None:
         engine.detector = shared_resources["detector"]
-    engine.update_config(flat_cfg)
+    cfg_copy = _merge_runtime_write_cfg(flat_cfg, app_context)
+    engine.update_config(cfg_copy)
 
 
 def _process_and_pack(engine, frame, prev_state=None):
@@ -387,15 +458,16 @@ def _parse_archive_record(fpath: str, base_name: str, root_dir: str, rel_dir: st
     time_parts = base_name.split("_")[0].split("-")
     time_disp = ":".join(time_parts[:3]) if len(time_parts) >= 3 else "--:--:--"
     parts = base_name.split("_")
+    default_person = tr("mod.people.archive.person_in_frame", "Person in frame")
     if len(parts) >= 3 and parts[1].isdigit():
         time_disp = f"{time_disp}.{parts[1]}"
         raw_label = "_".join(parts[2:])
-        item_name = raw_label.replace("-", ", ") if raw_label and not raw_label.isdigit() else "Людина в кадрі"
+        item_name = raw_label.replace("-", ", ") if raw_label and not raw_label.isdigit() else default_person
     elif len(parts) >= 2 and not parts[1].isdigit():
         raw_label = "_".join(parts[1:])
         item_name = raw_label.replace("-", ", ")
     else:
-        item_name = "Людина в кадрі"
+        item_name = default_person
     return {"time": time_disp, "name": item_name}
 
 
@@ -404,11 +476,11 @@ MODULE_SPEC = {
     "version": "2.0.0",
     "order": 30,
     "kind": "ai",
-    "name": "Люди/Транспорт",
+    "name": "People / Vehicles",
     "icon": "🚶",
-    "short_badge": "Л",
-    "description": "Детектор YOLO11n для фіксації людей (та опційно транспорту) з регулярними чистими скріншотами.",
-    "on_help": "Увімкнути детектор YOLO11n для фіксації людей (і опційно транспорту) з регулярними чистими скріншотами.",
+    "short_badge": "PPL",
+    "description": "YOLO11n detector for capturing people (and optionally vehicles) with periodic clean screenshots.",
+    "on_help": "Enable YOLO11n detector for capturing people (and optionally vehicles) with periodic clean screenshots.",
     "provides": ["person_detector"],
     "library_deps": ["opencv-python", "onnxruntime"],
     "settings_schema": [
@@ -416,17 +488,17 @@ MODULE_SPEC = {
             "key": "show_boxes",
             "type": "bool",
             "default": True,
-            "label": "Показувати рамки:",
-            "bool_text": "Показувати рамки навколо людей та транспорту",
-            "help": "Показувати рамки навколо людей і транспорту у вікні перегляду (збережені скріншоти на диску завжди без рамок).",
+            "label": "Show Boxes:",
+            "bool_text": "Show boxes around people and vehicles",
+            "help": "Show bounding boxes around people and vehicles in preview (screenshots saved to disk are always clean).",
         },
         {
             "key": "detect_transport",
             "type": "bool",
             "default": True,
-            "label": "Фіксувати транспорт:",
-            "bool_text": "Також розпізнавати авто, автобуси, вантажівки, мотоцикли",
-            "help": "Також виявляти й фіксувати автомобілі, автобуси, вантажівки, мотоцикли, велосипеди.",
+            "label": "Detect Vehicles:",
+            "bool_text": "Also detect cars, buses, trucks, motorcycles",
+            "help": "Also detect and capture cars, buses, trucks, motorcycles, and bicycles.",
         },
         {
             "key": "det_thresh",
@@ -435,8 +507,8 @@ MODULE_SPEC = {
             "min": 0.15,
             "max": 0.95,
             "step": 0.02,
-            "label": "Поріг детектора YOLO11n:",
-            "help": "Поріг впевненості детектора YOLO11n (0.30–0.75; 0.45 оптимум).",
+            "label": "YOLO11n Detector Threshold:",
+            "help": "Confidence threshold for YOLO11n detector (0.30–0.75; 0.45 optimal).",
         },
         {
             "key": "timer_ms",
@@ -445,8 +517,9 @@ MODULE_SPEC = {
             "min": 100,
             "max": 60000,
             "step": 100,
-            "label": "Інтервал скріншотів (мс):",
-            "help": "Мінімальний інтервал у мілісекундах між скріншотами, коли в кадрі є об'єкт (1000 мс = макс. 1 фото/сек).",
+            "disk_write": True,
+            "label": "Screenshot Interval (ms):",
+            "help": "Minimum interval in milliseconds between saved screenshots while an object is in frame (1000 ms = max 1 photo/sec).",
         },
         {
             "key": "delete_older_days",
@@ -455,8 +528,9 @@ MODULE_SPEC = {
             "min": 0.0,
             "max": 3650.0,
             "step": 1.0,
-            "label": "Автовидалення старше (днів):",
-            "help": "Автовидалення скріншотів цієї камери, старших за N днів (0 = необмежено).",
+            "disk_write": True,
+            "label": "Auto-delete older than (days):",
+            "help": "Automatically delete screenshots from this camera older than N days (0 = keep forever).",
         },
         {
             "key": "date_from",
@@ -464,23 +538,34 @@ MODULE_SPEC = {
             "type": "date_range",
             "default": "",
             "default_to": "",
-            "label": "Період роботи (дати):",
-            "help": "Початкова та кінцева дата роботи модуля людей (YYYY-MM-DD, порожньо = необмежено).",
+            "label": "Active Schedule (Dates):",
+            "help": "Start and end dates for the people module (YYYY-MM-DD, empty = unlimited).",
         },
     ],
     "archive": {
         "has_archive": True,
-        "button_label": lambda mod_cfg: "🚶🚗 Люди/Транспорт" if (mod_cfg or {}).get("detect_transport", True) else "🚶 Люди",
-        "sidebar_title": lambda mod_cfg: "Історія: Люди та Транспорт" if (mod_cfg or {}).get("detect_transport", True) else "Історія: Люди (скріншоти)",
-        "item_preview_label": "Скріншот:",
+        "button_label": lambda mod_cfg: (
+            tr("mod.people.archive.button_transport", "🚶🚗 People/Vehicles")
+            if (mod_cfg or {}).get("detect_transport", True)
+            else tr("mod.people.archive.button_people", "🚶 People")
+        ),
+        "sidebar_title": lambda mod_cfg: (
+            tr("mod.people.archive.sidebar_transport", "History: People & Vehicles")
+            if (mod_cfg or {}).get("detect_transport", True)
+            else tr("mod.people.archive.sidebar_people", "History: People (screenshots)")
+        ),
+        "item_preview_label": "Screenshot:",
         "icon": "🚶",
         "record_type": "single_image",
         "extensions": (".jpg", ".jpeg", ".png"),
         "parse_record": _parse_archive_record,
     },
+    "is_ready": is_ready,
     "refresh_capabilities": refresh_capabilities,
     "get_status_summary": get_status_summary,
+    "ensure_resources": ensure_resources,
     "create_shared_resources": _create_shared_resources,
+    "on_app_context_changed": lambda res, ctx, *a, **kw: res,
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,
     "process_and_pack": _process_and_pack,

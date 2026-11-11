@@ -2,14 +2,37 @@ import os
 import copy
 import threading
 
+from scripts.core.hardware_info import prepare_cuda_dll_environment, check_cuda_libraries_status
 
-def resolve_ort_providers(ai_backend: str) -> list:
+
+def resolve_ort_providers(ai_backend: str, base_dir: str = None) -> list:
     backend = str(ai_backend or "cpu").strip().lower()
+    if base_dir and backend in ("cuda", "auto"):
+        try:
+            prepare_cuda_dll_environment(base_dir, preload=False)
+        except Exception:
+            pass
     try:
         import onnxruntime as ort
-        avail = ort.get_available_providers()
+        try:
+            ort.set_default_logger_severity(3)
+        except Exception:
+            pass
+        if base_dir and backend in ("cuda", "auto"):
+            try:
+                prepare_cuda_dll_environment(base_dir, preload=True)
+            except Exception:
+                pass
+        avail = list(ort.get_available_providers())
     except Exception:
         avail = ["CPUExecutionProvider"]
+
+    if base_dir and backend in ("cuda", "auto") and "CUDAExecutionProvider" in avail:
+        try:
+            if not check_cuda_libraries_status(base_dir, allow_network=False).get("ready"):
+                avail = [p for p in avail if p != "CUDAExecutionProvider"]
+        except Exception:
+            pass
 
     def _pick(*wanted):
         res = [p for p in wanted if p in avail]
@@ -42,7 +65,7 @@ class InferencePool:
 
         self.ai_backend = str(ai_backend or "cpu").strip().lower()
         self.ai_threads = max(1, min(8, int(ai_threads or 2)))
-        self.providers = resolve_ort_providers(self.ai_backend)
+        self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
 
         self._lock = threading.RLock()
         # mod_id -> {"res": obj, "sig": file_sig, "ctx": dict}
@@ -60,10 +83,13 @@ class InferencePool:
             backend_changed = (new_backend != self.ai_backend) or (new_threads != self.ai_threads)
             ctx_changed = (new_ctx != self.app_context)
 
+            old_providers = list(self.providers)
             self.ai_backend = new_backend
             self.ai_threads = new_threads
             self.app_context = new_ctx
-            self.providers = resolve_ort_providers(new_backend)
+            self.providers = resolve_ort_providers(new_backend, base_dir=self.base_dir)
+            if list(self.providers) != old_providers:
+                backend_changed = True
 
             if backend_changed:
                 self._module_resources.clear()
@@ -94,7 +120,7 @@ class InferencePool:
 
     def invalidate_all(self):
         with self._lock:
-            self.providers = resolve_ort_providers(self.ai_backend)
+            self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
             self._module_resources.clear()
 
     def get_module_resources(self, mod_id: str):
@@ -126,6 +152,13 @@ class InferencePool:
                         )
                         cached["ctx"] = copy.deepcopy(self.app_context)
                         return cached["res"]
+
+            if self.ai_backend in ("cuda", "auto") or "CUDAExecutionProvider" in self.providers:
+                try:
+                    prepare_cuda_dll_environment(self.base_dir, preload=True)
+                    self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
+                except Exception:
+                    pass
 
             res = creator(
                 self.base_dir,

@@ -2,6 +2,9 @@ import sys
 import tkinter as tk
 from tkinter import ttk
 
+from scripts.core.i18n import tr
+from tkinter import font as tkfont
+
 EVT_CONFIGURE = "<Configure>"
 EVT_ENTER = "<Enter>"
 EVT_LEAVE = "<Leave>"
@@ -294,16 +297,60 @@ class ScrollableFrame(tk.Frame):
 
         self._wheel_bound = False
         self._wheel_hook_toplevel = None
+        self._suspend_scrollregion = False
         self.canvas.bind(EVT_ENTER, self._on_enter)
         self.canvas.bind(EVT_LEAVE, self._on_leave)
         self.inner.bind(EVT_ENTER, self._on_enter)
         self.inner.bind(EVT_LEAVE, self._on_leave)
 
     def _on_inner_configure(self, event=None):
+        if self._suspend_scrollregion:
+            return
         try:
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         except Exception:
             pass
+
+    def get_scroll_y_px(self) -> float:
+        try:
+            bbox = self.canvas.bbox("all")
+            if not bbox:
+                return 0.0
+            total_h = float(bbox[3] - bbox[1])
+            if total_h <= 1.0:
+                return 0.0
+            top_frac, _ = self.canvas.yview()
+            return max(0.0, float(top_frac) * total_h)
+        except Exception:
+            return 0.0
+
+    def set_scroll_y_px(self, y_px: float):
+        try:
+            for _ in range(2):
+                self.canvas.update_idletasks()
+            bbox = self.canvas.bbox("all")
+            if not bbox:
+                return
+            self.canvas.configure(scrollregion=bbox)
+            total_h = float(bbox[3] - bbox[1])
+            ch = float(self.canvas.winfo_height())
+            max_top = max(0.0, total_h - ch) if ch > 10.0 else max(0.0, total_h)
+            clamped = max(0.0, min(float(y_px), max_top))
+            if total_h > 0:
+                self.canvas.yview_moveto(clamped / total_h)
+        except Exception:
+            pass
+
+    def preserve_scroll_during(self, fn):
+        y_px = self.get_scroll_y_px()
+        prev = self._suspend_scrollregion
+        self._suspend_scrollregion = True
+        try:
+            return fn()
+        finally:
+            self._suspend_scrollregion = prev
+            if not prev:
+                self.set_scroll_y_px(y_px)
 
     def _on_canvas_configure(self, event=None):
         try:
@@ -379,7 +426,7 @@ class HelpButton(tk.Label):
     Кнопка '?' біля кожного параметра у налаштуваннях.
     Наведення показує коротку підказку, клік відкриває повний детальний опис параметра.
     """
-    def __init__(self, parent, help_text: str, title: str = "Довідка", bg="#181820"):
+    def __init__(self, parent, help_text: str, title: str = None, bg="#181820"):
         super().__init__(
             parent,
             text="?",
@@ -393,7 +440,7 @@ class HelpButton(tk.Label):
             pady=0,
         )
         self.help_text = str(help_text or "").strip()
-        self.help_title = str(title or "Довідка")
+        self.help_title = str(title if title is not None else tr("help.dialog_title", "Help"))
         self._hover_after = None
         self._tooltip_win = None
 
@@ -537,3 +584,278 @@ def compute_auto_grid(num_items: int, area_w: int, area_h: int) -> tuple:
     cols = max(1, int(math.ceil(math.sqrt(n * aspect * (9.0 / 16.0)))))
     rows = max(1, int(math.ceil(n / float(cols))))
     return rows, cols
+
+
+def _get_cached_tk_font(widget, font_spec=None):
+    """Повертає або кешує tkfont.Font на кореневому вікні (безпечно для кількох Tk() у тестах)."""
+    try:
+        top = widget.winfo_toplevel()
+    except Exception:
+        top = widget
+    cache = getattr(top, "_agy_ellipsis_fonts", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(top, "_agy_ellipsis_fonts", cache)
+        except Exception:
+            pass
+
+    try:
+        resolved = font_spec or widget.cget("font")
+    except Exception:
+        resolved = ("Segoe UI", 8)
+    key = tuple(resolved) if isinstance(resolved, (list, tuple)) else str(resolved)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        if isinstance(resolved, (list, tuple)):
+            family = str(resolved[0]) if len(resolved) > 0 else "Segoe UI"
+            size = int(resolved[1]) if len(resolved) > 1 else 9
+            mods = " ".join(str(x) for x in resolved[2:]).lower()
+            weight = "bold" if "bold" in mods else "normal"
+            slant = "italic" if "italic" in mods else "roman"
+            fobj = tkfont.Font(root=top, family=family, size=size, weight=weight, slant=slant)
+        else:
+            fobj = tkfont.Font(root=top, font=resolved)
+        cache[key] = fobj
+        return fobj
+    except Exception:
+        return None
+
+
+def fit_text_ellipsis(widget, text: str, max_px: int, font_spec=None) -> str:
+    """Обрізає однорядковий текст із «…» точно під доступну ширину в пікселях."""
+    s = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+    if not s:
+        return ""
+    limit = int(max_px or 0)
+    if limit <= 0:
+        return s
+
+    fobj = _get_cached_tk_font(widget, font_spec=font_spec)
+    if fobj is None:
+        approx = max(3, limit // 6)
+        return s if len(s) <= approx else (s[: max(1, approx - 1)].rstrip() + "…")
+
+    try:
+        if fobj.measure(s) <= limit:
+            return s
+        ell = "…"
+        if fobj.measure(ell) >= limit:
+            return ell
+        lo, hi = 1, len(s)
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cand = s[:mid].rstrip() + ell
+            if fobj.measure(cand) <= limit:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return s[:best].rstrip() + ell
+    except Exception:
+        return s
+
+
+def _refresh_single_line_ellipsis(lbl: tk.Label, event_width: int = None):
+    if lbl is None:
+        return
+    try:
+        if not lbl.winfo_exists():
+            return
+    except Exception:
+        return
+
+    full_raw = str(getattr(lbl, "_ellipsis_full_text", "") or "")
+    full_norm = " ".join(full_raw.replace("\r", " ").replace("\n", " ").split())
+    pad = int(getattr(lbl, "_ellipsis_pad", 4) or 0)
+    min_px = int(getattr(lbl, "_ellipsis_min_px", 40) or 40)
+    init_px = int(getattr(lbl, "_ellipsis_initial_px", 160) or 160)
+
+    w = 0
+    if event_width is not None and int(event_width) > 10:
+        w = int(event_width)
+    else:
+        try:
+            cur_w = int(lbl.winfo_width() or 0)
+            if cur_w > 10:
+                w = cur_w
+            elif lbl.master is not None:
+                mw = int(lbl.master.winfo_width() or 0)
+                if mw > 20:
+                    w = mw - 6
+        except Exception:
+            w = 0
+
+    max_px = max(min_px, (w if w > 10 else init_px) - pad)
+    disp = fit_text_ellipsis(lbl, full_norm, max_px)
+    lbl._ellipsis_truncated = bool(full_norm and disp != full_norm)
+
+    sig = (full_norm, disp)
+    if getattr(lbl, "_ellipsis_last_sig", None) == sig:
+        return
+    lbl._ellipsis_last_sig = sig
+    try:
+        lbl.configure(text=disp)
+    except Exception:
+        pass
+
+
+def set_single_line_ellipsis_text(lbl: tk.Label, full_text: str):
+    """Оновлює повний текст однорядкового заголовка та одразу підганяє обрізання «…»."""
+    if lbl is None:
+        return
+    lbl._ellipsis_full_text = str(full_text or "")
+    lbl._ellipsis_last_sig = None
+    _refresh_single_line_ellipsis(lbl)
+
+
+def bind_single_line_ellipsis(
+    lbl: tk.Label,
+    full_text: str = None,
+    pad: int = 4,
+    min_px: int = 40,
+    initial_px: int = 160,
+):
+    """Налаштовує Label як суворо 1-рядковий з автоматичним обрізанням «…» при зміні ширини."""
+    if full_text is None:
+        try:
+            full_text = str(lbl.cget("text") or "")
+        except Exception:
+            full_text = ""
+
+    lbl._ellipsis_full_text = str(full_text)
+    lbl._ellipsis_pad = int(pad)
+    lbl._ellipsis_min_px = int(min_px)
+    lbl._ellipsis_initial_px = int(initial_px)
+    lbl._ellipsis_truncated = False
+    lbl._ellipsis_last_sig = None
+
+    try:
+        lbl.configure(wraplength=0)
+    except Exception:
+        pass
+
+    _refresh_single_line_ellipsis(lbl)
+
+    def _on_cfg(event):
+        ew = getattr(event, "width", None)
+        _refresh_single_line_ellipsis(lbl, event_width=ew)
+
+    lbl.bind(EVT_CONFIGURE, _on_cfg, add="+")
+    return lbl
+
+
+def bind_hover_tooltip(
+    widget,
+    text_or_fn,
+    only_when_truncated: bool = False,
+    truncate_sources=None,
+    delay_ms: int = 350,
+):
+    """Показує легку підказку при наведенні курсора (опційно — лише коли текст обрізано «…»)."""
+    if widget is None:
+        return
+
+    state = {"after_id": None, "win": None}
+
+    def _cancel_timer():
+        aid = state.get("after_id")
+        if aid is not None:
+            try:
+                widget.after_cancel(aid)
+            except Exception:
+                pass
+            state["after_id"] = None
+
+    def _hide(event=None):
+        _cancel_timer()
+        pop = state.get("win")
+        state["win"] = None
+        if pop is not None:
+            try:
+                pop.destroy()
+            except Exception:
+                pass
+
+    def _show():
+        state["after_id"] = None
+        try:
+            if not widget.winfo_exists():
+                return
+        except Exception:
+            return
+
+        if only_when_truncated:
+            srcs = tuple(truncate_sources) if truncate_sources is not None else (widget,)
+            if not any(bool(getattr(s, "_ellipsis_truncated", False)) for s in srcs if s is not None):
+                return
+
+        try:
+            txt = text_or_fn() if callable(text_or_fn) else str(text_or_fn or "")
+        except Exception:
+            txt = ""
+        txt = str(txt or "").strip()
+        if not txt:
+            return
+
+        _hide()
+        try:
+            top = widget.winfo_toplevel()
+            pop = tk.Toplevel(top)
+            pop.overrideredirect(True)
+            pop.configure(bg="#00e5ff")
+        except Exception:
+            return
+
+        inner = tk.Frame(pop, bg="#1d202b", padx=10, pady=6)
+        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        tk.Label(
+            inner,
+            text=txt,
+            fg="#e8ebf5",
+            bg="#1d202b",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+            wraplength=360,
+            anchor=tk.W,
+        ).pack(fill=tk.BOTH, expand=True)
+
+        try:
+            pop.update_idletasks()
+            pw = pop.winfo_reqwidth()
+            ph = pop.winfo_reqheight()
+            vx, vy, vw, vh = get_virtual_screen_bounds(widget)
+            try:
+                px, py = widget.winfo_pointerxy()
+                bx = int(px) + 12
+                by = int(py) + 16
+            except Exception:
+                bx = int(widget.winfo_rootx()) + 8
+                by = int(widget.winfo_rooty()) + int(widget.winfo_height()) + 4
+            if bx + pw > vx + vw - 8:
+                bx = max(vx + 8, vx + vw - pw - 8)
+            if by + ph > vy + vh - 8:
+                by = max(vy + 8, int(widget.winfo_rooty()) - ph - 4)
+            pop.geometry(f"+{bx}+{by}")
+        except Exception:
+            pass
+        state["win"] = pop
+
+    def _on_enter(event=None):
+        _cancel_timer()
+        try:
+            state["after_id"] = widget.after(int(delay_ms), _show)
+        except Exception:
+            pass
+
+    try:
+        widget.bind(EVT_ENTER, _on_enter, add="+")
+        widget.bind(EVT_LEAVE, _hide, add="+")
+        widget.bind("<Button-1>", _hide, add="+")
+        widget.bind("<Destroy>", _hide, add="+")
+    except Exception:
+        pass

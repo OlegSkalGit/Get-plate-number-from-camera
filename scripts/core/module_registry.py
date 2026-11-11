@@ -7,6 +7,14 @@ import threading
 import traceback
 from datetime import datetime
 
+from scripts.core.i18n import tr
+
+
+def _tr_mod(mid: str, subkey: str, fallback: str, **kwargs) -> str:
+    if not fallback and not kwargs:
+        return tr(f"mod.{mid}.{subkey}", "")
+    return tr(f"mod.{mid}.{subkey}", fallback, **kwargs)
+
 
 def parse_date_str(val):
     s = str(val or "").strip()
@@ -101,7 +109,7 @@ class ModuleRegistry:
             importlib.invalidate_caches()
             spec = importlib.util.spec_from_file_location(mod_full_name, fpath)
             if spec is None or spec.loader is None:
-                raise ImportError(f"Не вдалося створити import spec для {fpath}")
+                raise ImportError(tr("modreg.spec_error", "Failed to create import spec for {path}", path=fpath))
             py_mod = importlib.util.module_from_spec(spec)
             sys.modules[mod_full_name] = py_mod
             # Читаємо й компілюємо напряму з вихідного файлу, щоб уникнути застарілого .pyc-кешу (1-сек квантування mtime)
@@ -315,33 +323,52 @@ class ModuleRegistry:
         help_map = {}
         for ent in self.list_modules():
             mid = ent["id"]
-            on_desc = ent["spec"].get("on_help") or f"Увімкнути або вимкнути модуль '{ent['spec'].get('name', mid)}' для цієї камери."
+            mod_name = _tr_mod(mid, "name", ent["spec"].get("name", mid))
+            raw_on_help = ent["spec"].get("on_help")
+            if raw_on_help:
+                on_desc = _tr_mod(mid, "on_help", raw_on_help)
+            else:
+                on_desc = tr(
+                    "modreg.default_on_help",
+                    "Enable or disable module '{name}' for this camera.",
+                    name=mod_name,
+                )
             help_map[f"{mid}.on"] = on_desc
             for fld in ent["spec"].get("settings_schema") or []:
                 k = fld.get("key")
                 if k and fld.get("help"):
-                    help_map[f"{mid}.{k}"] = fld["help"]
+                    help_map[f"{mid}.{k}"] = _tr_mod(mid, f"field.{k}.help", fld["help"])
         return help_map
 
     def describe_modules_status(self) -> list:
         rows = []
         for ent in self.list_modules():
+            mid = ent["id"]
             spec = ent["spec"]
             status_fn = spec.get("get_status_summary")
-            lib_status = "Готовий"
+            ready_fn = spec.get("is_ready")
+            lib_status = tr("mod.common.ready", "Ready")
+            status_ok = True
             if callable(status_fn):
                 try:
                     lib_status = str(status_fn(self.base_dir))
                 except Exception as e:
-                    lib_status = f"Помилка перевірки: {e}"
+                    lib_status = tr("modreg.check_error", "Check error: {err}", err=e)
+                    status_ok = False
+            if callable(ready_fn):
+                try:
+                    status_ok = bool(ready_fn(self.base_dir))
+                except Exception:
+                    status_ok = False
             rows.append({
-                "id": ent["id"],
-                "name": spec.get("name", ent["id"]),
+                "id": mid,
+                "name": _tr_mod(mid, "name", spec.get("name", mid)),
                 "icon": spec.get("icon", "🧩"),
                 "version": spec.get("version", "1.0.0"),
                 "kind": spec.get("kind", "ai"),
                 "file": ent["file"],
                 "status": lib_status,
+                "status_ok": status_ok,
                 "error": "",
             })
         for ek, eobj in self.get_errors().items():
@@ -352,7 +379,136 @@ class ModuleRegistry:
                 "version": "—",
                 "kind": "error",
                 "file": eobj.get("file", ""),
-                "status": f"Помилка завантаження: {eobj.get('error', '')}",
+                "status": tr("modreg.load_error", "Load error: {err}", err=eobj.get("error", "")),
+                "status_ok": False,
                 "error": eobj.get("traceback", ""),
             })
         return rows
+
+    def collect_library_dependencies(self) -> list:
+        """Збирає унікальний перелік Python-залежностей з усіх завантажених плагінів."""
+        out = []
+        seen = set()
+        for ent in self.list_modules():
+            for dep in (ent["spec"].get("library_deps") or []):
+                s = str(dep or "").strip()
+                low = s.lower()
+                if s and low not in seen:
+                    seen.add(low)
+                    out.append(s)
+        return out
+
+    def check_modules_resources(self) -> list:
+        """Швидко перевіряє стан ресурсів/моделей усіх завантажених модулів без завантаження."""
+        results = []
+        for ent in self.list_modules():
+            mid = ent["id"]
+            spec = ent["spec"]
+            fn = spec.get("ensure_resources")
+            if callable(fn):
+                try:
+                    res = fn(self.base_dir, download=False, progress_cb=None) or {}
+                except Exception as e:
+                    res = {
+                        "ok": False,
+                        "downloaded": [],
+                        "missing": [],
+                        "message": tr("modreg.check_error", "Check error: {err}", err=e),
+                    }
+            else:
+                st_fn = spec.get("get_status_summary")
+                msg = tr("mod.common.ready", "Ready")
+                if callable(st_fn):
+                    try:
+                        msg = str(st_fn(self.base_dir))
+                    except Exception as e:
+                        msg = tr("modreg.check_error", "Check error: {err}", err=e)
+                res = {"ok": True, "downloaded": [], "missing": [], "message": msg}
+            results.append({
+                "id": mid,
+                "name": _tr_mod(mid, "name", spec.get("name", mid)),
+                "icon": spec.get("icon", "🧩"),
+                "ok": bool(res.get("ok", True)),
+                "downloaded": list(res.get("downloaded") or []),
+                "missing": list(res.get("missing") or []),
+                "message": str(res.get("message") or ""),
+            })
+        return results
+
+    def ensure_modules_resources(self, progress_cb=None) -> list:
+        """Перевіряє та за потреби довантажує ресурси/моделі модулів через хук MODULE_SPEC['ensure_resources']."""
+        results = []
+        for ent in self.list_modules():
+            mid = ent["id"]
+            spec = ent["spec"]
+            mod_name = _tr_mod(mid, "name", spec.get("name", mid))
+            fn = spec.get("ensure_resources")
+            if callable(fn):
+                try:
+                    def _mod_prog(msg, _name=mod_name):
+                        if progress_cb:
+                            progress_cb(f"[{_name}] {msg}")
+
+                    res = fn(self.base_dir, download=True, progress_cb=_mod_prog) or {}
+                except Exception as e:
+                    res = {
+                        "ok": False,
+                        "downloaded": [],
+                        "missing": [],
+                        "message": tr("modreg.error_msg", "Error: {err}", err=e),
+                    }
+            else:
+                res = {"ok": True, "downloaded": [], "missing": [], "message": tr("mod.common.ready", "Ready")}
+            results.append({
+                "id": mid,
+                "name": mod_name,
+                "icon": spec.get("icon", "🧩"),
+                "ok": bool(res.get("ok", True)),
+                "downloaded": list(res.get("downloaded") or []),
+                "missing": list(res.get("missing") or []),
+                "message": str(res.get("message") or ""),
+            })
+        self.refresh_libraries_capabilities()
+        return results
+
+    def recommend_camera_modules(
+        self,
+        caps: dict,
+        cam_cfg: dict = None,
+        cur_modules: dict = None,
+        active_cam_count: int = 1,
+    ) -> dict:
+        """Збирає оптимальні параметри модулів (для камери або шаблону) через хук 'recommend_settings'."""
+        updates_by_mod = {}
+        notes = []
+        cur_mods = cur_modules if isinstance(cur_modules, dict) else ((cam_cfg or {}).get("modules") or {})
+        for ent in self.list_modules():
+            mid = ent["id"]
+            spec = ent["spec"]
+            rec_fn = spec.get("recommend_settings")
+            if not callable(rec_fn):
+                continue
+            try:
+                res = rec_fn(
+                    caps,
+                    cam_cfg=cam_cfg,
+                    cur_mod_cfg=cur_mods.get(mid) if isinstance(cur_mods.get(mid), dict) else {},
+                    active_cam_count=active_cam_count,
+                )
+            except Exception as e:
+                print(f"[ModuleRegistry] recommend_settings '{mid}': {e}")
+                continue
+            if not isinstance(res, dict):
+                continue
+            upd = res.get("updates")
+            if isinstance(upd, dict) and upd:
+                updates_by_mod[mid] = copy.deepcopy(upd)
+            mod_notes = res.get("notes") or []
+            if mod_notes:
+                notes.append({
+                    "id": mid,
+                    "name": _tr_mod(mid, "name", spec.get("name", mid)),
+                    "icon": spec.get("icon", "🧩"),
+                    "notes": [str(n) for n in mod_notes if str(n).strip()],
+                })
+        return {"updates_by_mod": updates_by_mod, "notes": notes}

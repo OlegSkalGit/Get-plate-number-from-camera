@@ -12,6 +12,12 @@ if BASE_DIR not in sys.path:
 
 os.chdir(BASE_DIR)
 
+try:
+    from scripts.core.hardware_info import prepare_cuda_dll_environment
+    prepare_cuda_dll_environment(BASE_DIR, preload=False)
+except Exception:
+    pass
+
 from scripts.ui.main_window import main
 
 
