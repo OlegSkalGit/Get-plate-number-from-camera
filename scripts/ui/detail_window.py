@@ -919,6 +919,13 @@ class CameraDetailWindow:
     def _render_tick(self):
         if self._is_closing:
             return
+        try:
+            if self.win.state() == "iconic":
+                self._render_after_id = self.win.after(250, self._render_tick)
+                return
+        except Exception:
+            pass
+
         detail_fps = max(5.0, min(60.0, float(self.hw_cfg.get("display_detail_fps", 25.0))))
         interval_ms = max(16, int(round(1000.0 / detail_fps)))
 
@@ -932,12 +939,15 @@ class CameraDetailWindow:
                 frame_ref = snap.get("frame")
                 seq = int(snap.get("seq", 0))
                 now = time.time()
-                if frame_ref is not None and (seq != self._last_drawn_seq or (now - self._last_draw_ts) >= 0.25):
+                if frame_ref is not None and (seq != self._last_drawn_seq or (now - self._last_draw_ts) >= 0.5):
                     self._last_drawn_seq = seq
                     self._last_draw_ts = now
                     self._last_main_offline = False
-                    frame = frame_ref.copy()
-                    self._draw_overlays_and_present(frame, snap.get("overlay") or {}, now)
+                    overlay = snap.get("overlay") or {}
+                    self._live_last_raw_frame = frame_ref
+                    self._live_last_overlay = overlay
+                    self._live_last_now = float(now)
+                    self._draw_overlays_and_present(frame_ref.copy(), overlay, now, cache_raw=False)
                 elif frame_ref is None and st in ("offline", "reconnecting"):
                     self.img_main_tk = None
                     self._live_last_raw_frame = None
@@ -956,13 +966,10 @@ class CameraDetailWindow:
         if cache_raw:
             try:
                 self._live_last_raw_frame = frame.copy()
-                try:
-                    self._live_last_overlay = copy.deepcopy(overlay or {})
-                except Exception:
-                    self._live_last_overlay = {
-                        k: (dict(v) if isinstance(v, dict) else v)
-                        for k, v in (overlay or {}).items()
-                    }
+                self._live_last_overlay = {
+                    k: (dict(v) if isinstance(v, dict) else v)
+                    for k, v in (overlay or {}).items()
+                }
                 self._live_last_now = float(now)
             except Exception:
                 pass
@@ -2144,7 +2151,19 @@ class CameraDetailWindow:
                 self._render_current_roi_view()
             return
 
-        cap = cv2.VideoCapture(fpath)
+        cap = None
+        if hasattr(cv2, "CAP_PROP_N_THREADS") and hasattr(cv2, "CAP_FFMPEG"):
+            try:
+                cap = cv2.VideoCapture(fpath, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 2])
+            except Exception:
+                cap = None
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            cap = cv2.VideoCapture(fpath)
         if not cap.isOpened():
             self._set_screen_canvas_placeholder_key("ui.detail.ph.video_open_err", "[Failed to open video]", color="#ff5555")
             if self.roi_visible or self.roi_panel.winfo_ismapped():

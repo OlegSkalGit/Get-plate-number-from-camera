@@ -12,6 +12,7 @@ from datetime import datetime
 import numpy as np
 
 from scripts.core.i18n import tr
+from scripts.core.io_pool import submit_io
 
 try:
     import cv2
@@ -256,10 +257,11 @@ def _imwrite_bgr(path: str, img) -> bool:
 def async_write_image(path, img):
     def _worker():
         try:
-            _imwrite_bgr(path, img)
+            if img is not None:
+                _imwrite_bgr(path, img)
         except Exception:
             pass
-    threading.Thread(target=_worker, daemon=True).start()
+    submit_io(_worker)
 
 
 def _sidecar_path_for_crop(face_path: str) -> str:
@@ -404,23 +406,44 @@ def is_valid_frontal_face(landmarks, box, min_size=20, max_yaw=32.0, max_pitch=2
     return ok
 
 
+def _expand_cuda_provider(req_providers: list) -> list:
+    out = []
+    for p in req_providers:
+        if p == "CUDAExecutionProvider":
+            out.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
+        else:
+            out.append(p)
+    return out
+
+
 def _build_ort_session(model_path: str, providers=None, intra_op_threads: int = 2):
     _ensure_deps()
     if ort is None:
         raise ImportError("Package 'onnxruntime' is not installed for the faces module")
+    try:
+        ort.set_default_logger_severity(3)
+    except Exception:
+        pass
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
     opts.intra_op_num_threads = max(1, int(intra_op_threads))
+    opts.inter_op_num_threads = 1
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
     req_providers = list(providers) if providers else ["CPUExecutionProvider"]
+    opt_providers = _expand_cuda_provider(req_providers)
     try:
-        sess = ort.InferenceSession(model_path, opts, providers=req_providers)
+        sess = ort.InferenceSession(model_path, opts, providers=opt_providers)
         return sess
     except Exception:
-        if req_providers != ["CPUExecutionProvider"]:
-            return ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
-        raise
+        try:
+            sess = ort.InferenceSession(model_path, opts, providers=req_providers)
+            return sess
+        except Exception:
+            if req_providers != ["CPUExecutionProvider"]:
+                return ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
+            raise
 
 
 class SCRFDDetector:
@@ -431,6 +454,7 @@ class SCRFDDetector:
         self.model_path = model_path
         self.input_size = input_size
         self._lock = threading.Lock()
+        self._anchor_cache = {}
         self.session = _build_ort_session(model_path, providers=providers, intra_op_threads=intra_op_threads)
         self.active_providers = self.session.get_providers()
         self.input_name = self.session.get_inputs()[0].name
@@ -458,6 +482,19 @@ class SCRFDDetector:
             self._feat_stride_fpn = []
             self.has_kps = num_outputs >= 2
 
+    def _get_anchors(self, target_w: int, target_h: int, stride: int, num_anchors: int):
+        key = (target_w, target_h, stride, num_anchors)
+        cached = self._anchor_cache.get(key)
+        if cached is not None:
+            return cached
+        height, width = target_h // stride, target_w // stride
+        anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+        anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+        if num_anchors > 1:
+            anchor_centers = np.repeat(anchor_centers, num_anchors, axis=0)
+        self._anchor_cache[key] = anchor_centers
+        return anchor_centers
+
     def detect(self, img, conf_thresh=0.40):
         if cv2 is None or img is None or img.size == 0:
             return []
@@ -478,13 +515,19 @@ class SCRFDDetector:
 
         canvas[top:top + nh, left:left + nw] = resized
 
-        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 128.0, (target_w, target_h), (127.5, 127.5, 127.5))
+        # swapRB=False: SCRFD очікує BGR-порядок каналів як у cv2.dnn.blobFromImage(..., swapRB=False)
+        blob_chw = canvas.transpose(2, 0, 1).astype(np.float32)
+        blob_chw -= np.float32(127.5)
+        blob_chw *= np.float32(1.0 / 128.0)
+        blob = blob_chw[None, ...]
+
         with self._lock:
             outs = self.session.run(self.output_names, {self.input_name: blob})
 
         scores_list = []
         bboxes_list = []
         kpss_list = []
+        inv_r = 1.0 / r
 
         if self.fmc == 0 and len(outs) in (2, 3):
             raw_boxes = np.squeeze(outs[0])
@@ -492,23 +535,22 @@ class SCRFDDetector:
 
             if raw_boxes.ndim == 2 and raw_boxes.shape[1] >= 5:
                 scores = raw_boxes[:, 4]
-                mask = scores >= conf_thresh
-                for i in np.where(mask)[0]:
-                    bx1 = (raw_boxes[i, 0] - dw) / r
-                    by1 = (raw_boxes[i, 1] - dh) / r
-                    bx2 = (raw_boxes[i, 2] - dw) / r
-                    by2 = (raw_boxes[i, 3] - dh) / r
-
-                    scores_list.append(float(scores[i]))
-                    bboxes_list.append([int(bx1), int(by1), int(bx2), int(by2)])
-
+                pos_inds = np.where(scores >= conf_thresh)[0]
+                if pos_inds.size > 0:
+                    sb = raw_boxes[pos_inds]
+                    bx1_i = ((sb[:, 0] - dw) * inv_r).astype(np.int32)
+                    by1_i = ((sb[:, 1] - dh) * inv_r).astype(np.int32)
+                    bx2_i = ((sb[:, 2] - dw) * inv_r).astype(np.int32)
+                    by2_i = ((sb[:, 3] - dh) * inv_r).astype(np.int32)
+                    scores_list.extend(scores[pos_inds].astype(np.float64).tolist())
+                    bboxes_list.extend(np.column_stack((bx1_i, by1_i, bx2_i, by2_i)).tolist())
                     if raw_kps is not None:
-                        kp = raw_kps[i].copy()
-                        kp[:, 0] = (kp[:, 0] - dw) / r
-                        kp[:, 1] = (kp[:, 1] - dh) / r
-                        kpss_list.append(kp)
+                        skp = raw_kps[pos_inds].astype(np.float32, copy=True)
+                        skp[:, :, 0] = (skp[:, :, 0] - dw) * inv_r
+                        skp[:, :, 1] = (skp[:, :, 1] - dh) * inv_r
+                        kpss_list.extend(list(skp))
                     else:
-                        kpss_list.append(None)
+                        kpss_list.extend([None] * len(pos_inds))
         else:
             for idx, stride in enumerate(self._feat_stride_fpn):
                 score_map = np.squeeze(outs[idx])
@@ -520,55 +562,65 @@ class SCRFDDetector:
                     score_map = score_map.reshape((-1, 1))
 
                 num_anchors = max(1, score_map.shape[0] // (height * width))
-                anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
-                anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-                if num_anchors > 1:
-                    anchor_centers = np.repeat(anchor_centers, num_anchors, axis=0)
+                anchor_centers = self._get_anchors(target_w, target_h, stride, num_anchors)
 
                 valid_len = min(len(anchor_centers), len(score_map), len(bbox_map))
                 scores = score_map[:valid_len].reshape(-1)
-                bbox_deltas = bbox_map[:valid_len] * stride
-                anchors = anchor_centers[:valid_len]
-
                 pos_inds = np.where(scores >= conf_thresh)[0]
-                for p in pos_inds:
-                    cx, cy = anchors[p]
-                    sc = scores[p]
-                    del_x1, del_y1, del_x2, del_y2 = bbox_deltas[p][:4]
+                if pos_inds.size == 0:
+                    continue
 
-                    bx1 = ((cx - del_x1) - dw) / r
-                    by1 = ((cy - del_y1) - dh) / r
-                    bx2 = ((cx + del_x2) - dw) / r
-                    by2 = ((cy + del_y2) - dh) / r
+                sel_anchors = anchor_centers[pos_inds]
+                sel_deltas = bbox_map[pos_inds, :4].astype(np.float32) * stride
+                cx = sel_anchors[:, 0]
+                cy = sel_anchors[:, 1]
 
-                    scores_list.append(float(sc))
-                    bboxes_list.append([int(bx1), int(by1), int(bx2), int(by2)])
+                bx1_i = ((cx - sel_deltas[:, 0] - dw) * inv_r).astype(np.int32)
+                by1_i = ((cy - sel_deltas[:, 1] - dh) * inv_r).astype(np.int32)
+                bx2_i = ((cx + sel_deltas[:, 2] - dw) * inv_r).astype(np.int32)
+                by2_i = ((cy + sel_deltas[:, 3] - dh) * inv_r).astype(np.int32)
 
-                    if kps_map is not None and p < len(kps_map):
-                        kps_delta = kps_map[p] * stride
-                        kps = kps_delta.reshape((5, 2))
-                        kps[:, 0] = ((kps[:, 0] + cx) - dw) / r
-                        kps[:, 1] = ((kps[:, 1] + cy) - dh) / r
-                        kpss_list.append(kps)
+                scores_list.extend(scores[pos_inds].astype(np.float64).tolist())
+                bboxes_list.extend(np.column_stack((bx1_i, by1_i, bx2_i, by2_i)).tolist())
+
+                if kps_map is not None:
+                    klen = len(kps_map)
+                    if int(pos_inds.max()) < klen:
+                        kps_batch = (kps_map[pos_inds].astype(np.float32) * stride).reshape((-1, 5, 2))
+                        kps_batch[:, :, 0] = (kps_batch[:, :, 0] + cx[:, None] - dw) * inv_r
+                        kps_batch[:, :, 1] = (kps_batch[:, :, 1] + cy[:, None] - dh) * inv_r
+                        kpss_list.extend(list(kps_batch))
                     else:
-                        kpss_list.append(None)
+                        for j, p in enumerate(pos_inds):
+                            if p < klen:
+                                kp = (kps_map[p].astype(np.float32) * stride).reshape((5, 2))
+                                kp[:, 0] = (kp[:, 0] + cx[j] - dw) * inv_r
+                                kp[:, 1] = (kp[:, 1] + cy[j] - dh) * inv_r
+                                kpss_list.append(kp)
+                            else:
+                                kpss_list.append(None)
+                else:
+                    kpss_list.extend([None] * len(pos_inds))
 
         if not bboxes_list:
             return []
 
-        boxes_for_nms = [
-            [max(0, b[0]), max(0, b[1]), max(1, b[2] - b[0]), max(1, b[3] - b[1])]
-            for b in bboxes_list
-        ]
+        b_arr = np.asarray(bboxes_list, dtype=np.int32)
+        x1_c = np.maximum(0, b_arr[:, 0])
+        y1_c = np.maximum(0, b_arr[:, 1])
+        w_c = np.maximum(1, b_arr[:, 2] - x1_c)
+        h_c = np.maximum(1, b_arr[:, 3] - y1_c)
+        boxes_for_nms = np.column_stack((x1_c, y1_c, w_c, h_c)).tolist()
+
         indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores_list, conf_thresh, 0.40)
         results = []
         if len(indices) > 0:
             for i in indices.flatten():
                 bx1, by1, bw, bh = boxes_for_nms[i]
                 results.append({
-                    "box": [bx1, by1, bx1 + bw, by1 + bh],
+                    "box": [int(bx1), int(by1), int(bx1 + bw), int(by1 + bh)],
                     "conf": scores_list[i],
-                    "landmarks": kpss_list[i]
+                    "landmarks": kpss_list[i],
                 })
         return results
 
@@ -613,7 +665,21 @@ class _BaseFaceDB:
         self._db_lock = threading.Lock()
         self.known_templates = []
         self._db_sig = None
+        self._db_gen = 0
+        self._gallery_mat = None
+        self._gallery_owner_idx = None
+        self._gallery_owner_uids = None
+        self._gallery_built_gen = -1
+        self._gallery_built_len = -1
         self._last_template_save_ts = {}
+
+    def _invalidate_gallery_cache_locked(self):
+        self._db_gen += 1
+        self._gallery_mat = None
+        self._gallery_owner_idx = None
+        self._gallery_owner_uids = None
+        self._gallery_built_gen = -1
+        self._gallery_built_len = -1
 
     def set_allow_disk_write(self, allow: bool):
         allow_b = bool(allow)
@@ -647,6 +713,7 @@ class _BaseFaceDB:
         Підтримує старий формат (ID_XXXX, 3 колонки та одиночний вектор без '|').
         """
         self.known_templates.clear()
+        self._invalidate_gallery_cache_locked()
         if not os.path.exists(self.db_path):
             if not getattr(self, "allow_disk_write", True):
                 self._db_sig = None
@@ -708,11 +775,13 @@ class _BaseFaceDB:
                 })
 
         self._db_sig = self._file_sig(self.db_path)
+        self._invalidate_gallery_cache_locked()
 
     def _sync_if_modified_locked(self):
         if not os.path.exists(self.db_path):
             if self.known_templates:
                 self.known_templates.clear()
+                self._invalidate_gallery_cache_locked()
             self._db_sig = None
             return
         cur_sig = self._file_sig(self.db_path)
@@ -751,6 +820,7 @@ class _BaseFaceDB:
                 pass
         os.replace(tmp_path, self.db_path)
         self._db_sig = self._file_sig(self.db_path)
+        self._invalidate_gallery_cache_locked()
 
     def _next_unique_id_locked(self) -> str:
         """Генерує унікальний UUID v4 для кожного нового обличчя в базі."""
@@ -775,23 +845,88 @@ class _BaseFaceDB:
         tpath = os.path.join(self.thumbs_dir, f"{sanitize_filename_part(u_id)}.jpg")
         return tpath if os.path.exists(tpath) else ""
 
+    def _ensure_gallery_cache_locked(self):
+        cur_len = len(self.known_templates)
+        if self._gallery_built_gen == self._db_gen and self._gallery_built_len == cur_len:
+            return
+        rows = []
+        owners = []
+        owner_uids = []
+        for idx, record in enumerate(self.known_templates):
+            uid = record["id"]
+            gallery = record.get("gallery") or [record["vector"]]
+            for v in gallery:
+                rows.append(np.asarray(v, dtype=np.float32))
+                owners.append(idx)
+                owner_uids.append(uid)
+        if rows:
+            self._gallery_mat = np.vstack(rows).astype(np.float32, copy=False)
+            self._gallery_owner_idx = np.asarray(owners, dtype=np.int32)
+            self._gallery_owner_uids = owner_uids
+        else:
+            self._gallery_mat = None
+            self._gallery_owner_idx = None
+            self._gallery_owner_uids = []
+        self._gallery_built_gen = self._db_gen
+        self._gallery_built_len = cur_len
+
     @staticmethod
     def _find_best_match_locked_in(templates, norm_emb, exclude_uids=None):
-        best_idx = -1
-        best_sim = -1.0
+        if not templates:
+            return -1, -1.0
         excl = exclude_uids or set()
+        rows = []
+        owners = []
         for idx, record in enumerate(templates):
             if record["id"] in excl:
                 continue
             gallery = record.get("gallery", [record["vector"]])
-            sim = max(float(np.dot(norm_emb, v)) for v in gallery)
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = idx
-        return best_idx, best_sim
+            for v in gallery:
+                rows.append(np.asarray(v, dtype=np.float32))
+                owners.append(idx)
+        if not rows:
+            return -1, -1.0
+        mat = np.vstack(rows).astype(np.float32, copy=False)
+        q = np.asarray(norm_emb, dtype=np.float32)
+        if mat.shape[1] != q.shape[0]:
+            best_idx = -1
+            best_sim = -1.0
+            for idx, record in enumerate(templates):
+                if record["id"] in excl:
+                    continue
+                gallery = record.get("gallery", [record["vector"]])
+                sim = max(float(np.dot(norm_emb, v)) for v in gallery)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_idx = idx
+            return best_idx, best_sim
+        sims = mat @ q
+        pos = int(np.argmax(sims))
+        best_sim = float(sims[pos])
+        if best_sim <= -1.0:
+            return -1, -1.0
+        return int(owners[pos]), best_sim
 
     def _find_best_match_locked(self, norm_emb, exclude_uids=None):
-        return self._find_best_match_locked_in(self.known_templates, norm_emb, exclude_uids=exclude_uids)
+        self._ensure_gallery_cache_locked()
+        if self._gallery_mat is None or self._gallery_mat.shape[0] == 0:
+            return -1, -1.0
+        q = np.asarray(norm_emb, dtype=np.float32)
+        if self._gallery_mat.shape[1] != q.shape[0]:
+            return self._find_best_match_locked_in(self.known_templates, norm_emb, exclude_uids=exclude_uids)
+        sims = self._gallery_mat @ q
+        if exclude_uids:
+            excl = exclude_uids
+            uids = self._gallery_owner_uids
+            valid_mask = np.fromiter((u not in excl for u in uids), dtype=bool, count=len(uids))
+            if not np.any(valid_mask):
+                return -1, -1.0
+            sims = np.where(valid_mask, sims, -2.0)
+        pos = int(np.argmax(sims))
+        best_sim = float(sims[pos])
+        if best_sim <= -1.0:
+            return -1, -1.0
+        return int(self._gallery_owner_idx[pos]), best_sim
 
     # --- Базові CRUD методи для GUI ---
     def list_records(self):
@@ -1514,7 +1649,14 @@ class FaceRecognizer(_BaseFaceDB):
         self._infer_lock = threading.Lock()
         self.session = _build_ort_session(model_path, providers=providers, intra_op_threads=intra_op_threads)
         self.active_providers = self.session.get_providers()
-        self.input_name = self.session.get_inputs()[0].name
+        in0 = self.session.get_inputs()[0]
+        self.input_name = in0.name
+        self._supports_batch = True
+        try:
+            if in0.shape and isinstance(in0.shape[0], int) and in0.shape[0] > 0:
+                self._supports_batch = False
+        except Exception:
+            pass
 
         with self._db_lock:
             self._load_database_locked()
@@ -1522,21 +1664,55 @@ class FaceRecognizer(_BaseFaceDB):
     def _get_embedder(self):
         return self
 
-    def compute_embedding(self, face_112_bgr):
-        _ensure_deps()
+    @staticmethod
+    def _prep_face_chw(face_112_bgr):
         if cv2 is not None:
             rgb = cv2.cvtColor(face_112_bgr, cv2.COLOR_BGR2RGB)
         else:
             rgb = face_112_bgr[:, :, ::-1]
-        tensor = (rgb.astype(np.float32) - 127.5) / 128.0
-        tensor = np.transpose(tensor, (2, 0, 1))
-        tensor = np.expand_dims(tensor, axis=0)
+        chw = rgb.transpose(2, 0, 1).astype(np.float32)
+        chw -= np.float32(127.5)
+        chw *= np.float32(1.0 / 128.0)
+        return chw
+
+    def compute_embedding(self, face_112_bgr):
+        _ensure_deps()
+        tensor = self._prep_face_chw(face_112_bgr)[None, ...]
 
         with self._infer_lock:
             outs = self.session.run(None, {self.input_name: tensor})
         emb = outs[0][0]
         norm = np.linalg.norm(emb)
         return emb / (norm + 1e-10)
+
+    def compute_embeddings_batch(self, face_crops: list) -> list:
+        _ensure_deps()
+        n = len(face_crops)
+        if n == 0:
+            return []
+        if n == 1:
+            return [self.compute_embedding(face_crops[0])]
+
+        tensors = [self._prep_face_chw(c) for c in face_crops]
+        if self._supports_batch:
+            batch = np.stack(tensors, axis=0)
+            try:
+                with self._infer_lock:
+                    outs = self.session.run(None, {self.input_name: batch})[0]
+                norms = np.linalg.norm(outs, axis=1, keepdims=True)
+                normed = outs / (norms + 1e-10)
+                return [normed[i] for i in range(n)]
+            except Exception:
+                self._supports_batch = False
+
+        res = []
+        for t in tensors:
+            blob = t[None, ...]
+            with self._infer_lock:
+                outs = self.session.run(None, {self.input_name: blob})[0]
+            emb = outs[0]
+            res.append(emb / (np.linalg.norm(emb) + 1e-10))
+        return res
 
     def identify_readonly(self, fused_embedding, min_similarity=0.45):
         """Повертає поточний збіг без створення нового ID або запису на диск (для live-підпису)."""
@@ -1644,12 +1820,15 @@ class FallbackFaceDB(_BaseFaceDB):
             emb.set_allow_disk_write(allow)
 
     def _sync_if_modified_locked(self):
-        # Для легкої БД без 30FPS-циклу перечитуємо завжди при зміні або відсутності
         if not os.path.exists(self.db_path):
-            self.known_templates.clear()
+            if self.known_templates:
+                self.known_templates.clear()
+                self._invalidate_gallery_cache_locked()
             self._db_sig = None
             return
-        self._load_database_locked()
+        cur_sig = self._file_sig(self.db_path)
+        if cur_sig != self._db_sig:
+            self._load_database_locked()
 
     def _get_embedder(self):
         if self._lazy_embedder is not None:
@@ -1696,6 +1875,27 @@ class FaceTrack:
         self.status_tag = ""
         self.is_ignored = False
         self.last_preview_ts = 0.0
+        self._crop_emb_cache = {}
+
+    def set_cached_embedding(self, crop, emb):
+        if crop is None or emb is None:
+            return
+        self._crop_emb_cache[id(crop)] = (crop, emb)
+        if len(self._crop_emb_cache) > (self.max_pool_size + 2):
+            keep_ids = {id(c) for c, _ in self.face_pool}
+            if self.best_face_img is not None:
+                keep_ids.add(id(self.best_face_img))
+            for k in list(self._crop_emb_cache.keys()):
+                if k not in keep_ids:
+                    self._crop_emb_cache.pop(k, None)
+
+    def get_cached_embedding(self, crop):
+        if crop is None:
+            return None
+        entry = self._crop_emb_cache.get(id(crop))
+        if entry is not None and entry[0] is crop:
+            return entry[1]
+        return None
 
     def update(self, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0):
         self.bbox = bbox
@@ -1766,6 +1966,7 @@ class FaceEngine:
         self.next_track_id = 1
         self.track_timeout = 2.0
         self.recently_saved = {}
+        self._last_full_scrfd_ts = 0.0
 
     def _reload_params(self):
         self.allow_disk_write = _parse_allow_disk_write(self.config)
@@ -1799,18 +2000,21 @@ class FaceEngine:
             if (now - ts) < self.face_sleep_time
         }
 
-    def process_frame(self, frame):
-        if frame is None or frame.size == 0:
+    def _detect_and_align(self, frame):
+        if frame is None or getattr(frame, "size", 0) == 0:
             return []
         frame_h, frame_w = frame.shape[:2]
-        face_detections = self.detector.detect(frame, conf_thresh=self.face_det_thresh)
+        with self._state_lock:
+            det_thresh = self.face_det_thresh
+            min_sz = self.face_min_size
+        face_detections = self.detector.detect(frame, conf_thresh=det_thresh)
         current_faces = []
 
         for f_info in face_detections:
             ok, ayaw, apitch = evaluate_frontal_face(
                 f_info["landmarks"],
                 f_info["box"],
-                min_size=self.face_min_size,
+                min_size=min_sz,
                 max_yaw=32.0,
                 max_pitch=28.0,
                 frame_w=frame_w,
@@ -1829,75 +2033,135 @@ class FaceEngine:
                 "yaw": ayaw,
                 "pitch": apitch,
             })
+        return current_faces
 
-        now = time.time()
+    def _collect_track_crops_needed(self, preview_tracks, save_tracks):
+        needed = []
+        seen_ids = set()
+        for t in preview_tracks:
+            c = t.best_face_img
+            if c is not None and t.get_cached_embedding(c) is None and id(c) not in seen_ids:
+                seen_ids.add(id(c))
+                needed.append((t, c))
+        for t, _is_flush in save_tracks:
+            if t.best_face_img is None or t.best_sharpness < 25.0:
+                continue
+            has_pool = False
+            for c, sh in t.face_pool:
+                if sh >= 12.0 and c is not None:
+                    has_pool = True
+                    if t.get_cached_embedding(c) is None and id(c) not in seen_ids:
+                        seen_ids.add(id(c))
+                        needed.append((t, c))
+            if not has_pool and t.best_face_img is not None:
+                c = t.best_face_img
+                if t.get_cached_embedding(c) is None and id(c) not in seen_ids:
+                    seen_ids.add(id(c))
+                    needed.append((t, c))
+        return needed
+
+    def _match_tracks_locked(self, frame, current_faces, now: float):
+        self._prune_recently_saved_locked(now)
         unmatched_faces = list(range(len(current_faces)))
+        preview_tracks = []
+        save_tracks = []
 
-        with self._state_lock:
-            self._prune_recently_saved_locked(now)
-
-            for f_id, f_track in list(self.active_tracks.items()):
-                best_idx = -1
-                min_dist = float("inf")
-                for idx in unmatched_faces:
-                    det = current_faces[idx]
-                    c1x = (f_track.bbox[0] + f_track.bbox[2]) / 2.0
-                    c1y = (f_track.bbox[1] + f_track.bbox[3]) / 2.0
-                    c2x = (det["box"][0] + det["box"][2]) / 2.0
-                    c2y = (det["box"][1] + det["box"][3]) / 2.0
-                    dist = math.hypot(c1x - c2x, c1y - c2y)
-                    bw = max(10, det["box"][2] - det["box"][0])
-                    bh = max(10, det["box"][3] - det["box"][1])
-                    max_track_dist = max(40.0, max(bw, bh) * 2.0)
-                    if dist < max_track_dist and dist < min_dist:
-                        min_dist = dist
-                        best_idx = idx
-
-                if best_idx != -1:
-                    det = current_faces[best_idx]
-                    f_track.update(
-                        det["box"], det["crop"], frame.copy(), det["sharpness"],
-                        yaw=det["yaw"], pitch=det["pitch"]
-                    )
-                    unmatched_faces.remove(best_idx)
-
-                    if f_track.u_id and self.cooldown_extend_on_seen and f_track.u_id in self.recently_saved:
-                        self.recently_saved[f_track.u_id] = now
-
-                    if not f_track.saved and f_track.frames_tracked >= 2 and (now - f_track.last_preview_ts) >= 0.8:
-                        f_track.last_preview_ts = now
-                        if f_track.best_sharpness >= 18.0:
-                            emb = self.recognizer.compute_embedding(f_track.best_face_img)
-                            p_uid, p_name, p_tag, p_ign = self.recognizer.identify_readonly(
-                                emb, min_similarity=self.face_min_similarity
-                            )
-                            if p_uid is not None:
-                                f_track.u_id = p_uid
-                                f_track.face_name = p_name
-                                f_track.status_tag = p_tag
-                                f_track.is_ignored = p_ign
-
-                    if not f_track.saved and f_track.best_sharpness >= 40.0 and f_track.frames_tracked >= 6:
-                        self._save_verified_face_locked(f_track, is_flush=False)
-                        f_track.saved = True
-
+        for f_id, f_track in list(self.active_tracks.items()):
+            best_idx = -1
+            min_dist = float("inf")
             for idx in unmatched_faces:
                 det = current_faces[idx]
-                f_tid = self.next_track_id
-                self.next_track_id += 1
-                self.active_tracks[f_tid] = FaceTrack(
-                    f_tid, det["box"], det["crop"], frame.copy(), det["sharpness"],
+                c1x = (f_track.bbox[0] + f_track.bbox[2]) / 2.0
+                c1y = (f_track.bbox[1] + f_track.bbox[3]) / 2.0
+                c2x = (det["box"][0] + det["box"][2]) / 2.0
+                c2y = (det["box"][1] + det["box"][3]) / 2.0
+                dist = math.hypot(c1x - c2x, c1y - c2y)
+                bw = max(10, det["box"][2] - det["box"][0])
+                bh = max(10, det["box"][3] - det["box"][1])
+                max_track_dist = max(40.0, max(bw, bh) * 2.0)
+                if dist < max_track_dist and dist < min_dist:
+                    min_dist = dist
+                    best_idx = idx
+
+            if best_idx != -1:
+                det = current_faces[best_idx]
+                f_track.update(
+                    det["box"], det["crop"], frame, det["sharpness"],
                     yaw=det["yaw"], pitch=det["pitch"]
                 )
+                unmatched_faces.remove(best_idx)
 
-            for f_id, f_track in list(self.active_tracks.items()):
-                if (now - f_track.last_seen) > self.track_timeout:
-                    if not f_track.saved:
-                        self._save_verified_face_locked(f_track, is_flush=False)
-                    del self.active_tracks[f_id]
+                if f_track.u_id and self.cooldown_extend_on_seen and f_track.u_id in self.recently_saved:
+                    self.recently_saved[f_track.u_id] = now
 
-            display_boxes = [(t.bbox, t.face_name, t.status_tag) for t in self.active_tracks.values()]
-        return display_boxes
+                if not f_track.saved and f_track.frames_tracked >= 2 and (now - f_track.last_preview_ts) >= 0.8:
+                    f_track.last_preview_ts = now
+                    if f_track.best_sharpness >= 18.0:
+                        preview_tracks.append(f_track)
+
+                if not f_track.saved and f_track.best_sharpness >= 40.0 and f_track.frames_tracked >= 6:
+                    save_tracks.append((f_track, False))
+
+        for idx in unmatched_faces:
+            det = current_faces[idx]
+            f_tid = self.next_track_id
+            self.next_track_id += 1
+            self.active_tracks[f_tid] = FaceTrack(
+                f_tid, det["box"], det["crop"], frame, det["sharpness"],
+                yaw=det["yaw"], pitch=det["pitch"]
+            )
+
+        for f_id, f_track in list(self.active_tracks.items()):
+            if (now - f_track.last_seen) > self.track_timeout:
+                del self.active_tracks[f_id]
+                if not f_track.saved:
+                    save_tracks.append((f_track, False))
+
+        return preview_tracks, save_tracks
+
+    def _finalize_tracks_locked(self, preview_tracks, save_tracks):
+        for f_track in preview_tracks:
+            emb = f_track.get_cached_embedding(f_track.best_face_img)
+            if emb is None:
+                emb = self.recognizer.compute_embedding(f_track.best_face_img)
+                f_track.set_cached_embedding(f_track.best_face_img, emb)
+            p_uid, p_name, p_tag, p_ign = self.recognizer.identify_readonly(
+                emb, min_similarity=self.face_min_similarity
+            )
+            if p_uid is not None:
+                f_track.u_id = p_uid
+                f_track.face_name = p_name
+                f_track.status_tag = p_tag
+                f_track.is_ignored = p_ign
+
+        for f_track, is_flush in save_tracks:
+            if not f_track.saved:
+                self._save_verified_face_locked(f_track, is_flush=is_flush)
+                f_track.saved = True
+
+        return [(t.bbox, t.face_name, t.status_tag) for t in self.active_tracks.values()]
+
+    def process_frame(self, frame):
+        if frame is None or frame.size == 0:
+            return []
+        current_faces = self._detect_and_align(frame)
+        now = time.time()
+        with self._state_lock:
+            self._last_full_scrfd_ts = now
+            preview_tracks, save_tracks = self._match_tracks_locked(frame, current_faces, now)
+            needed = self._collect_track_crops_needed(preview_tracks, save_tracks)
+
+        if needed:
+            crops = [c for _, c in needed]
+            if hasattr(self.recognizer, "compute_embeddings_batch"):
+                embs = self.recognizer.compute_embeddings_batch(crops)
+            else:
+                embs = [self.recognizer.compute_embedding(c) for c in crops]
+            for (t, c), emb in zip(needed, embs):
+                t.set_cached_embedding(c, emb)
+
+        with self._state_lock:
+            return self._finalize_tracks_locked(preview_tracks, save_tracks)
 
     def flush_tracks(self):
         """Примусове збереження активних незавершених треків (при зупинці або межі дат)."""
@@ -1912,13 +2176,25 @@ class FaceEngine:
         if track.best_face_img is None or track.best_sharpness < 25.0:
             return
 
-        embeddings = []
-        for face_crop, sh in track.face_pool:
-            if sh >= 12.0:
-                embeddings.append(self.recognizer.compute_embedding(face_crop))
+        pool_crops = [face_crop for face_crop, sh in track.face_pool if sh >= 12.0 and face_crop is not None]
+        if not pool_crops and track.best_face_img is not None:
+            pool_crops = [track.best_face_img]
 
+        missing = [c for c in pool_crops if track.get_cached_embedding(c) is None]
+        if missing:
+            if hasattr(self.recognizer, "compute_embeddings_batch"):
+                new_embs = self.recognizer.compute_embeddings_batch(missing)
+            else:
+                new_embs = [self.recognizer.compute_embedding(c) for c in missing]
+            for c, emb in zip(missing, new_embs):
+                track.set_cached_embedding(c, emb)
+
+        embeddings = [track.get_cached_embedding(c) for c in pool_crops]
+        embeddings = [e for e in embeddings if e is not None]
         if not embeddings:
-            embeddings.append(self.recognizer.compute_embedding(track.best_face_img))
+            emb = self.recognizer.compute_embedding(track.best_face_img)
+            track.set_cached_embedding(track.best_face_img, emb)
+            embeddings = [emb]
 
         mean_vector = np.mean(embeddings, axis=0)
         fused_vector = mean_vector / (np.linalg.norm(mean_vector) + 1e-10)
@@ -1999,7 +2275,7 @@ class FaceEngine:
         }
 
         crop_copy = track.best_face_img.copy() if track.best_face_img is not None else None
-        full_copy = track.best_frame.copy() if track.best_frame is not None else None
+        full_copy = track.best_frame
         cb = self.on_saved_callback
 
         def _persist_event():
@@ -2018,7 +2294,7 @@ class FaceEngine:
                     pass
 
         print(f"[ФІКСАЦІЯ ОБЛИЧЧЯ] {f_name} ({u_id}) [{status_tag}], різкість: {track.best_sharpness:.1f}")
-        threading.Thread(target=_persist_event, daemon=True).start()
+        submit_io(_persist_event)
 
 
 # ------------------------------------------------------------------
@@ -2144,6 +2420,81 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
 def _process_and_pack(engine, frame, prev_state=None):
     boxes = engine.process_frame(frame)
     return {"boxes": boxes}
+
+
+def _process_batch_and_pack(items: list, shared_resources=None) -> list:
+    """Батч-обробка облич із безпечним каскадом SCRFD (за person_hint) та батч-ембедінгами ArcFace."""
+    n = len(items)
+    if n == 0:
+        return []
+    out_states = [None] * n
+    now = time.time()
+
+    per_item_faces = [None] * n
+    for idx, it in enumerate(items):
+        eng = it["engine"]
+        fr = it["frame"]
+        if eng is None or fr is None or getattr(fr, "size", 0) == 0:
+            out_states[idx] = {"boxes": []}
+            continue
+
+        meta = it.get("meta") if isinstance(it.get("meta"), dict) else {}
+        person_hint = meta.get("person_hint", None)
+        with eng._state_lock:
+            has_tr = bool(eng.active_tracks)
+            last_ts = eng._last_full_scrfd_ts
+
+        if (person_hint is False) and (not has_tr) and ((now - last_ts) < 1.0):
+            per_item_faces[idx] = []
+        else:
+            per_item_faces[idx] = eng._detect_and_align(fr)
+            with eng._state_lock:
+                eng._last_full_scrfd_ts = now
+
+    rec_groups = {}
+    per_item_tasks = {}
+    for idx, faces_list in enumerate(per_item_faces):
+        if faces_list is None:
+            continue
+        it = items[idx]
+        eng = it["engine"]
+        fr = it["frame"]
+        with eng._state_lock:
+            preview_tracks, save_tracks = eng._match_tracks_locked(fr, faces_list, now)
+            needed = eng._collect_track_crops_needed(preview_tracks, save_tracks)
+        per_item_tasks[idx] = (preview_tracks, save_tracks)
+        if needed:
+            rec = eng.recognizer
+            grp = rec_groups.setdefault(id(rec), {"rec": rec, "pairs": []})
+            grp["pairs"].extend(needed)
+
+    for grp in rec_groups.values():
+        rec = grp["rec"]
+        pairs = grp["pairs"]
+        uniq_crops = []
+        seen_cid = set()
+        for _t, c in pairs:
+            cid = id(c)
+            if cid not in seen_cid:
+                seen_cid.add(cid)
+                uniq_crops.append(c)
+        if hasattr(rec, "compute_embeddings_batch"):
+            embs = rec.compute_embeddings_batch(uniq_crops)
+        else:
+            embs = [rec.compute_embedding(c) for c in uniq_crops]
+        emb_by_cid = {id(c): emb for c, emb in zip(uniq_crops, embs)}
+        for t, c in pairs:
+            emb = emb_by_cid.get(id(c))
+            if emb is not None:
+                t.set_cached_embedding(c, emb)
+
+    for idx, (preview_tracks, save_tracks) in per_item_tasks.items():
+        eng = items[idx]["engine"]
+        with eng._state_lock:
+            display_boxes = eng._finalize_tracks_locked(preview_tracks, save_tracks)
+        out_states[idx] = {"boxes": display_boxes}
+
+    return out_states
 
 
 def _draw_overlays(frame, state_data: dict, mod_cfg: dict, now: float):
@@ -2306,6 +2657,7 @@ MODULE_SPEC = {
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,
     "process_and_pack": _process_and_pack,
+    "process_batch_and_pack": _process_batch_and_pack,
     "draw_overlays": _draw_overlays,
     "flush_tracks": lambda eng: eng.flush_tracks() if eng is not None else None,
     "has_active_tracks": lambda eng: bool(eng is not None and getattr(eng, "active_tracks", None)),

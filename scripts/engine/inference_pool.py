@@ -65,7 +65,10 @@ class InferencePool:
 
         self.ai_backend = str(ai_backend or "cpu").strip().lower()
         self.ai_threads = max(1, min(8, int(ai_threads or 2)))
+        self._cuda_env_prepared = False
         self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
+        if self.ai_backend in ("cuda", "auto"):
+            self._cuda_env_prepared = True
 
         self._lock = threading.RLock()
         # mod_id -> {"res": obj, "sig": file_sig, "ctx": dict}
@@ -80,14 +83,19 @@ class InferencePool:
                 new_ctx.update(app_context)
             new_ctx["base_dir"] = self.base_dir
 
-            backend_changed = (new_backend != self.ai_backend) or (new_threads != self.ai_threads)
+            backend_name_changed = (new_backend != self.ai_backend)
+            backend_changed = backend_name_changed or (new_threads != self.ai_threads)
             ctx_changed = (new_ctx != self.app_context)
 
             old_providers = list(self.providers)
             self.ai_backend = new_backend
             self.ai_threads = new_threads
             self.app_context = new_ctx
-            self.providers = resolve_ort_providers(new_backend, base_dir=self.base_dir)
+            if backend_name_changed or not self.providers:
+                self._cuda_env_prepared = False
+                self.providers = resolve_ort_providers(new_backend, base_dir=self.base_dir)
+                if new_backend in ("cuda", "auto"):
+                    self._cuda_env_prepared = True
             if list(self.providers) != old_providers:
                 backend_changed = True
 
@@ -120,7 +128,10 @@ class InferencePool:
 
     def invalidate_all(self):
         with self._lock:
+            self._cuda_env_prepared = False
             self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
+            if self.ai_backend in ("cuda", "auto"):
+                self._cuda_env_prepared = True
             self._module_resources.clear()
 
     def get_module_resources(self, mod_id: str):
@@ -153,10 +164,11 @@ class InferencePool:
                         cached["ctx"] = copy.deepcopy(self.app_context)
                         return cached["res"]
 
-            if self.ai_backend in ("cuda", "auto") or "CUDAExecutionProvider" in self.providers:
+            if not self._cuda_env_prepared and (self.ai_backend in ("cuda", "auto") or "CUDAExecutionProvider" in self.providers):
                 try:
                     prepare_cuda_dll_environment(self.base_dir, preload=True)
                     self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
+                    self._cuda_env_prepared = True
                 except Exception:
                     pass
 

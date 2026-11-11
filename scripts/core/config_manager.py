@@ -175,6 +175,9 @@ class ConfigManager:
         self.config_json_path = os.path.join(self.base_dir, "config.json")
         self.legacy_ini_path = os.path.join(self.base_dir, "config.ini")
         self._lock = threading.Lock()
+        self._version = 0
+        self._fast_cache_ver = -1
+        self._fast_cache_snap = None
         self.data = self._load_or_migrate()
 
     def _get_registry_default_modules(self) -> dict:
@@ -421,6 +424,7 @@ class ConfigManager:
             after = json.dumps(norm, sort_keys=True, ensure_ascii=False)
             if after != before:
                 self.data = norm
+                self._version += 1
                 if not self._is_operator_mode_locked():
                     self._save_dict_atomic(norm)
                 return True
@@ -455,14 +459,24 @@ class ConfigManager:
         with self._lock:
             return copy.deepcopy(self.data)
 
+    def get_ui_fast_config(self) -> dict:
+        """Повертає кешований read-only знімок конфігурації (оновлюється лише при зміні _version)."""
+        with self._lock:
+            if self._fast_cache_snap is None or self._fast_cache_ver != self._version:
+                self._fast_cache_snap = copy.deepcopy(self.data)
+                self._fast_cache_ver = self._version
+            return self._fast_cache_snap
+
     def save_data(self, new_data: dict):
         with self._lock:
             norm = self._normalize_loaded_config(new_data)
             self.data = norm
+            self._version += 1
             self._save_dict_atomic(norm)
 
     def save(self):
         with self._lock:
+            self._version += 1
             self._save_dict_atomic(self.data)
 
     def get_language(self) -> str:
@@ -474,6 +488,7 @@ class ConfigManager:
         norm = normalize_language_code(lang_code) or DEFAULT_LANGUAGE
         with self._lock:
             self.data.setdefault("general", {})["language"] = norm
+            self._version += 1
             self._save_dict_atomic(self.data)
         return norm
 
@@ -531,6 +546,7 @@ class ConfigManager:
             if self._is_operator_mode_locked():
                 return
             self.data.setdefault("windows", {})[win_key] = copy.deepcopy(geom)
+            self._version += 1
             self._save_dict_atomic(self.data)
 
     def get_camera_window_geometry(self, cam_uuid: str, kind: str = "window") -> dict:
@@ -547,6 +563,7 @@ class ConfigManager:
             for c in self.data.get("cameras", []):
                 if c.get("uuid") == cam_uuid:
                     c[kind] = copy.deepcopy(geom)
+                    self._version += 1
                     self._save_dict_atomic(self.data)
                     return
 

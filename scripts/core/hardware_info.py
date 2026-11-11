@@ -2873,7 +2873,11 @@ def compute_optimal_hardware_config(
         chosen_threads = min(4, max(2, int(phys or (logi // 2))))
 
     hw_decoders = caps.get("hw_decoders") or []
-    if chosen_ai in ("directml", "cuda"):
+    if logi >= 6:
+        # На багатопотокових ПК CPU-декод із вибірковим grab/retrieve уникає D3D11/GPU readback-затримок
+        # і залишає 100% GPU для CUDA/DirectML інференсу та NVENC кодування
+        chosen_decode = "cpu"
+    elif chosen_ai in ("directml", "cuda"):
         if "d3d11va" in hw_decoders:
             chosen_decode = "d3d11va"
         elif chosen_ai == "cuda" and "cuda" in hw_decoders:
@@ -2883,19 +2887,28 @@ def compute_optimal_hardware_config(
     else:
         chosen_decode = "cpu"
 
-    chosen_opencl = bool((caps.get("opencv_opencl") or {}).get("supported", False))
+    chosen_opencl = False
 
     if chosen_ai in ("cuda", "directml"):
-        ai_fps = 10.0 if cam_cnt <= 4 else (8.0 if cam_cnt <= 8 else 6.0)
+        if cam_cnt <= 4:
+            ai_fps, grid_fps = 10.0, 15.0
+        elif cam_cnt <= 8:
+            ai_fps, grid_fps = 8.0, 12.0
+        elif cam_cnt <= 16:
+            ai_fps, grid_fps = 6.0, 10.0
+        elif cam_cnt <= 32:
+            ai_fps, grid_fps = 4.0, 8.0
+        else:
+            ai_fps, grid_fps = 3.0, 6.0
     else:
-        ai_fps = 8.0 if cam_cnt <= 2 else (6.0 if cam_cnt <= 6 else 4.0)
-
-    if chosen_ai != "cpu" or cam_cnt <= 4:
-        grid_fps = 15.0
-    elif cam_cnt <= 8:
-        grid_fps = 12.0
-    else:
-        grid_fps = 8.0
+        if cam_cnt <= 2:
+            ai_fps, grid_fps = 8.0, 15.0
+        elif cam_cnt <= 6:
+            ai_fps, grid_fps = 6.0, 12.0
+        elif cam_cnt <= 16:
+            ai_fps, grid_fps = 4.0, 8.0
+        else:
+            ai_fps, grid_fps = 2.0, 5.0
 
     detail_fps = 25.0
     resize_method = "linear" if (chosen_ai != "cpu" or logi >= 4) else "nearest"

@@ -703,18 +703,22 @@ class VideoEngine:
                 "-g", str(gop_frames),
             ])
         elif codec_name == "libx265":
+            cpu_threads = max(1, min(2, (os.cpu_count() or 4) // 4))
             args.extend([
                 "-vcodec", "libx265",
                 "-preset", self.preset,
                 "-crf", str(self.crf),
                 "-g", str(gop_frames),
+                "-threads", str(cpu_threads),
             ])
         else:
+            cpu_threads = max(1, min(2, (os.cpu_count() or 4) // 4))
             args.extend([
                 "-vcodec", "libx264",
                 "-preset", self.preset,
                 "-crf", str(self.crf),
                 "-g", str(gop_frames),
+                "-threads", str(cpu_threads),
             ])
 
         if self.max_bitrate_kbps > 0:
@@ -722,7 +726,7 @@ class VideoEngine:
                 "-maxrate", f"{self.max_bitrate_kbps}k",
                 "-bufsize", f"{self.max_bitrate_kbps * 2}k",
             ])
-        if (out_w, out_h) != (even_w, even_h):
+        if (out_w, out_h) != (even_w, even_h) and cv2 is None:
             args.extend(["-vf", f"scale={out_w}:{out_h}"])
         args.extend([
             "-pix_fmt", "yuv420p",
@@ -769,6 +773,7 @@ class VideoEngine:
                 codecs_to_try.append("libx264")
 
             opened = False
+            in_w, in_h = (out_w, out_h) if cv2 is not None else (even_w, even_h)
             for enc in codecs_to_try:
                 cmd = [
                     self.ffmpeg_exe,
@@ -776,12 +781,12 @@ class VideoEngine:
                     "-f", "rawvideo",
                     "-vcodec", "rawvideo",
                     "-pix_fmt", "bgr24",
-                    "-s", f"{even_w}x{even_h}",
+                    "-s", f"{in_w}x{in_h}",
                     "-r", f"{self.fps:.3f}",
                     "-i", "-",
                     "-an",
                 ]
-                cmd.extend(self._build_ffmpeg_encoder_args(enc, even_w, even_h, out_w, out_h))
+                cmd.extend(self._build_ffmpeg_encoder_args(enc, in_w, in_h, out_w, out_h))
                 cmd.append(out_path)
                 try:
                     proc = subprocess.Popen(
@@ -954,7 +959,14 @@ class VideoEngine:
                 write_ok = True
                 if self.ffmpeg_proc is not None:
                     try:
-                        self.ffmpeg_proc.stdin.write(np.ascontiguousarray(frame_to_write).tobytes())
+                        out_frame = frame_to_write
+                        if cv2 is not None and (self.output_w, self.output_h) != (self.segment_w, self.segment_h):
+                            out_frame = cv2.resize(frame_to_write, (self.output_w, self.output_h), interpolation=cv2.INTER_AREA)
+                        buf = np.ascontiguousarray(out_frame)
+                        try:
+                            self.ffmpeg_proc.stdin.write(memoryview(buf))
+                        except TypeError:
+                            self.ffmpeg_proc.stdin.write(buf.tobytes())
                     except Exception as e:
                         print(f"[VideoEngine Write Error]: {e}")
                         if self._active_encoder_label != "libx264":
@@ -1036,7 +1048,18 @@ def _probe_video_duration_sec(fpath: str, size_bytes: int, mtime_ns: int, start_
     if cv2 is not None and size_bytes > 0:
         cap = None
         try:
-            cap = cv2.VideoCapture(fpath)
+            if hasattr(cv2, "CAP_PROP_N_THREADS") and hasattr(cv2, "CAP_FFMPEG"):
+                try:
+                    cap = cv2.VideoCapture(fpath, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 1])
+                except Exception:
+                    cap = None
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                cap = cv2.VideoCapture(fpath)
             if cap is not None and cap.isOpened():
                 fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
                 cnt = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)

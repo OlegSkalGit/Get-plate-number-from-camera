@@ -7,11 +7,22 @@ from datetime import datetime
 import numpy as np
 
 from scripts.core.i18n import tr
+from scripts.core.io_pool import submit_io
 
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+
+def _expand_cuda_provider(req_providers: list) -> list:
+    out = []
+    for p in req_providers:
+        if p == "CUDAExecutionProvider":
+            out.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
+        else:
+            out.append(p)
+    return out
 
 
 def _ensure_deps():
@@ -88,14 +99,14 @@ def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None
 
 
 def async_write_image(path, img):
-    """Асинхронний запис зображення на диск без блокування відеопотоку."""
+    """Асинхронний запис зображення на диск через спільний обмежений пул."""
     def _worker():
         try:
-            if cv2 is not None:
+            if cv2 is not None and img is not None:
                 cv2.imwrite(path, img)
         except Exception as e:
             print(f"[Помилка запису скріншота]: {e}")
-    threading.Thread(target=_worker, daemon=True).start()
+    submit_io(_worker)
 
 
 COCO_CLASSES = {
@@ -125,6 +136,7 @@ class PersonDetector:
         self.detect_vehicles = detect_vehicles
         self.use_ort = False
         self.active_providers = ["OpenCV-CPU"]
+        self._supports_batch = False
         self._lock = threading.Lock()
 
         try:
@@ -142,32 +154,36 @@ class PersonDetector:
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
             req_providers = list(providers) if providers else ["CPUExecutionProvider"]
+            opt_providers = _expand_cuda_provider(req_providers)
             try:
-                self.session = ort.InferenceSession(model_path, opts, providers=req_providers)
+                self.session = ort.InferenceSession(model_path, opts, providers=opt_providers)
             except Exception:
-                self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
+                try:
+                    self.session = ort.InferenceSession(model_path, opts, providers=req_providers)
+                except Exception:
+                    self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
             self.active_providers = self.session.get_providers()
-            self.input_name = self.session.get_inputs()[0].name
+            in0 = self.session.get_inputs()[0]
+            self.input_name = in0.name
             self.output_names = [o.name for o in self.session.get_outputs()]
             self.use_ort = True
+            self._supports_batch = True
+            try:
+                if in0.shape and isinstance(in0.shape[0], int) and in0.shape[0] > 0:
+                    self._supports_batch = False
+            except Exception:
+                pass
         except Exception as e:
             print(f"[PersonDetector ONNX Runtime fallback to cv2.dnn]: {e}")
             self.net = cv2.dnn.readNetFromONNX(model_path)
             self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
             self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
             self.use_ort = False
+            self._supports_batch = False
 
-    def predict(self, frame: np.ndarray, conf_thresh: float = 0.45, imgsz: int = 640, detect_vehicles: bool = None):
-        """Детекція людей (клас 0) та опційно транспорту (класи 1-8) без зміни спільного стану."""
-        if cv2 is None or frame is None or frame.size == 0:
-            return []
-
-        use_vehicles = self.detect_vehicles if detect_vehicles is None else bool(detect_vehicles)
-        target_classes = ALL_TARGET_CLASSES if use_vehicles else PERSON_CLASSES
-        target_rows = [4 + c for c in target_classes]
-
+    @staticmethod
+    def _preprocess_one(frame: np.ndarray, imgsz: int):
         h_orig, w_orig = frame.shape[:2]
-
         r = min(imgsz / h_orig, imgsz / w_orig)
         nw, nh = int(round(w_orig * r)), int(round(h_orig * r))
         dw, dh = (imgsz - nw) / 2.0, (imgsz - nh) / 2.0
@@ -181,29 +197,37 @@ class PersonDetector:
         top, left = int(round(dh - 0.1)), int(round(dw - 0.1))
         canvas[top:top + nh, left:left + nw] = resized
 
-        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        chw = rgb.transpose(2, 0, 1).astype(np.float32)
+        chw *= np.float32(1.0 / 255.0)
+        return chw, (w_orig, h_orig, r, dw, dh)
 
-        with self._lock:
-            if self.use_ort:
-                raw = self.session.run(self.output_names, {self.input_name: blob})[0]
-            else:
-                self.net.setInput(blob)
-                raw = self.net.forward()
-
-        preds = np.squeeze(raw)
+    @staticmethod
+    def _postprocess_one(raw_i, meta, conf_thresh: float, use_vehicles: bool, raw_person_hint_thresh: float = 0.12):
+        w_orig, h_orig, r, dw, dh = meta
+        preds = np.asarray(raw_i)
+        if preds.ndim > 2:
+            preds = np.squeeze(preds)
         if preds.ndim != 2:
-            return []
+            return [], True
 
         if preds.shape[0] > preds.shape[1]:
             preds = preds.T
 
+        if preds.shape[0] < 5:
+            return [], True
+
+        person_hint = bool(np.any(preds[4, :] >= raw_person_hint_thresh))
+
+        target_classes = ALL_TARGET_CLASSES if use_vehicles else PERSON_CLASSES
+        target_rows = [4 + c for c in target_classes]
         class_scores = preds[target_rows, :]
         max_scores = np.max(class_scores, axis=0)
         best_class_indices = np.argmax(class_scores, axis=0)
 
         mask = max_scores >= conf_thresh
         if not np.any(mask):
-            return []
+            return [], person_hint
 
         valid_scores = max_scores[mask]
         valid_class_indices = best_class_indices[mask]
@@ -213,52 +237,156 @@ class PersonDetector:
         cy = valid_boxes[1]
         bw = valid_boxes[2]
         bh = valid_boxes[3]
+        hw = bw * 0.5
+        hh = bh * 0.5
 
-        boxes_for_nms = []
-        scores_list = []
-        original_boxes = []
-        detected_classes = []
-        detected_labels = []
+        ox1 = np.clip(np.round((cx - hw - dw) / r), 0, w_orig - 1).astype(np.int32)
+        oy1 = np.clip(np.round((cy - hh - dh) / r), 0, h_orig - 1).astype(np.int32)
+        ox2 = np.clip(np.round((cx + hw - dw) / r), 0, w_orig).astype(np.int32)
+        oy2 = np.clip(np.round((cy + hh - dh) / r), 0, h_orig).astype(np.int32)
 
-        for i in range(len(valid_scores)):
-            s = float(valid_scores[i])
-            c_x, c_y, w, h = float(cx[i]), float(cy[i]), float(bw[i]), float(bh[i])
-            c_id = target_classes[valid_class_indices[i]]
-            lbl = COCO_CLASSES.get(c_id, f"Class_{c_id}")
+        box_w = ox2 - ox1
+        box_h = oy2 - oy1
+        keep = (box_w > 10) & (box_h > 10)
+        if not np.any(keep):
+            return [], person_hint
 
-            ox1 = max(0, min(w_orig - 1, int(round((c_x - w / 2.0 - dw) / r))))
-            oy1 = max(0, min(h_orig - 1, int(round((c_y - h / 2.0 - dh) / r))))
-            ox2 = max(0, min(w_orig, int(round((c_x + w / 2.0 - dw) / r))))
-            oy2 = max(0, min(h_orig, int(round((c_y + h / 2.0 - dh) / r))))
+        ox1_k = ox1[keep]
+        oy1_k = oy1[keep]
+        ox2_k = ox2[keep]
+        oy2_k = oy2[keep]
+        bw_k = box_w[keep]
+        bh_k = box_h[keep]
+        scores_k = valid_scores[keep]
+        cls_arr = np.asarray([target_classes[i] for i in valid_class_indices[keep]], dtype=np.int32)
 
-            box_w = ox2 - ox1
-            box_h = oy2 - oy1
-            if box_w <= 10 or box_h <= 10:
-                continue
-
-            boxes_for_nms.append([ox1 + c_id * 4096, oy1 + c_id * 4096, box_w, box_h])
-            scores_list.append(s)
-            original_boxes.append((ox1, oy1, ox2, oy2))
-            detected_classes.append(c_id)
-            detected_labels.append(lbl)
-
-        if not boxes_for_nms:
-            return []
+        offsets = cls_arr * 4096
+        boxes_for_nms = np.column_stack((ox1_k + offsets, oy1_k + offsets, bw_k, bh_k)).tolist()
+        scores_list = scores_k.astype(np.float64).tolist()
 
         indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores_list, score_threshold=conf_thresh, nms_threshold=0.45)
         if len(indices) == 0:
-            return []
+            return [], person_hint
 
         detections = []
         for idx in indices.flatten():
+            c_id = int(cls_arr[idx])
             detections.append({
-                "box": original_boxes[idx],
-                "conf": scores_list[idx],
-                "class_id": detected_classes[idx],
-                "label": detected_labels[idx]
+                "box": (int(ox1_k[idx]), int(oy1_k[idx]), int(ox2_k[idx]), int(oy2_k[idx])),
+                "conf": float(scores_list[idx]),
+                "class_id": c_id,
+                "label": COCO_CLASSES.get(c_id, f"Class_{c_id}"),
             })
+        return detections, person_hint
 
-        return detections
+    def predict(self, frame: np.ndarray, conf_thresh: float = 0.45, imgsz: int = 640, detect_vehicles: bool = None):
+        """Детекція людей (клас 0) та опційно транспорту (класи 1-8) без зміни спільного стану."""
+        if cv2 is None or frame is None or frame.size == 0:
+            return []
+
+        use_vehicles = self.detect_vehicles if detect_vehicles is None else bool(detect_vehicles)
+        chw, meta = self._preprocess_one(frame, imgsz)
+        blob = chw[None, ...]
+
+        with self._lock:
+            if self.use_ort:
+                raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+            else:
+                self.net.setInput(blob)
+                raw = self.net.forward()
+
+        dets, _ = self._postprocess_one(raw[0] if raw.ndim >= 3 else raw, meta, conf_thresh, use_vehicles)
+        return dets
+
+    def predict_batch(
+        self,
+        frames: list,
+        conf_threshs=0.45,
+        detect_vehicles_flags=None,
+        imgsz: int = 640,
+        raw_person_hint_thresh: float = 0.12,
+    ):
+        n = len(frames)
+        if n == 0 or cv2 is None:
+            return [], []
+        if isinstance(conf_threshs, (int, float)):
+            thresh_list = [float(conf_threshs)] * n
+        else:
+            thresh_list = [float(x) for x in conf_threshs]
+        if detect_vehicles_flags is None:
+            veh_list = [self.detect_vehicles] * n
+        elif isinstance(detect_vehicles_flags, bool):
+            veh_list = [detect_vehicles_flags] * n
+        else:
+            veh_list = [bool(x) for x in detect_vehicles_flags]
+
+        det_results = [[] for _ in range(n)]
+        hint_results = [True] * n
+        valid_indices = []
+        chws = []
+        metas = []
+        for i, fr in enumerate(frames):
+            if fr is None or getattr(fr, "size", 0) == 0:
+                continue
+            chw, meta = self._preprocess_one(fr, imgsz)
+            valid_indices.append(i)
+            chws.append(chw)
+            metas.append(meta)
+
+        if not valid_indices:
+            return det_results, hint_results
+
+        if len(valid_indices) == 1 or not self.use_ort or not self._supports_batch:
+            for k, orig_idx in enumerate(valid_indices):
+                blob = chws[k][None, ...]
+                with self._lock:
+                    if self.use_ort:
+                        raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+                    else:
+                        self.net.setInput(blob)
+                        raw = self.net.forward()
+                dets, ph = self._postprocess_one(
+                    raw[0] if raw.ndim >= 3 else raw,
+                    metas[k],
+                    thresh_list[orig_idx],
+                    veh_list[orig_idx],
+                    raw_person_hint_thresh=raw_person_hint_thresh,
+                )
+                det_results[orig_idx] = dets
+                hint_results[orig_idx] = ph
+            return det_results, hint_results
+
+        batch_blob = np.stack(chws, axis=0)
+        try:
+            with self._lock:
+                raw_batch = self.session.run(self.output_names, {self.input_name: batch_blob})[0]
+            for k, orig_idx in enumerate(valid_indices):
+                dets, ph = self._postprocess_one(
+                    raw_batch[k],
+                    metas[k],
+                    thresh_list[orig_idx],
+                    veh_list[orig_idx],
+                    raw_person_hint_thresh=raw_person_hint_thresh,
+                )
+                det_results[orig_idx] = dets
+                hint_results[orig_idx] = ph
+            return det_results, hint_results
+        except Exception:
+            self._supports_batch = False
+            for k, orig_idx in enumerate(valid_indices):
+                blob = chws[k][None, ...]
+                with self._lock:
+                    raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+                dets, ph = self._postprocess_one(
+                    raw[0] if raw.ndim >= 3 else raw,
+                    metas[k],
+                    thresh_list[orig_idx],
+                    veh_list[orig_idx],
+                    raw_person_hint_thresh=raw_person_hint_thresh,
+                )
+                det_results[orig_idx] = dets
+                hint_results[orig_idx] = ph
+            return det_results, hint_results
 
 
 def _parse_allow_disk_write(config: dict = None, app_context: dict = None) -> bool:
@@ -343,32 +471,34 @@ class PersonEngine:
             if detect_transport is not None:
                 self.detect_vehicles = bool(detect_transport)
 
-    def process_frame(self, frame: np.ndarray):
-        if frame is None or frame.size == 0:
-            return []
-        with self._state_lock:
-            conf_t = self.conf_thresh
-            det_veh = self.detect_vehicles
-            interval = self.interval_sec
-            allow_write = self.allow_disk_write
-
-        detections = self.detector.predict(frame, conf_thresh=conf_t, detect_vehicles=det_veh)
+    def _handle_detections(self, frame: np.ndarray, detections: list):
         if not detections:
             return []
 
         now = time.time()
         should_save = False
-        if allow_write:
-            with self._state_lock:
-                if self.allow_disk_write and (now - self.last_shot_time) >= interval:
-                    self.last_shot_time = now
-                    should_save = True
+        with self._state_lock:
+            allow_write = self.allow_disk_write
+            interval = self.interval_sec
+            if allow_write and (now - self.last_shot_time) >= interval:
+                self.last_shot_time = now
+                should_save = True
 
         if should_save:
             self._save_screenshot(frame, detections)
 
         display_boxes = [(det["box"], int(round(det["conf"] * 100)), det.get("label", "Person")) for det in detections]
         return display_boxes
+
+    def process_frame(self, frame: np.ndarray):
+        if frame is None or frame.size == 0:
+            return []
+        with self._state_lock:
+            conf_t = self.conf_thresh
+            det_veh = self.detect_vehicles
+
+        detections = self.detector.predict(frame, conf_thresh=conf_t, detect_vehicles=det_veh)
+        return self._handle_detections(frame, detections)
 
     def _save_screenshot(self, frame: np.ndarray, detections: list):
         if not self.allow_disk_write:
@@ -391,7 +521,7 @@ class PersonEngine:
         filename = f"{time_prefix}_{slug_label}.jpg"
         full_path = os.path.join(day_dir, filename)
 
-        async_write_image(full_path, frame.copy())
+        async_write_image(full_path, frame)
 
         time_display = now_dt.strftime("%H:%M:%S")
         print(f"[ФІКСАЦІЯ ОБ'ЄКТА ({summary_label})] Збережено скріншот: {full_path}")
@@ -438,6 +568,61 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
 def _process_and_pack(engine, frame, prev_state=None):
     boxes = engine.process_frame(frame)
     return {"boxes": boxes}
+
+
+def _process_batch_and_pack(items: list, shared_resources=None) -> list:
+    """Батч-детекція людей і транспорту across multiple cameras + виставлення підказки person_hint."""
+    n = len(items)
+    if n == 0:
+        return []
+    out_states = [None] * n
+
+    groups = {}
+    for idx, it in enumerate(items):
+        eng = it["engine"]
+        fr = it["frame"]
+        if eng is None or fr is None or getattr(fr, "size", 0) == 0:
+            out_states[idx] = {"boxes": []}
+            continue
+        groups.setdefault(id(eng.detector), []).append(idx)
+
+    for idxs in groups.values():
+        detector = items[idxs[0]]["engine"].detector
+        frames_g = []
+        threshs_g = []
+        veh_flags_g = []
+        for idx in idxs:
+            eng = items[idx]["engine"]
+            frames_g.append(items[idx]["frame"])
+            with eng._state_lock:
+                threshs_g.append(eng.conf_thresh)
+                veh_flags_g.append(eng.detect_vehicles)
+
+        if hasattr(detector, "predict_batch"):
+            dets_list, hints_list = detector.predict_batch(
+                frames_g,
+                conf_threshs=threshs_g,
+                detect_vehicles_flags=veh_flags_g,
+                imgsz=640,
+                raw_person_hint_thresh=0.12,
+            )
+        else:
+            dets_list = [
+                detector.predict(fr, conf_thresh=th, detect_vehicles=vf)
+                for fr, th, vf in zip(frames_g, threshs_g, veh_flags_g)
+            ]
+            hints_list = [True] * len(frames_g)
+
+        for local_i, idx in enumerate(idxs):
+            it = items[idx]
+            eng = it["engine"]
+            meta = it.get("meta")
+            if isinstance(meta, dict):
+                meta["person_hint"] = bool(hints_list[local_i])
+            boxes = eng._handle_detections(frames_g[local_i], dets_list[local_i])
+            out_states[idx] = {"boxes": boxes}
+
+    return out_states
 
 
 def _draw_overlays(frame, state_data: dict, mod_cfg: dict, now: float):
@@ -569,5 +754,6 @@ MODULE_SPEC = {
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,
     "process_and_pack": _process_and_pack,
+    "process_batch_and_pack": _process_batch_and_pack,
     "draw_overlays": _draw_overlays,
 }

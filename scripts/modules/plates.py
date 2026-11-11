@@ -11,6 +11,7 @@ from datetime import datetime
 import numpy as np
 
 from scripts.core.i18n import tr
+from scripts.core.io_pool import submit_io
 
 try:
     import cv2
@@ -19,10 +20,13 @@ except ImportError:
 
 try:
     from fast_alpr.default_ocr import DefaultOCR
+    from fast_alpr.base import OcrResult
 except ImportError:
     DefaultOCR = None
+    OcrResult = None
 
 YOLO_IMGSZ = 640
+_PLATE_TL = threading.local()
 
 # Пропорції пластин номерних знаків
 PLATE_ASPECT_RATIO_STANDARD = 520.0 / 112.0
@@ -30,7 +34,7 @@ PLATE_ASPECT_RATIO_SQUARE = 300.0 / 150.0
 
 
 def _ensure_deps():
-    global cv2, DefaultOCR
+    global cv2, DefaultOCR, OcrResult
     if cv2 is None:
         try:
             cv2 = importlib.import_module("cv2")
@@ -38,9 +42,29 @@ def _ensure_deps():
             pass
     if DefaultOCR is None:
         try:
-            DefaultOCR = importlib.import_module("fast_alpr.default_ocr").DefaultOCR
+            mod = importlib.import_module("fast_alpr.default_ocr")
+            DefaultOCR = mod.DefaultOCR
+            OcrResult = getattr(importlib.import_module("fast_alpr.base"), "OcrResult", None)
         except ImportError:
             pass
+
+
+def _get_clahe():
+    clahe = getattr(_PLATE_TL, "clahe", None)
+    if clahe is None and cv2 is not None:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        _PLATE_TL.clahe = clahe
+    return clahe
+
+
+def _expand_cuda_provider(req_providers: list) -> list:
+    out = []
+    for p in req_providers:
+        if p == "CUDAExecutionProvider":
+            out.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
+        else:
+            out.append(p)
+    return out
 
 
 def refresh_capabilities():
@@ -57,9 +81,12 @@ def refresh_capabilities():
     except ImportError:
         cv2 = None
     try:
-        DefaultOCR = importlib.import_module("fast_alpr.default_ocr").DefaultOCR
+        mod = importlib.import_module("fast_alpr.default_ocr")
+        DefaultOCR = mod.DefaultOCR
+        OcrResult = getattr(importlib.import_module("fast_alpr.base"), "OcrResult", None)
     except ImportError:
         DefaultOCR = None
+        OcrResult = None
 
 
 def is_ready(base_dir: str = "") -> bool:
@@ -154,25 +181,25 @@ def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None
 
 
 def async_write_image(path, img):
-    """Асинхронний запис зображення на диск без блокування відеопотоку."""
+    """Асинхронний запис зображення на диск через спільний обмежений пул."""
     def _worker():
         try:
-            if cv2 is not None:
+            if cv2 is not None and img is not None:
                 cv2.imwrite(path, img)
         except Exception:
             pass
-    threading.Thread(target=_worker, daemon=True).start()
+    submit_io(_worker)
 
 
 def async_write_text(path, content):
-    """Асинхронний запис дебаг-лога на диск."""
+    """Асинхронний запис дебаг-лога на диск через спільний обмежений пул."""
     def _worker():
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
         except Exception:
             pass
-    threading.Thread(target=_worker, daemon=True).start()
+    submit_io(_worker)
 
 
 def calculate_sharpness(img):
@@ -273,7 +300,7 @@ def rectify_and_enhance(plate_crop):
 
     lab = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = _get_clahe()
     cl = clahe.apply(l_channel)
     contrast_crop = cv2.cvtColor(cv2.merge((cl, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
 
@@ -324,7 +351,7 @@ class PlateTrack:
         self.saved = False
 
         self.best_plate_img = plate_img
-        self.best_frame = frame.copy()
+        self.best_frame = frame
         self.best_sharpness = sharpness
         self.best_conf = conf if text != "UNKNOWN" else 0.0
         self.best_text = text
@@ -358,7 +385,7 @@ class PlateTrack:
             if existing is None or sharpness > existing["sharpness"]:
                 self.best_candidates_by_text[text] = {
                     "plate_img": plate_img,
-                    "frame": frame.copy(),
+                    "frame": frame,
                     "text": text,
                     "conf": conf,
                     "sharpness": sharpness,
@@ -375,7 +402,7 @@ class PlateTrack:
         if current_score > self.best_score and text != "UNKNOWN":
             self.best_score = current_score
             self.best_plate_img = plate_img
-            self.best_frame = frame.copy()
+            self.best_frame = frame
             self.best_sharpness = sharpness
             self.best_conf = conf
             self.best_text = text
@@ -424,6 +451,7 @@ class ONNXDetector:
         self.model_path = model_path
         self.use_ort = False
         self.active_providers = ["OpenCV-CPU"]
+        self._supports_batch = False
         self._lock = threading.Lock()
 
         try:
@@ -441,14 +469,25 @@ class ONNXDetector:
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
             req_providers = list(providers) if providers else ["CPUExecutionProvider"]
+            opt_providers = _expand_cuda_provider(req_providers)
             try:
-                self.session = ort.InferenceSession(model_path, opts, providers=req_providers)
+                self.session = ort.InferenceSession(model_path, opts, providers=opt_providers)
             except Exception:
-                self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
+                try:
+                    self.session = ort.InferenceSession(model_path, opts, providers=req_providers)
+                except Exception:
+                    self.session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
             self.active_providers = self.session.get_providers()
-            self.input_name = self.session.get_inputs()[0].name
+            in0 = self.session.get_inputs()[0]
+            self.input_name = in0.name
             self.output_names = [o.name for o in self.session.get_outputs()]
             self.use_ort = True
+            self._supports_batch = True
+            try:
+                if in0.shape and isinstance(in0.shape[0], int) and in0.shape[0] > 0:
+                    self._supports_batch = False
+            except Exception:
+                pass
         except Exception:
             if cv2 is None:
                 raise ImportError("onnxruntime or opencv-python is required for ONNXDetector")
@@ -456,12 +495,11 @@ class ONNXDetector:
             self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
             self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
             self.use_ort = False
+            self._supports_batch = False
 
-    def predict(self, frame, conf_thresh=0.22, imgsz=480):
-        if cv2 is None or frame is None or frame.size == 0:
-            return []
+    @staticmethod
+    def _preprocess_one(frame, imgsz: int):
         h_orig, w_orig = frame.shape[:2]
-
         r = min(imgsz / h_orig, imgsz / w_orig)
         nw, nh = int(round(w_orig * r)), int(round(h_orig * r))
         dw, dh = (imgsz - nw) / 2.0, (imgsz - nh) / 2.0
@@ -475,16 +513,17 @@ class ONNXDetector:
         top, left = int(round(dh - 0.1)), int(round(dw - 0.1))
         canvas[top:top + nh, left:left + nw] = resized
 
-        blob = cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        chw = rgb.transpose(2, 0, 1).astype(np.float32)
+        chw *= np.float32(1.0 / 255.0)
+        return chw, (w_orig, h_orig, r, dw, dh)
 
-        with self._lock:
-            if self.use_ort:
-                raw = self.session.run(self.output_names, {self.input_name: blob})[0]
-            else:
-                self.net.setInput(blob)
-                raw = self.net.forward()
-
-        preds = np.squeeze(raw)
+    @staticmethod
+    def _postprocess_one(raw_i, meta, conf_thresh: float):
+        w_orig, h_orig, r, dw, dh = meta
+        preds = np.asarray(raw_i)
+        if preds.ndim > 2:
+            preds = np.squeeze(preds)
         if preds.ndim != 2:
             return []
 
@@ -494,11 +533,6 @@ class ONNXDetector:
         channels = preds.shape[1]
         if channels < 5:
             return []
-
-        cx = preds[:, 0]
-        cy = preds[:, 1]
-        w = preds[:, 2]
-        h = preds[:, 3]
 
         if channels == 5:
             scores = preds[:, 4]
@@ -511,37 +545,100 @@ class ONNXDetector:
         if not np.any(mask):
             return []
 
-        cx, cy, w, h, scores = cx[mask], cy[mask], w[mask], h[mask], scores[mask]
+        sub = preds[mask]
+        sc = scores[mask]
+        cx, cy, w, h = sub[:, 0], sub[:, 1], sub[:, 2], sub[:, 3]
+        hw = w * 0.5
+        hh = h * 0.5
 
-        x1 = (cx - w / 2.0 - dw) / r
-        y1 = (cy - h / 2.0 - dh) / r
-        x2 = (cx + w / 2.0 - dw) / r
-        y2 = (cy + h / 2.0 - dh) / r
+        bx1 = np.clip((cx - hw - dw) / r, 0, w_orig - 1).astype(np.int32)
+        by1 = np.clip((cy - hh - dh) / r, 0, h_orig - 1).astype(np.int32)
+        bx2 = np.clip((cx + hw - dw) / r, 0, w_orig).astype(np.int32)
+        by2 = np.clip((cy + hh - dh) / r, 0, h_orig).astype(np.int32)
 
-        boxes_for_nms = []
-        scores_list = []
-        for i in range(len(scores)):
-            bx1 = max(0, min(w_orig - 1, int(x1[i])))
-            by1 = max(0, min(h_orig - 1, int(y1[i])))
-            bx2 = max(0, min(w_orig, int(x2[i])))
-            by2 = max(0, min(h_orig, int(y2[i])))
-            bw = bx2 - bx1
-            bh = by2 - by1
-            if bw > 25 and bh > 10:
-                boxes_for_nms.append([bx1, by1, bw, bh])
-                scores_list.append(float(scores[i]))
-
-        if not boxes_for_nms:
+        bw = bx2 - bx1
+        bh = by2 - by1
+        keep = (bw > 25) & (bh > 10)
+        if not np.any(keep):
             return []
+
+        boxes_for_nms = np.column_stack((bx1[keep], by1[keep], bw[keep], bh[keep])).tolist()
+        scores_list = sc[keep].astype(np.float64).tolist()
 
         indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores_list, conf_thresh, 0.45)
         final_boxes = []
         if len(indices) > 0:
             for idx in indices.flatten():
-                bx, by, bw, bh = boxes_for_nms[idx]
-                final_boxes.append((bx, by, bx + bw, by + bh))
-
+                bx, by, w_i, h_i = boxes_for_nms[idx]
+                final_boxes.append((int(bx), int(by), int(bx + w_i), int(by + h_i)))
         return final_boxes
+
+    def predict(self, frame, conf_thresh=0.22, imgsz=480):
+        if cv2 is None or frame is None or frame.size == 0:
+            return []
+        chw, meta = self._preprocess_one(frame, imgsz)
+        blob = chw[None, ...]
+
+        with self._lock:
+            if self.use_ort:
+                raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+            else:
+                self.net.setInput(blob)
+                raw = self.net.forward()
+
+        return self._postprocess_one(raw[0] if raw.ndim >= 3 else raw, meta, conf_thresh)
+
+    def predict_batch(self, frames: list, conf_threshs=0.22, imgsz: int = YOLO_IMGSZ) -> list:
+        n = len(frames)
+        if n == 0 or cv2 is None:
+            return [[] for _ in range(n)]
+        if isinstance(conf_threshs, (int, float)):
+            thresh_list = [float(conf_threshs)] * n
+        else:
+            thresh_list = [float(x) for x in conf_threshs]
+
+        results = [[] for _ in range(n)]
+        valid_indices = []
+        chws = []
+        metas = []
+        for i, fr in enumerate(frames):
+            if fr is None or getattr(fr, "size", 0) == 0:
+                continue
+            chw, meta = self._preprocess_one(fr, imgsz)
+            valid_indices.append(i)
+            chws.append(chw)
+            metas.append(meta)
+
+        if not valid_indices:
+            return results
+
+        if len(valid_indices) == 1 or not self.use_ort or not self._supports_batch:
+            for k, orig_idx in enumerate(valid_indices):
+                blob = chws[k][None, ...]
+                with self._lock:
+                    if self.use_ort:
+                        raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+                    else:
+                        self.net.setInput(blob)
+                        raw = self.net.forward()
+                results[orig_idx] = self._postprocess_one(raw[0] if raw.ndim >= 3 else raw, metas[k], thresh_list[orig_idx])
+            return results
+
+        batch_blob = np.stack(chws, axis=0)
+        try:
+            with self._lock:
+                raw_batch = self.session.run(self.output_names, {self.input_name: batch_blob})[0]
+            for k, orig_idx in enumerate(valid_indices):
+                results[orig_idx] = self._postprocess_one(raw_batch[k], metas[k], thresh_list[orig_idx])
+            return results
+        except Exception:
+            self._supports_batch = False
+            for k, orig_idx in enumerate(valid_indices):
+                blob = chws[k][None, ...]
+                with self._lock:
+                    raw = self.session.run(self.output_names, {self.input_name: blob})[0]
+                results[orig_idx] = self._postprocess_one(raw[0] if raw.ndim >= 3 else raw, metas[k], thresh_list[orig_idx])
+            return results
 
 
 class ThreadSafePlateOCR:
@@ -559,6 +656,7 @@ class ThreadSafePlateOCR:
     @staticmethod
     def _create_ocr(model_path: str, config_path: str, providers=None):
         req_providers = list(providers) if providers else ["CPUExecutionProvider"]
+        opt_providers = _expand_cuda_provider(req_providers)
         use_cuda = any("CUDA" in p for p in req_providers)
         use_cpu_only = req_providers == ["CPUExecutionProvider"]
         device = "cpu" if use_cpu_only else ("cuda" if use_cuda else "auto")
@@ -577,30 +675,26 @@ class ThreadSafePlateOCR:
             opts = None
 
         sig = inspect.signature(DefaultOCR.__init__)
-        try:
-            kwargs = {
-                "hub_ocr_model": None,
-                "device": device,
-                "model_path": model_path,
-                "config_path": config_path,
-            }
-            if "providers" in sig.parameters:
-                kwargs["providers"] = req_providers
-            if opts is not None and "sess_options" in sig.parameters:
-                kwargs["sess_options"] = opts
-            return DefaultOCR(**kwargs)
-        except Exception:
-            fb_kwargs = {
-                "hub_ocr_model": None,
-                "device": "cpu",
-                "model_path": model_path,
-                "config_path": config_path,
-            }
-            if "providers" in sig.parameters:
-                fb_kwargs["providers"] = ["CPUExecutionProvider"]
-            if opts is not None and "sess_options" in sig.parameters:
-                fb_kwargs["sess_options"] = opts
-            return DefaultOCR(**fb_kwargs)
+        for prov_cand, dev_cand in (
+            (opt_providers, device),
+            (req_providers, device),
+            (["CPUExecutionProvider"], "cpu"),
+        ):
+            try:
+                kwargs = {
+                    "hub_ocr_model": None,
+                    "device": dev_cand,
+                    "model_path": model_path,
+                    "config_path": config_path,
+                }
+                if "providers" in sig.parameters:
+                    kwargs["providers"] = prov_cand
+                if opts is not None and "sess_options" in sig.parameters:
+                    kwargs["sess_options"] = opts
+                return DefaultOCR(**kwargs)
+            except Exception:
+                continue
+        return DefaultOCR(hub_ocr_model=None, device="cpu", model_path=model_path, config_path=config_path)
 
     def _detect_active_providers(self):
         for attr in ("ocr_model", "model", "session"):
@@ -624,6 +718,53 @@ class ThreadSafePlateOCR:
     def predict(self, img):
         with self._lock:
             return self.ocr.predict(img)
+
+    def predict_batch(self, imgs: list) -> list:
+        n = len(imgs)
+        if n == 0:
+            return []
+        if n == 1:
+            return [self.predict(imgs[0])]
+
+        ocr_model = getattr(self.ocr, "ocr_model", None)
+        if ocr_model is not None and hasattr(ocr_model, "run") and OcrResult is not None and cv2 is not None:
+            try:
+                color_mode = getattr(getattr(ocr_model, "config", None), "image_color_mode", None)
+                results = [None] * n
+                valid_idx = []
+                converted = []
+                for i, im in enumerate(imgs):
+                    if im is None:
+                        continue
+                    if color_mode == "grayscale":
+                        conv = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+                    elif color_mode == "rgb":
+                        conv = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+                    else:
+                        conv = im
+                    valid_idx.append(i)
+                    converted.append(conv)
+                if not valid_idx:
+                    return results
+                with self._lock:
+                    preds = ocr_model.run(converted, return_confidence=True)
+                if len(preds) == len(valid_idx):
+                    for k, orig_i in enumerate(valid_idx):
+                        p = preds[k]
+                        cp = getattr(p, "char_probs", None)
+                        conf = 0.0 if cp is None else [float(x) for x in cp.tolist()]
+                        results[orig_i] = OcrResult(
+                            text=p.plate,
+                            confidence=conf,
+                            region=getattr(p, "region", None),
+                            region_confidence=getattr(p, "region_prob", None),
+                        )
+                    return results
+            except Exception:
+                pass
+
+        with self._lock:
+            return [self.ocr.predict(im) for im in imgs]
 
 
 def _parse_allow_disk_write(config: dict = None, app_context: dict = None) -> bool:
@@ -710,16 +851,10 @@ class PlateEngine:
             self.config = dict(config or {})
             self._reload_params()
 
-    def process_frame(self, frame):
-        """Обробка кадру з детекцією, OCR, трекінгом та поверненням даних для оверлею."""
-        if frame is None or frame.size == 0:
-            return [], None
-
+    def _extract_rectified_candidates(self, frame, detected_boxes):
         frame_h, frame_w = frame.shape[:2]
         total_area = frame_h * frame_w
-        current_detections = []
-        detected_boxes = self.detector.predict(frame, conf_thresh=self.plates_det_thresh, imgsz=YOLO_IMGSZ)
-
+        cands = []
         for (x1, y1, x2, y2) in detected_boxes:
             bw = x2 - x1
             bh = y2 - y1
@@ -738,44 +873,38 @@ class PlateEngine:
             if enhanced is None:
                 continue
 
-            plate_str = ""
-            plate_conf = 0.0
-            try:
-                res = self.ocr.predict(enhanced)
-                if res is not None:
-                    raw_txt = getattr(res, "text", "")
-                    raw_conf = getattr(res, "confidence", 0.0)
-
-                    if isinstance(raw_conf, (list, tuple, np.ndarray)):
-                        plate_conf = float(np.mean(raw_conf)) if len(raw_conf) > 0 else 0.0
-                    else:
-                        plate_conf = float(raw_conf)
-
-                    clean_txt = re.sub(r"[^A-Z0-9]", "", str(raw_txt).strip().upper())
-                    if len(clean_txt) >= 3:
-                        plate_str = clean_txt
-            except Exception as ocr_err:
-                print(f"[OCR Error]: {ocr_err}")
-
             sharpness = calculate_sharpness(enhanced)
-
-            if plate_str:
-                text_res = plate_str
-                conf_res = plate_conf
-            else:
-                text_res = "UNKNOWN"
-                conf_res = 0.0
-
-            current_detections.append({
+            cands.append({
                 "box": (x1, y1, x2, y2),
                 "plate_img": enhanced,
                 "dims": (ov_w, ov_h),
-                "text": text_res,
-                "conf": conf_res,
-                "sharpness": sharpness
+                "sharpness": sharpness,
             })
+        return cands
 
-        now = time.time()
+    @staticmethod
+    def _parse_ocr_result(res):
+        plate_str = ""
+        plate_conf = 0.0
+        if res is not None:
+            raw_txt = getattr(res, "text", "")
+            raw_conf = getattr(res, "confidence", 0.0)
+
+            if isinstance(raw_conf, (list, tuple, np.ndarray)):
+                plate_conf = float(np.mean(raw_conf)) if len(raw_conf) > 0 else 0.0
+            else:
+                plate_conf = float(raw_conf)
+
+            clean_txt = re.sub(r"[^A-Z0-9]", "", str(raw_txt).strip().upper())
+            if len(clean_txt) >= 3:
+                plate_str = clean_txt
+        if plate_str:
+            return plate_str, plate_conf
+        return "UNKNOWN", 0.0
+
+    def _update_tracks_from_detections(self, frame, current_detections, now: float = None):
+        if now is None:
+            now = time.time()
         unmatched_detections = list(range(len(current_detections)))
 
         with self._state_lock:
@@ -853,6 +982,40 @@ class PlateEngine:
                 }
 
         return display_boxes, overlay_info
+
+    def process_frame(self, frame):
+        """Обробка кадру з детекцією, OCR, трекінгом та поверненням даних для оверлею."""
+        if frame is None or frame.size == 0:
+            return [], None
+
+        with self._state_lock:
+            det_thresh = self.plates_det_thresh
+
+        detected_boxes = self.detector.predict(frame, conf_thresh=det_thresh, imgsz=YOLO_IMGSZ)
+        cands = self._extract_rectified_candidates(frame, detected_boxes)
+        current_detections = []
+        if cands:
+            try:
+                if hasattr(self.ocr, "predict_batch"):
+                    ocr_results = self.ocr.predict_batch([c["plate_img"] for c in cands])
+                else:
+                    ocr_results = [self.ocr.predict(c["plate_img"]) for c in cands]
+            except Exception as ocr_err:
+                print(f"[OCR Error]: {ocr_err}")
+                ocr_results = [None] * len(cands)
+
+            for cand, res in zip(cands, ocr_results):
+                text_res, conf_res = self._parse_ocr_result(res)
+                current_detections.append({
+                    "box": cand["box"],
+                    "plate_img": cand["plate_img"],
+                    "dims": cand["dims"],
+                    "text": text_res,
+                    "conf": conf_res,
+                    "sharpness": cand["sharpness"],
+                })
+
+        return self._update_tracks_from_detections(frame, current_detections)
 
     def flush_tracks(self):
         """Примусове збереження всіх активних незавершених треків."""
@@ -1005,6 +1168,96 @@ def _process_and_pack(engine, frame, prev_state=None):
         state["last_plate_conf"] = overlay_info["conf"]
         state["last_plate_time"] = overlay_info["time"]
     return state
+
+
+def _process_batch_and_pack(items: list, shared_resources=None) -> list:
+    """Батч-обробка кадрів з різних камер за один виклик YOLO-детектора та один батч-виклик CCT OCR."""
+    n = len(items)
+    if n == 0:
+        return []
+    out_states = [None] * n
+
+    groups = {}
+    for idx, it in enumerate(items):
+        eng = it["engine"]
+        fr = it["frame"]
+        if eng is None or fr is None or getattr(fr, "size", 0) == 0:
+            state = dict(it.get("prev_state") or {})
+            state["boxes"] = []
+            out_states[idx] = state
+            continue
+        key = (id(eng.detector), id(eng.ocr))
+        groups.setdefault(key, []).append(idx)
+
+    for idxs in groups.values():
+        first_eng = items[idxs[0]]["engine"]
+        detector = first_eng.detector
+        ocr = first_eng.ocr
+
+        frames_g = []
+        threshs_g = []
+        for idx in idxs:
+            eng = items[idx]["engine"]
+            frames_g.append(items[idx]["frame"])
+            with eng._state_lock:
+                threshs_g.append(eng.plates_det_thresh)
+
+        if hasattr(detector, "predict_batch"):
+            boxes_list = detector.predict_batch(frames_g, conf_threshs=threshs_g, imgsz=YOLO_IMGSZ)
+        else:
+            boxes_list = [detector.predict(fr, conf_thresh=th, imgsz=YOLO_IMGSZ) for fr, th in zip(frames_g, threshs_g)]
+
+        per_item_cands = []
+        all_enhanced = []
+        crop_owners = []
+        for local_i, idx in enumerate(idxs):
+            eng = items[idx]["engine"]
+            cands = eng._extract_rectified_candidates(frames_g[local_i], boxes_list[local_i])
+            per_item_cands.append(cands)
+            for c_i, c in enumerate(cands):
+                all_enhanced.append(c["plate_img"])
+                crop_owners.append((local_i, c_i))
+
+        ocr_results = []
+        if all_enhanced:
+            try:
+                if hasattr(ocr, "predict_batch"):
+                    ocr_results = ocr.predict_batch(all_enhanced)
+                else:
+                    ocr_results = [ocr.predict(im) for im in all_enhanced]
+            except Exception as ocr_err:
+                print(f"[OCR Batch Error]: {ocr_err}")
+                ocr_results = [None] * len(all_enhanced)
+
+        per_item_dets = [[] for _ in range(len(idxs))]
+        for (local_i, c_i), res in zip(crop_owners, ocr_results):
+            cand = per_item_cands[local_i][c_i]
+            text_res, conf_res = PlateEngine._parse_ocr_result(res)
+            per_item_dets[local_i].append({
+                "box": cand["box"],
+                "plate_img": cand["plate_img"],
+                "dims": cand["dims"],
+                "text": text_res,
+                "conf": conf_res,
+                "sharpness": cand["sharpness"],
+            })
+
+        now = time.time()
+        for local_i, idx in enumerate(idxs):
+            it = items[idx]
+            eng = it["engine"]
+            boxes, overlay_info = eng._update_tracks_from_detections(frames_g[local_i], per_item_dets[local_i], now=now)
+            state = dict(it.get("prev_state") or {})
+            state["boxes"] = boxes
+            if overlay_info is not None:
+                state["last_plate_img"] = overlay_info["img"]
+                state["last_plate_dims"] = overlay_info["dims"]
+                state["last_plate_text"] = overlay_info["text"]
+                state["last_plate_conf"] = overlay_info["conf"]
+                state["last_plate_time"] = overlay_info["time"]
+            out_states[idx] = state
+
+    return out_states
 
 
 def _draw_overlays(frame, state_data: dict, mod_cfg: dict, now: float):
@@ -1182,6 +1435,7 @@ MODULE_SPEC = {
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,
     "process_and_pack": _process_and_pack,
+    "process_batch_and_pack": _process_batch_and_pack,
     "draw_overlays": _draw_overlays,
     "flush_tracks": lambda eng: eng.flush_tracks() if eng is not None else None,
     "has_active_tracks": lambda eng: bool(eng is not None and getattr(eng, "active_tracks", None)),

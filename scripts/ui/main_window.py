@@ -19,6 +19,7 @@ from scripts.core.i18n import (
 )
 from scripts.core.module_registry import ModuleRegistry
 from scripts.core.config_manager import ConfigManager
+from scripts.core.io_pool import flush_io
 from scripts.core.hardware_info import (
     HardwareMonitor,
     prepare_cuda_dll_environment,
@@ -151,6 +152,8 @@ class MainGridWindow:
         self._panel_visible = True
         self._lang_menu_active = False
         self._last_total_cams = 0
+        self._window_minimized = False
+        self._visible_grid_uuids = set()
 
         # Потокобезпечна черга UI-викликів із фонових потоків
         self._ui_queue = queue.SimpleQueue()
@@ -183,6 +186,8 @@ class MainGridWindow:
 
         self.root.bind(EVT_MOTION, self._on_mouse_motion)
         self.root.bind(EVT_CONFIGURE, self._on_root_configure)
+        self.root.bind("<Unmap>", self._on_root_unmap)
+        self.root.bind("<Map>", self._on_root_map)
 
         self._drain_ui_queue()
         self._start_hw_poll_thread()
@@ -928,6 +933,7 @@ class MainGridWindow:
 
         self._last_layout_key = None
         self._relayout_grid(force=True)
+        self._render_tiles_once()
         self._maybe_ensure_cuda_async()
 
     def open_camera_detail(self, cam_uuid: str):
@@ -990,6 +996,42 @@ class MainGridWindow:
     # ------------------------------------------------------------------
     # Побудова, адаптація і рендер сітки камер (тільки sub_source)
     # ------------------------------------------------------------------
+    def _fast_cfg(self) -> dict:
+        if hasattr(self.cfg_mgr, "get_ui_fast_config"):
+            return self.cfg_mgr.get_ui_fast_config()
+        return self.cfg_mgr.get_snapshot()
+
+    def _sync_visible_grid_uuids(self, vis_set: set):
+        if hasattr(self.camera_manager, "set_visible_grid_uuids"):
+            try:
+                self.camera_manager.set_visible_grid_uuids(vis_set)
+            except Exception:
+                pass
+
+    def _on_root_unmap(self, event=None):
+        if self._is_closing or (event is not None and event.widget is not self.root):
+            return
+        try:
+            st = str(self.root.state()).lower()
+            if st not in ("iconic", "withdrawn"):
+                return
+        except Exception:
+            pass
+        if not self._window_minimized:
+            self._window_minimized = True
+            self._sync_visible_grid_uuids(set())
+
+    def _on_root_map(self, event=None):
+        if self._is_closing or (event is not None and event.widget is not self.root):
+            return
+        if self._window_minimized:
+            self._window_minimized = False
+            self._sync_visible_grid_uuids(self._visible_grid_uuids)
+            try:
+                self._render_tiles_once()
+            except Exception:
+                pass
+
     def _on_root_configure(self, event=None):
         if self._is_closing:
             return
@@ -1081,7 +1123,7 @@ class MainGridWindow:
         if area_w < 80 or area_h < 80:
             return
 
-        snap = self.cfg_mgr.get_snapshot()
+        snap = self._fast_cfg()
         grid_cfg = snap.get("grid") or {}
         units = self.camera_manager.get_ordered_enabled_units()
         total_cams = len(units)
@@ -1103,6 +1145,10 @@ class MainGridWindow:
             self._total_pages = 1
             self._current_page = 0
             visible_units = units
+
+        self._visible_grid_uuids = {u.uuid for u in visible_units}
+        if not self._window_minimized:
+            self._sync_visible_grid_uuids(self._visible_grid_uuids)
 
         if self._total_pages > 1:
             self.lbl_page.configure(
@@ -1190,14 +1236,14 @@ class MainGridWindow:
                     fill="#ffcc00", font=("Segoe UI", 10, "bold"), tags="placeholder"
                 )
 
-                lbl_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, tags="ov_lbl")
-                lbl_txt_id = canvas.create_text(10, 10, text="", fill="#ffffff", font=("Segoe UI", 9, "bold"), anchor=tk.NW, tags="ov_lbl")
+                lbl_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, state=tk.HIDDEN, tags="ov_lbl")
+                lbl_txt_id = canvas.create_text(10, 10, text="", fill="#ffffff", font=("Segoe UI", 9, "bold"), anchor=tk.NW, state=tk.HIDDEN, tags="ov_lbl")
 
-                st_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, tags="ov_st")
-                st_txt_id = canvas.create_text(10, 10, text="", fill="#75e08b", font=("Segoe UI", 8, "bold"), anchor=tk.NE, tags="ov_st")
+                st_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, state=tk.HIDDEN, tags="ov_st")
+                st_txt_id = canvas.create_text(10, 10, text="", fill="#75e08b", font=("Segoe UI", 8, "bold"), anchor=tk.NE, state=tk.HIDDEN, tags="ov_st")
 
-                warn_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#351418", outline="#ff5555", width=1, tags="ov_warn")
-                warn_txt_id = canvas.create_text(10, 10, text="", fill="#ff9999", font=("Segoe UI", 8, "bold"), anchor=tk.SW, tags="ov_warn")
+                warn_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#351418", outline="#ff5555", width=1, state=tk.HIDDEN, tags="ov_warn")
+                warn_txt_id = canvas.create_text(10, 10, text="", fill="#ff9999", font=("Segoe UI", 8, "bold"), anchor=tk.SW, state=tk.HIDDEN, tags="ov_warn")
 
                 canvas.bind("<Button-1>", lambda e, uid=u.uuid: self.open_camera_detail(uid))
 
@@ -1282,7 +1328,7 @@ class MainGridWindow:
             self.ctrl_frame.lift()
 
     def _update_tile_borders(self):
-        grid_cfg = (self.cfg_mgr.get_snapshot().get("grid") or {})
+        grid_cfg = (self._fast_cfg().get("grid") or {})
         col_normal = grid_cfg.get("border_color", "#00e5ff")
         col_active = grid_cfg.get("active_border_color", "#00ff88")
         col_offline = grid_cfg.get("offline_border_color", "#ff4444")
@@ -1322,10 +1368,25 @@ class MainGridWindow:
         if self._is_closing:
             return 83
 
+        try:
+            st = str(self.root.state()).lower()
+            if st == "iconic":
+                if not self._window_minimized:
+                    self._window_minimized = True
+                    self._sync_visible_grid_uuids(set())
+                return 250
+            elif self._window_minimized and st in ("normal", "zoomed"):
+                self._window_minimized = False
+                self._sync_visible_grid_uuids(self._visible_grid_uuids)
+        except Exception:
+            pass
+        if self._window_minimized:
+            return 250
+
         if not self._tiles and self.camera_manager.get_ordered_enabled_units():
             self._relayout_grid(force=False)
 
-        snap = self.cfg_mgr.get_snapshot()
+        snap = self._fast_cfg()
         grid_cfg = snap.get("grid") or {}
         hw_cfg = snap.get("hardware") or {}
         grid_fps = max(2.0, min(30.0, float(hw_cfg.get("display_grid_fps", 12.0))))
@@ -1408,9 +1469,9 @@ class MainGridWindow:
                         cv.coords(t["lbl_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
                         cv.itemconfigure(t["lbl_bg_id"], state=tk.NORMAL)
             else:
-                if t["last_lbl_text"] != "":
-                    t["last_lbl_text"] = ""
-                    cv.itemconfigure(t["lbl_txt_id"], state=tk.HIDDEN)
+                if t["last_lbl_text"] != "__HIDDEN__":
+                    t["last_lbl_text"] = "__HIDDEN__"
+                    cv.itemconfigure(t["lbl_txt_id"], text="", state=tk.HIDDEN)
                     cv.itemconfigure(t["lbl_bg_id"], state=tk.HIDDEN)
 
             # 4. Оверлей статусу запису, динамічних AI-модулів і FPS (верхній правий кут)
@@ -1453,14 +1514,14 @@ class MainGridWindow:
                             cv.coords(t["st_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
                             cv.itemconfigure(t["st_bg_id"], state=tk.NORMAL)
                 else:
-                    if t["last_st_key"] != ("", "", iw):
-                        t["last_st_key"] = ("", "", iw)
-                        cv.itemconfigure(t["st_txt_id"], state=tk.HIDDEN)
+                    if t["last_st_key"] != ("__HIDDEN__",):
+                        t["last_st_key"] = ("__HIDDEN__",)
+                        cv.itemconfigure(t["st_txt_id"], text="", state=tk.HIDDEN)
                         cv.itemconfigure(t["st_bg_id"], state=tk.HIDDEN)
             else:
-                if t["last_st_key"] is not None:
-                    t["last_st_key"] = None
-                    cv.itemconfigure(t["st_txt_id"], state=tk.HIDDEN)
+                if t["last_st_key"] != ("__HIDDEN__",):
+                    t["last_st_key"] = ("__HIDDEN__",)
+                    cv.itemconfigure(t["st_txt_id"], text="", state=tk.HIDDEN)
                     cv.itemconfigure(t["st_bg_id"], state=tk.HIDDEN)
 
             # 5. Нижній бейдж при втраті зв'язку (коли останній кадр ще висить)
@@ -1477,7 +1538,7 @@ class MainGridWindow:
                         cv.coords(t["warn_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
                         cv.itemconfigure(t["warn_bg_id"], state=tk.NORMAL)
                 else:
-                    cv.itemconfigure(t["warn_txt_id"], state=tk.HIDDEN)
+                    cv.itemconfigure(t["warn_txt_id"], text="", state=tk.HIDDEN)
                     cv.itemconfigure(t["warn_bg_id"], state=tk.HIDDEN)
 
             cv.tag_raise("ov_lbl")
@@ -1621,6 +1682,11 @@ class MainGridWindow:
             self.camera_manager.stop_all()
         except Exception as e:
             print(f"[Shutdown CameraManager error]: {e}")
+
+        try:
+            flush_io(timeout=3.0)
+        except Exception:
+            pass
 
         try:
             self.root.destroy()

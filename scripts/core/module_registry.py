@@ -5,7 +5,8 @@ import importlib
 import importlib.util
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, date
+from functools import lru_cache
 
 from scripts.core.i18n import tr
 
@@ -16,8 +17,8 @@ def _tr_mod(mid: str, subkey: str, fallback: str, **kwargs) -> str:
     return tr(f"mod.{mid}.{subkey}", fallback, **kwargs)
 
 
-def parse_date_str(val):
-    s = str(val or "").strip()
+@lru_cache(maxsize=512)
+def _parse_date_cached(s: str):
     if not s or s.lower() in ("none", "unlimited", "null", "*"):
         return None
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%Y/%m/%d"):
@@ -28,12 +29,23 @@ def parse_date_str(val):
     return None
 
 
+def parse_date_str(val):
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    s = str(val or "").strip()
+    if not s:
+        return None
+    return _parse_date_cached(s)
+
+
 def is_date_range_active(d_from_str: str, d_to_str: str) -> bool:
     df = parse_date_str(d_from_str)
     dt = parse_date_str(d_to_str)
     if df is None and dt is None:
         return True
-    today = datetime.now().date()
+    today = date.today()
     if df is not None and today < df:
         return False
     if dt is not None and today > dt:
@@ -65,6 +77,8 @@ class ModuleRegistry:
         self._file_sigs = {}      # path -> (mtime_ns, size)
         self._last_scan_ts = 0.0
         self._generation = 0
+        self._kind_cache = {}
+        self._cap_cache = {}
 
         self.scan_and_load(force=False)
 
@@ -226,6 +240,8 @@ class ModuleRegistry:
 
             # Зливаємо без втрати вже завантажених, якщо був неперехоплений збій іншого
             self._modules = new_modules
+            self._kind_cache.clear()
+            self._cap_cache.clear()
             changed = bool(added or updated or removed or force)
             if changed:
                 self._generation += 1
@@ -271,11 +287,16 @@ class ModuleRegistry:
 
     def list_modules(self, kind: str = None) -> list:
         with self._lock:
+            cached = self._kind_cache.get(kind)
+            if cached is not None:
+                return list(cached)
             vals = list(self._modules.values())
-        if kind is not None:
-            vals = [v for v in vals if v["spec"].get("kind") == kind]
-        vals.sort(key=lambda x: (int(x["spec"].get("order", 100)), str(x["id"])))
-        return vals
+            if kind is not None:
+                vals = [v for v in vals if v["spec"].get("kind") == kind]
+            vals.sort(key=lambda x: (int(x["spec"].get("order", 100)), str(x["id"])))
+            t_vals = tuple(vals)
+            self._kind_cache[kind] = t_vals
+            return list(t_vals)
 
     def get_module(self, mod_id: str):
         with self._lock:
@@ -295,9 +316,14 @@ class ModuleRegistry:
 
     def list_by_capability(self, cap_name: str) -> list:
         with self._lock:
+            cached = self._cap_cache.get(cap_name)
+            if cached is not None:
+                return list(cached)
             vals = [v for v in self._modules.values() if cap_name in (v["spec"].get("provides") or [])]
-        vals.sort(key=lambda x: (int(x["spec"].get("order", 100)), str(x["id"])))
-        return vals
+            vals.sort(key=lambda x: (int(x["spec"].get("order", 100)), str(x["id"])))
+            t_vals = tuple(vals)
+            self._cap_cache[cap_name] = t_vals
+            return list(t_vals)
 
     def get_default_module_config(self, mod_id: str) -> dict:
         spec = self.get_spec(mod_id)

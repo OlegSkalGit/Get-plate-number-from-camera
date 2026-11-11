@@ -2556,7 +2556,19 @@ class PeopleWindow:
             self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ffcc00")
             return
 
-        cap = cv2.VideoCapture(fpath)
+        cap = None
+        if hasattr(cv2, "CAP_PROP_N_THREADS") and hasattr(cv2, "CAP_FFMPEG"):
+            try:
+                cap = cv2.VideoCapture(fpath, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 2])
+            except Exception:
+                cap = None
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            cap = cv2.VideoCapture(fpath)
         if not cap.isOpened():
             self._vid_ph_spec = ("ui.people.vid_ph.open_err", "[Failed to open video file]", "#ff6666")
             self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ff6666")
