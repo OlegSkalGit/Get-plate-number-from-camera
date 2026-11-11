@@ -29,7 +29,12 @@ from scripts.core.hardware_info import (
 )
 from scripts.engine.inference_pool import InferencePool
 from scripts.engine.camera_manager import CameraManager
-from scripts.ui.helpers import WindowGeometryTracker, compute_auto_grid
+from scripts.ui.helpers import (
+    WindowGeometryTracker,
+    compute_auto_grid,
+    configure_dark_combobox_style,
+    style_dark_combobox_popdown,
+)
 from scripts.ui.detail_window import CameraDetailWindow
 from scripts.ui.settings_window import SettingsWindow
 from scripts.ui.people_window import PeopleWindow
@@ -131,6 +136,9 @@ class MainGridWindow:
         self._current_page = 0
         self._total_pages = 1
         self._tiles = {}          # uuid -> dict widget refs & cache
+        self._grid_surface = None
+        self._empty_slots = []
+        self._last_grid_dims_key = None
         self._last_layout_key = None
         self._relayout_after_id = None
         self._render_after_id = None
@@ -263,31 +271,17 @@ class MainGridWindow:
             font=("Segoe UI", 10)
         ).pack(side=tk.LEFT, padx=(0, 4))
 
-        try:
-            style = ttk.Style(self.root)
-            if style.theme_use() in ("vista", "xpnative", "winnative", "default"):
-                style.theme_use("clam")
-            style.configure(
-                "MainLang.TCombobox",
-                fieldbackground="#222534",
-                background="#2b2f40",
-                foreground="#ffffff",
-                arrowcolor="#00e5ff",
-                bordercolor="#2e3347",
-                lightcolor="#2e3347",
-                darkcolor="#222534",
-                selectbackground="#007acc",
-                selectforeground="#ffffff",
-            )
-            style.map(
-                "MainLang.TCombobox",
-                fieldbackground=[("readonly", "#222534")],
-                foreground=[("readonly", "#ffffff")],
-                selectbackground=[("readonly", "#222534")],
-                selectforeground=[("readonly", "#ffffff")],
-            )
-        except Exception:
-            pass
+        configure_dark_combobox_style(
+            self.root,
+            style_name="MainLang.TCombobox",
+            field_bg="#222534",
+            hover_field_bg="#2a2f43",
+            btn_bg="#2b2f40",
+            btn_hover_bg="#353b52",
+            fg="#ffffff",
+            arrow_color="#00e5ff",
+            border_color="#2e3347",
+        )
 
         lang_labels = [m["label"] for m in list_languages()]
         self.top_lang_var = tk.StringVar(value=get_language_label())
@@ -301,6 +295,7 @@ class MainGridWindow:
             style="MainLang.TCombobox",
         )
         self.cmb_top_lang.pack(side=tk.LEFT)
+        style_dark_combobox_popdown(self.cmb_top_lang)
         self.cmb_top_lang.bind("<<ComboboxSelected>>", self._on_top_language_selected)
         self.cmb_top_lang.bind("<Button-1>", self._on_top_lang_interact)
         self.cmb_top_lang.bind("<FocusIn>", self._on_top_lang_interact)
@@ -1015,11 +1010,65 @@ class MainGridWindow:
 
     def _clear_tiles(self):
         for slot in self._tiles.values():
+            for key in ("canvas", "hl_top", "hl_bottom", "hl_left", "hl_right"):
+                w = slot.get(key)
+                if w is not None:
+                    try:
+                        w.destroy()
+                    except Exception:
+                        pass
+        self._tiles.clear()
+        for es in self._empty_slots:
             try:
-                slot["frame"].destroy()
+                es.destroy()
             except Exception:
                 pass
-        self._tiles.clear()
+        self._empty_slots.clear()
+        if self._grid_surface is not None:
+            try:
+                self._grid_surface.destroy()
+            except Exception:
+                pass
+            self._grid_surface = None
+        self._last_grid_dims_key = None
+
+    def _apply_tile_highlight(self, t: dict, state: str, bcol: str):
+        cx, cy, cw, ch = t["cell_rect"]
+        bw = t["bw"]
+        strips = (
+            ("hl_top", cx - bw, cy - bw, cw + 2 * bw, bw),
+            ("hl_bottom", cx - bw, cy + ch, cw + 2 * bw, bw),
+            ("hl_left", cx - bw, cy, bw, ch),
+            ("hl_right", cx + cw, cy, bw, ch),
+        )
+        if state == "normal":
+            for key, *_ in strips:
+                try:
+                    t[key].place_forget()
+                except Exception:
+                    pass
+        else:
+            for key, sx, sy, sw, sh in strips:
+                try:
+                    t[key].configure(bg=bcol)
+                    t[key].place(x=sx, y=sy, width=sw, height=sh)
+                except Exception:
+                    pass
+
+    def _restack_grid_highlights(self):
+        for target_state in ("offline", "active"):
+            for t in self._tiles.values():
+                if t.get("last_hl_state") == target_state:
+                    for key in ("hl_top", "hl_bottom", "hl_left", "hl_right"):
+                        try:
+                            t[key].lift()
+                        except Exception:
+                            pass
+        if self._panel_visible:
+            try:
+                self.ctrl_frame.lift()
+            except Exception:
+                pass
 
     def _relayout_grid(self, force: bool = False):
         self._relayout_after_id = None
@@ -1066,6 +1115,7 @@ class MainGridWindow:
 
         bw = max(1, min(10, int(grid_cfg.get("border_width", 2))))
         gap = max(0, min(20, int(grid_cfg.get("tile_gap", 4))))
+        col_normal = grid_cfg.get("border_color", "#00e5ff")
 
         layout_key = (
             area_w, area_h, rows, cols, bw, gap,
@@ -1073,22 +1123,13 @@ class MainGridWindow:
             bool(grid_cfg.get("show_labels", True)),
             bool(grid_cfg.get("show_status", True)),
             bool(grid_cfg.get("show_fps", True)),
-            grid_cfg.get("border_color", "#00e5ff"),
+            col_normal,
             grid_cfg.get("active_border_color", "#00ff88"),
             grid_cfg.get("offline_border_color", "#ff4444"),
         )
         if not force and layout_key == self._last_layout_key:
             return
         self._last_layout_key = layout_key
-
-        avail_w = max(60, area_w - gap * (cols + 1))
-        avail_h = max(60, area_h - gap * (rows + 1))
-        tile_w = max(48, avail_w // cols)
-        tile_h = max(48, avail_h // rows)
-        total_grid_w = cols * tile_w + (cols + 1) * gap
-        total_grid_h = rows * tile_h + (rows + 1) * gap
-        origin_x = max(0, (area_w - total_grid_w) // 2)
-        origin_y = max(0, (area_h - total_grid_h) // 2)
 
         if not visible_units:
             self._clear_tiles()
@@ -1109,15 +1150,40 @@ class MainGridWindow:
         elif hasattr(self, "_empty_lbl") and self._empty_lbl.winfo_exists():
             self._empty_lbl.place_forget()
 
-        needed_uids = [u.uuid for u in visible_units]
-        existing_uids = list(self._tiles.keys())
-        if existing_uids != needed_uids:
-            self._clear_tiles()
-            for u in visible_units:
-                frame = tk.Frame(self.grid_area, bg=grid_cfg.get("border_color", "#00e5ff"), cursor="hand2")
-                canvas = tk.Canvas(frame, bg="#08090d", highlightthickness=0, bd=0, cursor="hand2")
-                canvas.pack(fill=tk.BOTH, expand=True, padx=bw, pady=bw)
+        outer_pad = gap
+        avail_w = max(cols * 32, area_w - 2 * outer_pad - bw * (cols + 1))
+        avail_h = max(rows * 24, area_h - 2 * outer_pad - bw * (rows + 1))
+        base_w, rem_w = divmod(avail_w, cols)
+        base_h, rem_h = divmod(avail_h, rows)
+        col_widths = [base_w + (1 if c < rem_w else 0) for c in range(cols)]
+        row_heights = [base_h + (1 if r < rem_h else 0) for r in range(rows)]
 
+        col_xs = []
+        x_cur = bw
+        for c in range(cols):
+            col_xs.append(x_cur)
+            x_cur += col_widths[c] + bw
+
+        row_ys = []
+        y_cur = bw
+        for r in range(rows):
+            row_ys.append(y_cur)
+            y_cur += row_heights[r] + bw
+
+        total_grid_w = x_cur
+        total_grid_h = y_cur
+        origin_x = max(0, (area_w - total_grid_w) // 2)
+        origin_y = max(0, (area_h - total_grid_h) // 2)
+
+        needed_uids = tuple(u.uuid for u in visible_units)
+        grid_dims_key = (rows, cols, needed_uids)
+        if grid_dims_key != self._last_grid_dims_key or self._grid_surface is None or not self._grid_surface.winfo_exists():
+            self._clear_tiles()
+            self._last_grid_dims_key = grid_dims_key
+            self._grid_surface = tk.Frame(self.grid_area, bg=col_normal, highlightthickness=0, bd=0)
+
+            for u in visible_units:
+                canvas = tk.Canvas(self._grid_surface, bg="#08090d", highlightthickness=0, bd=0, cursor="hand2")
                 img_id = canvas.create_image(1, 1, anchor=tk.CENTER, tags="vid_img")
                 ph_id = canvas.create_text(
                     1, 1, text=tr("ui.main.tile.connecting", "Connecting..."),
@@ -1133,12 +1199,19 @@ class MainGridWindow:
                 warn_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#351418", outline="#ff5555", width=1, tags="ov_warn")
                 warn_txt_id = canvas.create_text(10, 10, text="", fill="#ff9999", font=("Segoe UI", 8, "bold"), anchor=tk.SW, tags="ov_warn")
 
-                frame.bind("<Button-1>", lambda e, uid=u.uuid: self.open_camera_detail(uid))
                 canvas.bind("<Button-1>", lambda e, uid=u.uuid: self.open_camera_detail(uid))
 
+                hl_top = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+                hl_bottom = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+                hl_left = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+                hl_right = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+
                 self._tiles[u.uuid] = {
-                    "frame": frame,
                     "canvas": canvas,
+                    "hl_top": hl_top,
+                    "hl_bottom": hl_bottom,
+                    "hl_left": hl_left,
+                    "hl_right": hl_right,
                     "img_id": img_id,
                     "ph_id": ph_id,
                     "lbl_bg_id": lbl_bg_id,
@@ -1151,35 +1224,58 @@ class MainGridWindow:
                     "last_seq": -1,
                     "inner_w": 0,
                     "inner_h": 0,
+                    "cell_rect": (bw, bw, 32, 24),
+                    "bw": bw,
                     "last_border": "",
+                    "last_hl_state": "",
                     "last_lbl_text": None,
                     "last_st_key": None,
                     "last_warn_text": None,
                 }
 
-        inner_w = max(32, tile_w - 2 * bw)
-        inner_h = max(24, tile_h - 2 * bw)
+            total_slots = rows * cols
+            for _ in range(total_slots - len(visible_units)):
+                es = tk.Frame(self._grid_surface, bg="#08090d", highlightthickness=0, bd=0)
+                self._empty_slots.append(es)
+        else:
+            try:
+                if str(self._grid_surface.cget("bg")) != col_normal:
+                    self._grid_surface.configure(bg=col_normal)
+            except Exception:
+                pass
+
+        self._grid_surface.place(x=origin_x, y=origin_y, width=total_grid_w, height=total_grid_h)
 
         for slot_i, u in enumerate(visible_units):
             r = slot_i // cols
             c = slot_i % cols
-            px = origin_x + gap + c * (tile_w + gap)
-            py = origin_y + gap + r * (tile_h + gap)
+            cx = col_xs[c]
+            cy = row_ys[r]
+            cw = col_widths[c]
+            ch = row_heights[r]
             t = self._tiles[u.uuid]
 
-            t["frame"].place(x=px, y=py, width=tile_w, height=tile_h)
-            t["canvas"].pack_configure(padx=bw, pady=bw)
-            t["inner_w"] = inner_w
-            t["inner_h"] = inner_h
+            cv = t["canvas"]
+            cv.place(x=cx, y=cy, width=cw, height=ch)
+            t["inner_w"] = cw
+            t["inner_h"] = ch
+            t["cell_rect"] = (cx, cy, cw, ch)
+            t["bw"] = bw
+            t["last_border"] = ""
             t["last_lbl_text"] = None
             t["last_st_key"] = None
             t["last_warn_text"] = None
 
-            cv = t["canvas"]
-            cv.coords(t["img_id"], inner_w // 2, inner_h // 2)
-            cv.coords(t["ph_id"], inner_w // 2, inner_h // 2)
+            cv.coords(t["img_id"], cw // 2, ch // 2)
+            cv.coords(t["ph_id"], cw // 2, ch // 2)
 
-            u.set_grid_target_size(inner_w, inner_h)
+            u.set_grid_target_size(cw, ch)
+
+        for empty_idx, es in enumerate(self._empty_slots):
+            slot_i = len(visible_units) + empty_idx
+            r = slot_i // cols
+            c = slot_i % cols
+            es.place(x=col_xs[c], y=row_ys[r], width=col_widths[c], height=row_heights[r])
 
         self._update_tile_borders()
         if self._panel_visible:
@@ -1191,25 +1287,36 @@ class MainGridWindow:
         col_active = grid_cfg.get("active_border_color", "#00ff88")
         col_offline = grid_cfg.get("offline_border_color", "#ff4444")
 
+        if self._grid_surface is not None and self._grid_surface.winfo_exists():
+            try:
+                if str(self._grid_surface.cget("bg")) != col_normal:
+                    self._grid_surface.configure(bg=col_normal)
+            except Exception:
+                pass
+
+        changed = False
         for uid, t in self._tiles.items():
             unit = self.camera_manager.get_unit(uid)
             if uid in self.detail_windows:
-                bcol = col_active
+                hl_state, bcol = "active", col_active
             elif unit is not None:
                 snap = unit.get_grid_snapshot()
                 if snap.get("sub_status") in ("offline", "reconnecting") and snap.get("main_status") != "active":
-                    bcol = col_offline
+                    hl_state, bcol = "offline", col_offline
                 else:
-                    bcol = col_normal
+                    hl_state, bcol = "normal", col_normal
             else:
-                bcol = col_offline
+                hl_state, bcol = "offline", col_offline
 
-            if bcol != t["last_border"]:
-                t["last_border"] = bcol
-                try:
-                    t["frame"].configure(bg=bcol)
-                except Exception:
-                    pass
+            bkey = (hl_state, bcol, t.get("bw", 2))
+            if bkey != t["last_border"]:
+                t["last_border"] = bkey
+                t["last_hl_state"] = hl_state
+                self._apply_tile_highlight(t, hl_state, bcol)
+                changed = True
+
+        if changed:
+            self._restack_grid_highlights()
 
     def _render_tiles_once(self):
         if self._is_closing:
@@ -1232,6 +1339,7 @@ class MainGridWindow:
         col_offline = grid_cfg.get("offline_border_color", "#ff4444")
 
         ai_entries = self.registry.list_modules(kind="ai")
+        border_changed = False
 
         for uid, t in list(self._tiles.items()):
             unit = self.camera_manager.get_unit(uid)
@@ -1242,16 +1350,19 @@ class MainGridWindow:
             iw = max(32, t["inner_w"])
             ih = max(24, t["inner_h"])
 
-            # 1. Колір рамки плитки
+            # 1. Колір лінії сітки для комірки (без дублювання рамок)
             if uid in self.detail_windows:
-                bcol = col_active
+                hl_state, bcol = "active", col_active
             elif gs.get("sub_status") in ("offline", "reconnecting") and gs.get("main_status") != "active":
-                bcol = col_offline
+                hl_state, bcol = "offline", col_offline
             else:
-                bcol = col_normal
-            if bcol != t["last_border"]:
-                t["last_border"] = bcol
-                t["frame"].configure(bg=bcol)
+                hl_state, bcol = "normal", col_normal
+            bkey = (hl_state, bcol, t.get("bw", 2))
+            if bkey != t["last_border"]:
+                t["last_border"] = bkey
+                t["last_hl_state"] = hl_state
+                self._apply_tile_highlight(t, hl_state, bcol)
+                border_changed = True
 
             # 2. Кадр субпотоку
             rgb = gs.get("rgb")
@@ -1372,6 +1483,9 @@ class MainGridWindow:
             cv.tag_raise("ov_lbl")
             cv.tag_raise("ov_st")
             cv.tag_raise("ov_warn")
+
+        if border_changed:
+            self._restack_grid_highlights()
 
         return interval_ms
 

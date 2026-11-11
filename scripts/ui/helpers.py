@@ -859,3 +859,158 @@ def bind_hover_tooltip(
         widget.bind("<Destroy>", _hide, add="+")
     except Exception:
         pass
+
+
+def ensure_clam_theme(master=None) -> ttk.Style:
+    """Перемикає тему ttk на 'clam' лише за потреби (без скидання вже налаштованих стилів)."""
+    style = ttk.Style(master)
+    try:
+        if style.theme_use() != "clam":
+            style.theme_use("clam")
+    except Exception:
+        pass
+
+    target = master
+    if target is not None:
+        try:
+            top = target.winfo_toplevel()
+            if not getattr(top, "_dark_combo_opt_applied", False):
+                top.option_add("*TCombobox*Listbox*Background", "#1e2230")
+                top.option_add("*TCombobox*Listbox*Foreground", "#ffffff")
+                top.option_add("*TCombobox*Listbox*selectBackground", "#007acc")
+                top.option_add("*TCombobox*Listbox*selectForeground", "#ffffff")
+                top.option_add("*TCombobox*Listbox*highlightThickness", 0)
+                top._dark_combo_opt_applied = True
+        except Exception:
+            pass
+    return style
+
+
+def configure_dark_combobox_style(
+    master=None,
+    style_name: str = "TCombobox",
+    field_bg: str = "#222534",
+    hover_field_bg: str = "#292d40",
+    btn_bg: str = "#2b2f40",
+    btn_hover_bg: str = "#353a50",
+    fg: str = "#ffffff",
+    arrow_color: str = "#00e5ff",
+    border_color: str = "#2e3347",
+) -> str:
+    """
+    Налаштовує темну тему для ttk.Combobox у всіх станах (включно з readonly/focus/hover/disabled)
+    без світлого тла #dcdad5 / #eeebe7 стандартної теми clam.
+    """
+    style = ensure_clam_theme(master)
+    names = ["TCombobox"]
+    if style_name and style_name != "TCombobox":
+        names.append(style_name)
+
+    for sname in names:
+        try:
+            style.configure(
+                sname,
+                fieldbackground=field_bg,
+                background=btn_bg,
+                foreground=fg,
+                arrowcolor=arrow_color,
+                bordercolor=border_color,
+                lightcolor=border_color,
+                darkcolor=field_bg,
+                insertcolor=fg,
+                selectbackground=field_bg,
+                selectforeground=fg,
+            )
+            style.map(
+                sname,
+                fieldbackground=[
+                    ("disabled", "#1a1d28"),
+                    ("readonly", "focus", hover_field_bg),
+                    ("readonly", "hover", hover_field_bg),
+                    ("readonly", field_bg),
+                    ("focus", hover_field_bg),
+                    ("hover", hover_field_bg),
+                ],
+                background=[
+                    ("disabled", "#1e2230"),
+                    ("pressed", btn_hover_bg),
+                    ("active", btn_hover_bg),
+                    ("hover", btn_hover_bg),
+                    ("readonly", btn_bg),
+                ],
+                foreground=[
+                    ("disabled", "#7c8499"),
+                    ("readonly", "focus", fg),
+                    ("readonly", "hover", fg),
+                    ("readonly", fg),
+                    ("focus", fg),
+                    ("hover", fg),
+                ],
+                arrowcolor=[
+                    ("disabled", "#555e73"),
+                    ("pressed", "#ffffff"),
+                    ("active", "#55f0ff"),
+                    ("hover", "#55f0ff"),
+                ],
+                selectbackground=[
+                    ("readonly", "focus", hover_field_bg),
+                    ("readonly", field_bg),
+                    ("focus", "#007acc"),
+                ],
+                selectforeground=[
+                    ("disabled", "#7c8499"),
+                    ("readonly", fg),
+                ],
+            )
+        except Exception:
+            pass
+    return style_name or "TCombobox"
+
+
+def style_dark_combobox_popdown(
+    cb: ttk.Combobox,
+    bg: str = "#1e2230",
+    fg: str = "#ffffff",
+    sel_bg: str = "#007acc",
+    sel_fg: str = "#ffffff",
+    border_bg: str = "#2e3347",
+):
+    """Задає темні кольори безпосередньо для випадаючого списку (PopdownWindow Listbox) ttk.Combobox."""
+    if cb is None:
+        return cb
+
+    def _apply(_e=None):
+        try:
+            if not cb.winfo_exists():
+                return
+            pd = str(cb.tk.call("ttk::combobox::PopdownWindow", str(cb)))
+            lb = f"{pd}.f.l"
+            try:
+                cb.tk.call(pd, "configure", "-background", border_bg)
+            except Exception:
+                pass
+            try:
+                cb.tk.call(f"{pd}.f", "configure", "-background", bg, "-borderwidth", 1, "-relief", "solid")
+            except Exception:
+                pass
+            cb.tk.call(
+                lb,
+                "configure",
+                "-background", bg,
+                "-foreground", fg,
+                "-selectbackground", sel_bg,
+                "-selectforeground", sel_fg,
+                "-highlightthickness", 0,
+                "-borderwidth", 0,
+                "-relief", "flat",
+                "-activestyle", "none",
+            )
+        except Exception:
+            pass
+
+    _apply()
+    try:
+        cb.bind("<Button-1>", _apply, add="+")
+    except Exception:
+        pass
+    return cb

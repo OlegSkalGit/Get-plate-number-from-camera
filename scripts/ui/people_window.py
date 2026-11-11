@@ -10,7 +10,7 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
 from scripts.core.i18n import tr
-from scripts.ui.helpers import WindowGeometryTracker, ScrollableFrame
+from scripts.ui.helpers import WindowGeometryTracker, ScrollableFrame, ensure_clam_theme
 
 try:
     import cv2
@@ -516,6 +516,12 @@ class PeopleWindow:
 
         self._is_closing = False
         self._reanalyzing_all = False
+        self._active_modal_count = 0
+        self._load_in_flight = False
+        self._pending_live_refresh = False
+        self._pending_flush_after_id = None
+        self._vid_slider_dragging = False
+        self._tl_tree_syncing = False
         self._load_seq = 0
         self._video_seq = 0
         self._notify_after_id = None
@@ -542,10 +548,16 @@ class PeopleWindow:
         self._unassigned_events = []    # list[event_dict]
         self._summary = {}              # uid -> stats
         self._selected_uid = None       # uid або "__UNASSIGNED__"
+        self._displayed_uid = None      # uid, для якого реально відмальовані права панель і таймлайн
         self._matched_videos = []       # list[video_seg_dict] для обраної людини
         self._timeline_items = []       # відфільтровані та відсортовані елементи правої стрічки
         self._tree_item_map = {}        # iid -> timeline item dict
         self._current_item = None       # поточний обраний елемент таймлайну
+        self._rendered_selected_events_sig = None
+        self._rendered_videos_sig = None
+        self._rendered_tl_sig = None
+        self._rendered_hits_sig = None
+        self._last_active_img_sig = None
         self._global_stats_mode = "init"
         self._video_scanning = False
         self._media_empty_key = ("ui.people.timeline.select_event", "Select an event from the list")
@@ -554,12 +566,18 @@ class PeopleWindow:
         self._vid_ph_spec = None
         self._vid_hits_lbl = None
 
-        # UI-кеші зображень
+        # UI-кеші зображень та карток
         self._left_thumbs = []
+        self._thumb_cache = {}
         self._hdr_thumb_tk = None
+        self._hdr_thumb_sig = None
         self._crop_preview_tk = None
         self._screen_preview_tk = None
         self._person_card_frames = {}
+        self._person_cards = {}
+        self._rendered_people_order = []
+        self._rendered_card_keys = []
+        self._empty_list_lbl = None
 
         # Відеоплеєр
         self._vid_cap = None
@@ -580,7 +598,7 @@ class PeopleWindow:
         self.sort_desc_var = tk.BooleanVar(value=True)
 
         self._build_ui()
-        self.search_var.trace_add("write", lambda *_: self._render_people_list())
+        self.search_var.trace_add("write", lambda *_: self._render_people_list(keep_existing_order=False))
         self._drain_ui_queue()
         self._init_refresh_after_id = self.win.after(60, self.refresh_all)
 
@@ -798,11 +816,7 @@ class PeopleWindow:
         tl_box = tk.Frame(self.right_paned, bg="#171923", highlightthickness=1, highlightbackground="#292d3e")
         self.right_paned.add(tl_box, minsize=250, width=340)
 
-        style = ttk.Style(self.win)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+        style = ensure_clam_theme(self.win)
         style.configure(
             "PeopleTL.Treeview",
             background="#151720",
@@ -889,6 +903,8 @@ class PeopleWindow:
             bg="#1b1d29", fg="#ffffff", troughcolor="#2a2d3d", highlightthickness=0, sliderlength=14
         )
         self.vid_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.vid_slider.bind("<ButtonPress-1>", self._on_vid_slider_press, add="+")
+        self.vid_slider.bind("<ButtonRelease-1>", self._on_vid_slider_release, add="+")
 
         self.lbl_vid_time = tk.Label(
             vid_ctrl, text="00:00/00:00", fg="#d5dae8", bg="#1b1d29", font=("Consolas", 8), width=12
@@ -1038,9 +1054,9 @@ class PeopleWindow:
             self.btn_open_folder.configure(text=tr("ui.people.btn_open_folder", "📂 Folder"))
             self.btn_open_external.configure(text=tr("ui.people.btn_open_file", "↗ Open file"))
 
-            self._render_people_list()
+            self._render_people_list(keep_existing_order=True)
             self._update_person_header()
-            self._rebuild_timeline(reload_media=False)
+            self._rebuild_timeline(reload_media=False, preserve_scroll=True)
 
             if self._current_item is not None:
                 self.lbl_item_header.configure(text=self._format_item_header(self._current_item))
@@ -1095,15 +1111,19 @@ class PeopleWindow:
     def _guard_operator_write(self, action_label: str) -> bool:
         if not self._is_operator_mode():
             return False
-        messagebox.showinfo(
-            tr("ui.op.title", "Operator Mode"),
-            tr(
-                "ui.people.op_blocked_msg",
-                "Action '{action}' is unavailable in Operator mode (disk writes and changes are disabled).\nSwitch the system to Server mode in Settings to edit the face database.",
-                action=action_label,
-            ),
-            parent=self.win,
-        )
+        self._enter_modal()
+        try:
+            messagebox.showinfo(
+                tr("ui.op.title", "Operator Mode"),
+                tr(
+                    "ui.people.op_blocked_msg",
+                    "Action '{action}' is unavailable in Operator mode (disk writes and changes are disabled).\nSwitch the system to Server mode in Settings to edit the face database.",
+                    action=action_label,
+                ),
+                parent=self.win,
+            )
+        finally:
+            self._exit_modal(schedule_flush=True)
         return True
 
     # ------------------------------------------------------------------
@@ -1219,26 +1239,144 @@ class PeopleWindow:
         return matched
 
     # ------------------------------------------------------------------
-    # Завантаження та оновлення даних
+    # Завантаження, стабілізація та інкрементальне оновлення даних
     # ------------------------------------------------------------------
-    def refresh_all(self, select_uid: str = None):
-        if getattr(self, "_init_refresh_after_id", None) is not None:
+    @staticmethod
+    def _file_sig(path: str):
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+            return (os.path.normpath(path), int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            return None
+
+    def _get_cached_thumb(self, path: str, size_wh: tuple):
+        sig = self._file_sig(path)
+        if sig is None:
+            return None, None
+        key = (sig[0], sig[1], sig[2], int(size_wh[0]), int(size_wh[1]))
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            return cached, sig
+        try:
+            with Image.open(path) as pim:
+                pim.load()
+                pim = pim.resize((int(size_wh[0]), int(size_wh[1])), Image.Resampling.LANCZOS)
+                tkimg = ImageTk.PhotoImage(pim)
+            self._thumb_cache[key] = tkimg
+            while len(self._thumb_cache) > 600:
+                try:
+                    self._thumb_cache.pop(next(iter(self._thumb_cache)))
+                except Exception:
+                    break
+            return tkimg, sig
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _compute_events_sig(evs: list):
+        return tuple(
+            (
+                str(e.get("crop_path") or ""),
+                str(e.get("full_path") or ""),
+                str(e.get("person_name") or ""),
+                str(e.get("tag") or ""),
+                e.get("sharpness"),
+                float(e.get("timestamp") or 0.0),
+            )
+            for e in (evs or [])
+        )
+
+    @staticmethod
+    def _compute_videos_sig(vids: list):
+        return tuple(
+            (
+                str(v.get("path") or ""),
+                bool(v.get("busy")),
+                float(v.get("latest_hit_ts") or 0.0),
+                tuple((float(h.get("event_ts") or 0.0), float(h.get("seek_sec") or 0.0)) for h in (v.get("hits") or [])),
+            )
+            for v in (vids or [])
+        )
+
+    def _is_live_refresh_blocked(self) -> bool:
+        if self._is_closing or self._reanalyzing_all or self._active_modal_count > 0 or self._vid_slider_dragging:
+            return True
+        try:
+            if self.win.winfo_exists():
+                grab_w = self.win.grab_current()
+                if grab_w is not None and grab_w.winfo_toplevel() is not self.win:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _enter_modal(self):
+        self._active_modal_count += 1
+
+    def _exit_modal(self, schedule_flush: bool = True):
+        self._active_modal_count = max(0, self._active_modal_count - 1)
+        if schedule_flush and self._pending_live_refresh and not self._is_closing:
+            self._schedule_pending_live_refresh(delay_ms=80)
+
+    def _schedule_pending_live_refresh(self, delay_ms: int = 120):
+        if self._is_closing:
+            return
+        if self._pending_flush_after_id is not None:
             try:
-                self.win.after_cancel(self._init_refresh_after_id)
+                self.win.after_cancel(self._pending_flush_after_id)
             except Exception:
                 pass
-            self._init_refresh_after_id = None
+            self._pending_flush_after_id = None
+        try:
+            if self.win.winfo_exists():
+                self._pending_flush_after_id = self.win.after(int(delay_ms), self._flush_pending_live_refresh)
+        except Exception:
+            pass
+
+    def _flush_pending_live_refresh(self):
+        self._pending_flush_after_id = None
+        if self._is_closing or not self._pending_live_refresh:
+            return
+        if self._is_live_refresh_blocked() or self._load_in_flight:
+            return
+        self._pending_live_refresh = False
+        self.refresh_all(select_uid=self._selected_uid, live_update=True, preserve_active_item=True)
+
+    def refresh_all(self, select_uid: str = None, *, live_update: bool = False, preserve_active_item: bool = True):
+        for attr in ("_init_refresh_after_id", "_pending_flush_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                try:
+                    self.win.after_cancel(aid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         if self._is_closing or not self.win.winfo_exists():
             return
+        if live_update and self._load_in_flight:
+            self._pending_live_refresh = True
+            return
+        if not live_update:
+            self._pending_live_refresh = False
+
         db = self._get_face_db()
         if db is None:
             self._records = []
             self._events_by_person = {}
             self._unassigned_events = []
             self._summary = {}
+            self._selected_uid = None
+            self._displayed_uid = None
             self._global_stats_mode = "no_db"
             self._sync_global_stats_label()
-            self._render_people_list()
+            self._render_people_list(keep_existing_order=False)
+            self._update_person_header()
+            self._matched_videos = []
+            self._rendered_videos_sig = None
+            self._rendered_selected_events_sig = None
+            self._rebuild_timeline(reload_media=False, preserve_scroll=False)
             return
 
         if select_uid is not None:
@@ -1246,17 +1384,38 @@ class PeopleWindow:
 
         self._load_seq += 1
         seq = self._load_seq
+        self._load_in_flight = True
         cams_info = self._get_cameras_info()
+        is_live = bool(live_update)
+        keep_item = bool(preserve_active_item)
 
         def _worker():
-            collected = db.collect_person_events(cams_info)
-            self._ui_queue.put((self._on_collected_loaded, (seq, collected)))
+            collected = None
+            try:
+                collected = db.collect_person_events(cams_info)
+            except Exception:
+                collected = None
+            self._ui_queue.put((self._on_collected_loaded, (seq, collected, is_live, keep_item)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_collected_loaded(self, seq: int, collected: dict):
+    def _on_collected_loaded(
+        self,
+        seq: int,
+        collected: dict,
+        is_live_update: bool = False,
+        preserve_active_item: bool = True,
+    ):
+        if seq == self._load_seq:
+            self._load_in_flight = False
         if seq != self._load_seq or self._is_closing or not self.win.winfo_exists():
             return
+        if collected is None:
+            return
+        if is_live_update and self._is_live_refresh_blocked():
+            self._pending_live_refresh = True
+            return
+
         self._records = list(collected.get("records") or [])
         self._events_by_person = dict(collected.get("events_by_person") or {})
         self._unassigned_events = list(collected.get("unassigned_events") or [])
@@ -1267,20 +1426,34 @@ class PeopleWindow:
 
         # Перевіряємо валідність вибраного UID
         valid_ids = {r["id"] for r in self._records}
-        if self._selected_uid == "__UNASSIGNED__" and not self._unassigned_events:
-            self._selected_uid = None
-        elif self._selected_uid not in valid_ids and self._selected_uid != "__UNASSIGNED__":
+        if self._selected_uid == "__UNASSIGNED__":
+            if not self._unassigned_events:
+                self._selected_uid = None
+        elif self._selected_uid not in valid_ids:
             self._selected_uid = None
 
-        self._render_people_list()
         if self._selected_uid is None and self._records:
-            self.select_person(self._records[0]["id"])
-        elif self._selected_uid is not None:
-            self.select_person(self._selected_uid)
-        else:
+            self._selected_uid = self._records[0]["id"]
+
+        self._render_people_list(keep_existing_order=bool(is_live_update and preserve_active_item))
+
+        if self._selected_uid is None:
+            self._displayed_uid = None
+            self._stop_video_player()
+            self._current_item = None
+            self._rendered_selected_events_sig = None
+            self._rendered_videos_sig = None
             self._matched_videos = []
-            self._rebuild_timeline()
+            self._update_person_header()
+            self._rebuild_timeline(reload_media=False, preserve_scroll=False)
+        elif self._selected_uid != self._displayed_uid or not preserve_active_item:
+            self.select_person(self._selected_uid, force=True, render_list=False)
+        else:
+            self._refresh_selected_person_inplace(is_live_update=is_live_update)
+
         self._sync_operator_mode_ui()
+        if self._pending_live_refresh and not self._is_live_refresh_blocked():
+            self._schedule_pending_live_refresh(delay_ms=150)
 
     def _cycle_people_sort(self):
         order = ["recent", "crops", "name"]
@@ -1288,14 +1461,9 @@ class PeopleWindow:
         nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "recent"
         self.people_sort_var.set(nxt)
         self._sync_people_sort_btn_text()
-        self._render_people_list()
+        self._render_people_list(keep_existing_order=False)
 
-    def _render_people_list(self):
-        for ch in list(self.people_scroll.inner.winfo_children()):
-            ch.destroy()
-        self._left_thumbs.clear()
-        self._person_card_frames.clear()
-
+    def _build_people_card_specs(self, keep_existing_order: bool = False):
         q = self.search_var.get().strip().upper()
         sort_mode = self.people_sort_var.get()
 
@@ -1311,78 +1479,56 @@ class PeopleWindow:
                 return (0, -int(st.get("crop_count", 0)), -float(st.get("last_ts", 0.0)), r["name"].upper())
             return (0, -float(st.get("last_ts", 0.0)), -int(st.get("crop_count", 0)), r["name"].upper())
 
-        recs.sort(key=_sort_key)
+        if keep_existing_order and self._rendered_people_order:
+            pos_map = {uid: idx for idx, uid in enumerate(self._rendered_people_order)}
+            existing_recs = [r for r in recs if r["id"] in pos_map]
+            existing_recs.sort(key=lambda r: pos_map[r["id"]])
+            new_recs = [r for r in recs if r["id"] not in pos_map]
+            new_recs.sort(key=_sort_key)
+            recs = existing_recs + new_recs
+        else:
+            recs.sort(key=_sort_key)
 
-        if not recs and not self._unassigned_events:
-            tk.Label(
-                self.people_scroll.inner,
-                text=tr("ui.people.list_empty", "People database is empty\nor nothing matched your search."),
-                fg="#8c92a4", bg="#151720", font=("Segoe UI", 9), pady=24
-            ).pack()
-            return
-
+        specs = []
         for rec in recs:
             uid = rec["id"]
             st = self._summary.get(uid) or {}
             evs = self._events_by_person.get(uid) or []
             thumb_src = rec.get("thumb_path") or ""
-            if (not thumb_src or not os.path.exists(thumb_src)) and evs:
+            thumb_sig = self._file_sig(thumb_src)
+            if thumb_sig is None and evs:
                 thumb_src = evs[-1].get("crop_path") or ""
+                thumb_sig = self._file_sig(thumb_src)
 
             is_sel = (self._selected_uid == uid)
-            bg_c = "#212738" if is_sel else "#1b1d29"
-            bd_c = "#00e5ff" if is_sel else "#292d3e"
-            card = tk.Frame(
-                self.people_scroll.inner, bg=bg_c, padx=8, pady=7,
-                highlightthickness=2 if is_sel else 1, highlightbackground=bd_c, cursor="hand2"
-            )
-            card.pack(fill=tk.X, padx=6, pady=3)
-            self._person_card_frames[uid] = card
-
-            t_lbl = tk.Label(card, bg="#101118", width=6, height=3, text="👤", fg="#70758a", font=("Segoe UI", 12))
-            if thumb_src and os.path.exists(thumb_src):
-                try:
-                    with Image.open(thumb_src) as pim:
-                        pim.load()
-                        pim = pim.resize((48, 48), Image.Resampling.LANCZOS)
-                        tkimg = ImageTk.PhotoImage(pim)
-                        self._left_thumbs.append(tkimg)
-                        t_lbl.configure(image=tkimg, text="", width=48, height=48)
-                except Exception:
-                    pass
-            t_lbl.pack(side=tk.LEFT, padx=(0, 10))
-
-            txt_box = tk.Frame(card, bg=bg_c)
-            txt_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
             ign = bool(rec.get("ignore", False))
             ign_str = tr("ui.people.card_ignore_tag", " [IGNORE]") if ign else ""
-            l1 = tk.Label(
-                txt_box,
-                text=f"{rec['name']}{ign_str}",
-                fg="#8c92a4" if ign else "#ffffff", bg=bg_c, font=("Segoe UI", 9, "bold"), anchor=tk.W
-            )
-            l1.pack(fill=tk.X)
-
+            name_txt = f"{rec['name']}{ign_str}"
+            fg_name = "#8c92a4" if ign else "#ffffff"
             short_uid = uid if len(uid) <= 18 else f"{uid[:18]}..."
-            l2 = tk.Label(
-                txt_box, text=f"UUID: {short_uid}",
-                fg="#00c4e0", bg=bg_c, font=("Consolas", 7), anchor=tk.W
-            )
-            l2.pack(fill=tk.X)
-
+            uuid_txt = f"UUID: {short_uid}"
             c_cnt = int(st.get("crop_count", 0))
             last_ts = float(st.get("last_ts", 0.0))
             last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m %H:%M") if last_ts > 0 else "—"
-            l3 = tk.Label(
-                txt_box,
-                text=tr("ui.people.card_meta_fmt", "Crops: {crops}  •  Last seen: {last}", crops=c_cnt, last=last_str),
-                fg="#9ba3b8", bg=bg_c, font=("Segoe UI", 8), anchor=tk.W
-            )
-            l3.pack(fill=tk.X)
+            meta_txt = tr("ui.people.card_meta_fmt", "Crops: {crops}  •  Last seen: {last}", crops=c_cnt, last=last_str)
+            bg_c = "#212738" if is_sel else "#1b1d29"
+            bd_c = "#00e5ff" if is_sel else "#292d3e"
+            bd_w = 2 if is_sel else 1
 
-            for w in (card, t_lbl, txt_box, l1, l2, l3):
-                w.bind("<Button-1>", lambda e, target=uid: self.select_person(target))
+            specs.append({
+                "key": uid,
+                "is_unassigned": False,
+                "thumb_src": thumb_src,
+                "thumb_sig": thumb_sig,
+                "name_txt": name_txt,
+                "fg_name": fg_name,
+                "uuid_txt": uuid_txt,
+                "meta_txt": meta_txt,
+                "bg_c": bg_c,
+                "bd_c": bd_c,
+                "bd_w": bd_w,
+                "state": (name_txt, fg_name, uuid_txt, meta_txt, thumb_sig, is_sel),
+            })
 
         unassigned_title = tr("ui.people.unassigned_card_title", "⚠ Unassigned / deleted ({n})", n=len(self._unassigned_events))
         if self._unassigned_events and (
@@ -1391,46 +1537,274 @@ class PeopleWindow:
             is_sel = (self._selected_uid == "__UNASSIGNED__")
             bg_c = "#2c221b" if is_sel else "#221b18"
             bd_c = "#ffcc00" if is_sel else "#4d3a27"
+            bd_w = 2 if is_sel else 1
+            hint_txt = tr("ui.people.unassigned_card_hint", "Orphan crops without faces.txt record — can be reanalyzed or deleted")
+            specs.append({
+                "key": "__UNASSIGNED__",
+                "is_unassigned": True,
+                "title": unassigned_title,
+                "hint": hint_txt,
+                "bg_c": bg_c,
+                "bd_c": bd_c,
+                "bd_w": bd_w,
+                "state": (unassigned_title, hint_txt, is_sel),
+            })
+        return specs
+
+    def _create_person_card(self, sp: dict) -> dict:
+        key = sp["key"]
+        bg_c = sp["bg_c"]
+        if sp["is_unassigned"]:
             ucard = tk.Frame(
                 self.people_scroll.inner, bg=bg_c, padx=8, pady=8,
-                highlightthickness=2 if is_sel else 1, highlightbackground=bd_c, cursor="hand2"
+                highlightthickness=sp["bd_w"], highlightbackground=sp["bd_c"], cursor="hand2"
             )
-            ucard.pack(fill=tk.X, padx=6, pady=(8, 4))
-            self._person_card_frames["__UNASSIGNED__"] = ucard
             ul1 = tk.Label(
-                ucard, text=unassigned_title,
+                ucard, text=sp["title"],
                 fg="#ffcc00", bg=bg_c, font=("Segoe UI", 9, "bold"), anchor=tk.W
             )
             ul1.pack(fill=tk.X)
             ul2 = tk.Label(
-                ucard,
-                text=tr("ui.people.unassigned_card_hint", "Orphan crops without faces.txt record — can be reanalyzed or deleted"),
+                ucard, text=sp["hint"],
                 fg="#b8a898", bg=bg_c, font=("Segoe UI", 7), anchor=tk.W
             )
             ul2.pack(fill=tk.X)
             for w in (ucard, ul1, ul2):
                 w.bind("<Button-1>", lambda e: self.select_person("__UNASSIGNED__"))
+            self._person_card_frames[key] = ucard
+            return {
+                "frame": ucard,
+                "ul1": ul1,
+                "ul2": ul2,
+                "is_unassigned": True,
+                "thumb_sig": None,
+                "tkimg": None,
+                "state": sp["state"],
+            }
+
+        card = tk.Frame(
+            self.people_scroll.inner, bg=bg_c, padx=8, pady=7,
+            highlightthickness=sp["bd_w"], highlightbackground=sp["bd_c"], cursor="hand2"
+        )
+        t_lbl = tk.Label(card, bg="#101118", width=6, height=3, text="👤", fg="#70758a", font=("Segoe UI", 12))
+        tkimg, thumb_sig = self._get_cached_thumb(sp["thumb_src"], (48, 48))
+        if tkimg is not None:
+            t_lbl.configure(image=tkimg, text="", width=48, height=48)
+        t_lbl.pack(side=tk.LEFT, padx=(0, 10))
+
+        txt_box = tk.Frame(card, bg=bg_c)
+        txt_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        l1 = tk.Label(
+            txt_box, text=sp["name_txt"],
+            fg=sp["fg_name"], bg=bg_c, font=("Segoe UI", 9, "bold"), anchor=tk.W
+        )
+        l1.pack(fill=tk.X)
+        l2 = tk.Label(
+            txt_box, text=sp["uuid_txt"],
+            fg="#00c4e0", bg=bg_c, font=("Consolas", 7), anchor=tk.W
+        )
+        l2.pack(fill=tk.X)
+        l3 = tk.Label(
+            txt_box, text=sp["meta_txt"],
+            fg="#9ba3b8", bg=bg_c, font=("Segoe UI", 8), anchor=tk.W
+        )
+        l3.pack(fill=tk.X)
+
+        for w in (card, t_lbl, txt_box, l1, l2, l3):
+            w.bind("<Button-1>", lambda e, target=key: self.select_person(target))
+        self._person_card_frames[key] = card
+        return {
+            "frame": card,
+            "t_lbl": t_lbl,
+            "txt_box": txt_box,
+            "l1": l1,
+            "l2": l2,
+            "l3": l3,
+            "is_unassigned": False,
+            "thumb_sig": thumb_sig,
+            "tkimg": tkimg,
+            "state": sp["state"],
+        }
+
+    def _update_person_card_inplace(self, cinfo: dict, sp: dict):
+        if cinfo["state"] == sp["state"]:
+            return
+        prev_state = cinfo["state"]
+        cinfo["state"] = sp["state"]
+        bg_c = sp["bg_c"]
+
+        if sp["is_unassigned"]:
+            cinfo["frame"].configure(bg=bg_c, highlightthickness=sp["bd_w"], highlightbackground=sp["bd_c"])
+            cinfo["ul1"].configure(text=sp["title"], bg=bg_c)
+            cinfo["ul2"].configure(text=sp["hint"], bg=bg_c)
+            return
+
+        if prev_state[5] != sp["state"][5]:
+            cinfo["frame"].configure(bg=bg_c, highlightthickness=sp["bd_w"], highlightbackground=sp["bd_c"])
+            cinfo["txt_box"].configure(bg=bg_c)
+            cinfo["l1"].configure(bg=bg_c)
+            cinfo["l2"].configure(bg=bg_c)
+            cinfo["l3"].configure(bg=bg_c)
+
+        if prev_state[0] != sp["state"][0] or prev_state[1] != sp["state"][1]:
+            cinfo["l1"].configure(text=sp["name_txt"], fg=sp["fg_name"])
+        if prev_state[2] != sp["state"][2]:
+            cinfo["l2"].configure(text=sp["uuid_txt"])
+        if prev_state[3] != sp["state"][3]:
+            cinfo["l3"].configure(text=sp["meta_txt"])
+        if prev_state[4] != sp["state"][4]:
+            tkimg, thumb_sig = self._get_cached_thumb(sp["thumb_src"], (48, 48))
+            cinfo["tkimg"] = tkimg
+            cinfo["thumb_sig"] = thumb_sig
+            if tkimg is not None:
+                cinfo["t_lbl"].configure(image=tkimg, text="", width=48, height=48)
+            else:
+                cinfo["t_lbl"].configure(image="", text="👤", width=6, height=3)
+
+    def _destroy_all_person_cards(self):
+        for ch in list(self.people_scroll.inner.winfo_children()):
+            ch.destroy()
+        self._left_thumbs.clear()
+        self._person_card_frames.clear()
+        self._person_cards.clear()
+        self._empty_list_lbl = None
+        self._rendered_people_order = []
+        self._rendered_card_keys = []
+
+    def _render_people_list(self, keep_existing_order: bool = False):
+        specs = self._build_people_card_specs(keep_existing_order=keep_existing_order)
+        desired_keys = [sp["key"] for sp in specs]
+        old_keys = list(self._rendered_card_keys)
+
+        if not specs:
+            if (
+                self._empty_list_lbl is not None
+                and self._empty_list_lbl.winfo_exists()
+                and not self._person_cards
+            ):
+                self._empty_list_lbl.configure(
+                    text=tr("ui.people.list_empty", "People database is empty\nor nothing matched your search.")
+                )
+                return
+            self._destroy_all_person_cards()
+            self._empty_list_lbl = tk.Label(
+                self.people_scroll.inner,
+                text=tr("ui.people.list_empty", "People database is empty\nor nothing matched your search."),
+                fg="#8c92a4", bg="#151720", font=("Segoe UI", 9), pady=24
+            )
+            self._empty_list_lbl.pack()
+            return
+
+        if self._empty_list_lbl is not None:
+            try:
+                self._empty_list_lbl.destroy()
+            except Exception:
+                pass
+            self._empty_list_lbl = None
+
+        all_cards_alive = (
+            bool(old_keys)
+            and all(
+                k in self._person_cards and self._person_cards[k]["frame"].winfo_exists()
+                for k in old_keys
+            )
+        )
+
+        # Швидкий шлях 1: порядок і набір карток не змінилися — оновлюємо лише змінені віджети без перебудови
+        if desired_keys == old_keys and all_cards_alive:
+            for sp in specs:
+                self._update_person_card_inplace(self._person_cards[sp["key"]], sp)
+            self._left_thumbs = [c["tkimg"] for c in self._person_cards.values() if c.get("tkimg") is not None]
+            return
+
+        # Швидкий шлях 2: у режимі фонового оновлення існуючі картки лишилися на своїх місцях, а нові додані в кінець
+        old_person_keys = [k for k in old_keys if k != "__UNASSIGNED__"]
+        new_person_keys = [k for k in desired_keys if k != "__UNASSIGNED__"]
+        is_prefix_append = (
+            keep_existing_order
+            and all_cards_alive
+            and bool(old_person_keys)
+            and len(new_person_keys) >= len(old_person_keys)
+            and new_person_keys[:len(old_person_keys)] == old_person_keys
+        )
+        if is_prefix_append:
+            def _append_update():
+                existing_set = set(old_person_keys)
+                has_new_people = len(new_person_keys) > len(old_person_keys)
+                had_unassigned = "__UNASSIGNED__" in self._person_cards
+                want_unassigned = "__UNASSIGNED__" in desired_keys
+
+                if had_unassigned and (has_new_people or not want_unassigned):
+                    ucard_info = self._person_cards["__UNASSIGNED__"]
+                    if not want_unassigned:
+                        ucard_info["frame"].destroy()
+                        self._person_cards.pop("__UNASSIGNED__", None)
+                        self._person_card_frames.pop("__UNASSIGNED__", None)
+                    else:
+                        ucard_info["frame"].pack_forget()
+
+                for sp in specs:
+                    k = sp["key"]
+                    if sp["is_unassigned"]:
+                        continue
+                    if k in existing_set:
+                        self._update_person_card_inplace(self._person_cards[k], sp)
+                    else:
+                        cinfo = self._create_person_card(sp)
+                        self._person_cards[k] = cinfo
+                        cinfo["frame"].pack(fill=tk.X, padx=6, pady=3)
+
+                for sp in specs:
+                    if not sp["is_unassigned"]:
+                        continue
+                    if "__UNASSIGNED__" in self._person_cards:
+                        uc_info = self._person_cards["__UNASSIGNED__"]
+                        self._update_person_card_inplace(uc_info, sp)
+                        if has_new_people:
+                            uc_info["frame"].pack(fill=tk.X, padx=6, pady=(8, 4))
+                    else:
+                        uc_info = self._create_person_card(sp)
+                        self._person_cards["__UNASSIGNED__"] = uc_info
+                        uc_info["frame"].pack(fill=tk.X, padx=6, pady=(8, 4))
+
+                self._rendered_people_order = new_person_keys
+                self._rendered_card_keys = desired_keys
+                self._left_thumbs = [c["tkimg"] for c in self._person_cards.values() if c.get("tkimg") is not None]
+
+            self.people_scroll.preserve_scroll_during(_append_update)
+            return
+
+        # Шлях 3: повна перебудова зі збереженням скролу
+        def _full_rebuild():
+            self._destroy_all_person_cards()
+            for sp in specs:
+                cinfo = self._create_person_card(sp)
+                self._person_cards[sp["key"]] = cinfo
+                if sp["is_unassigned"]:
+                    cinfo["frame"].pack(fill=tk.X, padx=6, pady=(8, 4))
+                else:
+                    cinfo["frame"].pack(fill=tk.X, padx=6, pady=3)
+            self._rendered_people_order = [sp["key"] for sp in specs if not sp["is_unassigned"]]
+            self._rendered_card_keys = desired_keys
+            self._left_thumbs = [c["tkimg"] for c in self._person_cards.values() if c.get("tkimg") is not None]
+
+        self.people_scroll.preserve_scroll_during(_full_rebuild)
 
     # ------------------------------------------------------------------
     # Вибір людини і формування хронологічної стрічки (кропи + скріни + відео)
     # ------------------------------------------------------------------
-    def select_person(self, uid: str):
-        self._selected_uid = uid
-        self._stop_video_player()
-        self._current_item = None
-        self._render_people_list()
-        self._update_person_header()
-
-        evs = self._get_selected_events()
-        self._matched_videos = []
-        self._rebuild_timeline()
-
-        # Фонове зіставлення відеофрагментів (щоб не блокувати UI при відкритті відео)
+    def _start_video_scan_for_selected(self, uid: str, evs: list, *, is_live_update: bool = False):
         self._video_seq += 1
         v_seq = self._video_seq
         if not evs:
             self._video_scanning = False
+            self._matched_videos = []
+            self._rendered_videos_sig = ()
             self.lbl_video_scan.configure(text="")
+            if is_live_update:
+                self._update_person_header()
+                self._rebuild_timeline(reload_media=False, preserve_scroll=True)
             return
 
         self._video_scanning = True
@@ -1438,18 +1812,66 @@ class PeopleWindow:
 
         def _vid_worker():
             vids = self._find_matching_videos_for_person(evs)
-            self._ui_queue.put((self._on_videos_matched, (v_seq, uid, vids)))
+            self._ui_queue.put((self._on_videos_matched, (v_seq, uid, vids, bool(is_live_update))))
 
         threading.Thread(target=_vid_worker, daemon=True).start()
 
-    def _on_videos_matched(self, v_seq: int, uid: str, vids: list):
+    def _refresh_selected_person_inplace(self, is_live_update: bool = True):
+        uid = self._selected_uid
+        evs = self._get_selected_events()
+        new_evs_sig = self._compute_events_sig(evs)
+        evs_changed = (new_evs_sig != self._rendered_selected_events_sig)
+
+        self._update_person_header()
+        self._update_filter_buttons_style()
+
+        if evs_changed or not is_live_update:
+            self._rendered_selected_events_sig = new_evs_sig
+            self._rebuild_timeline(reload_media=False, preserve_scroll=True)
+            self._start_video_scan_for_selected(uid, evs, is_live_update=True)
+
+    def select_person(self, uid: str, force: bool = False, render_list: bool = True):
+        if not force and uid == self._displayed_uid and self._selected_uid == uid:
+            return
+        self._selected_uid = uid
+        self._displayed_uid = uid
+        self._stop_video_player()
+        self._current_item = None
+        self._rendered_selected_events_sig = None
+        self._rendered_videos_sig = None
+        self._rendered_tl_sig = None
+        self._rendered_hits_sig = None
+        self._last_active_img_sig = None
+
+        if render_list:
+            self._render_people_list(keep_existing_order=True)
+        self._update_person_header()
+
+        evs = self._get_selected_events()
+        self._rendered_selected_events_sig = self._compute_events_sig(evs)
+        self._matched_videos = []
+        self._rebuild_timeline(reload_media=True, preserve_scroll=False)
+        self._start_video_scan_for_selected(uid, evs, is_live_update=False)
+
+    def _on_videos_matched(self, v_seq: int, uid: str, vids: list, is_live_update: bool = False):
         if v_seq != self._video_seq or uid != self._selected_uid or self._is_closing or not self.win.winfo_exists():
             return
-        self._matched_videos = list(vids or [])
         self._video_scanning = False
         self.lbl_video_scan.configure(text="")
+        if is_live_update and self._is_live_refresh_blocked():
+            self._pending_live_refresh = True
+            return
+
+        vids_list = list(vids or [])
+        new_vids_sig = self._compute_videos_sig(vids_list)
+        if new_vids_sig == self._rendered_videos_sig:
+            return
+
+        self._matched_videos = vids_list
+        self._rendered_videos_sig = new_vids_sig
         self._update_person_header()
-        self._rebuild_timeline()
+        # Не скидаємо вибране фото/відео, щойно відкрите користувачем або плеєр, який уже грає
+        self._rebuild_timeline(reload_media=False, preserve_scroll=True)
 
     def _get_selected_record(self):
         if self._selected_uid is None or self._selected_uid == "__UNASSIGNED__":
@@ -1466,14 +1888,19 @@ class PeopleWindow:
             return list(self._events_by_person.get(self._selected_uid) or [])
         return []
 
+    def _set_header_placeholder(self):
+        if self._hdr_thumb_sig is None and self._hdr_thumb_tk is None:
+            return
+        self._hdr_thumb_tk = None
+        self._hdr_thumb_sig = None
+        self.hdr_thumb_lbl.configure(image="", text="👤", width=8, height=4)
+
     def _update_person_header(self):
         rec = self._get_selected_record()
         evs = self._get_selected_events()
 
-        self._hdr_thumb_tk = None
-        self.hdr_thumb_lbl.configure(image="", text="👤", width=8, height=4)
-
         if self._selected_uid == "__UNASSIGNED__":
+            self._set_header_placeholder()
             self.lbl_person_name.configure(text=tr("ui.people.unassigned_hdr", "⚠ Unassigned crops"), fg="#ffcc00")
             self.lbl_person_uuid.configure(text=tr("ui.people.unassigned_uuid", "UUID: (missing from faces.txt)"))
             self.lbl_person_meta.configure(
@@ -1487,6 +1914,7 @@ class PeopleWindow:
             return
 
         if rec is None:
+            self._set_header_placeholder()
             self.lbl_person_name.configure(text=tr("ui.people.select_person", "Select a person from the list on the left"), fg="#ffffff")
             self.lbl_person_uuid.configure(text="UUID: —")
             self.lbl_person_meta.configure(text="")
@@ -1497,17 +1925,22 @@ class PeopleWindow:
             return
 
         tp = rec.get("thumb_path") or ""
-        if (not tp or not os.path.exists(tp)) and evs:
+        new_sig = self._file_sig(tp)
+        if new_sig is None and evs:
             tp = evs[-1].get("crop_path") or ""
-        if tp and os.path.exists(tp):
-            try:
-                with Image.open(tp) as pim:
-                    pim.load()
-                    pim = pim.resize((68, 68), Image.Resampling.LANCZOS)
-                    self._hdr_thumb_tk = ImageTk.PhotoImage(pim)
-                    self.hdr_thumb_lbl.configure(image=self._hdr_thumb_tk, text="", width=68, height=68)
-            except Exception:
-                pass
+            new_sig = self._file_sig(tp)
+
+        if new_sig != self._hdr_thumb_sig or (new_sig is not None and self._hdr_thumb_tk is None):
+            if new_sig is not None:
+                tkimg, resolved_sig = self._get_cached_thumb(tp, (68, 68))
+                if tkimg is not None:
+                    self._hdr_thumb_tk = tkimg
+                    self._hdr_thumb_sig = resolved_sig
+                    self.hdr_thumb_lbl.configure(image=tkimg, text="", width=68, height=68)
+                else:
+                    self._set_header_placeholder()
+            else:
+                self._set_header_placeholder()
 
         ign = bool(rec.get("ignore", False))
         ign_hdr = tr("ui.people.hdr_ignored_tag", "  [IGNORED]") if ign else ""
@@ -1548,13 +1981,13 @@ class PeopleWindow:
     def _set_kind_filter(self, kind_key: str):
         self.kind_filter_var.set(kind_key)
         self._update_filter_buttons_style()
-        self._rebuild_timeline()
+        self._rebuild_timeline(reload_media=False, preserve_scroll=False)
 
     def _toggle_time_order(self):
         desc = not bool(self.sort_desc_var.get())
         self.sort_desc_var.set(desc)
         self._sync_time_order_btn_text()
-        self._rebuild_timeline()
+        self._rebuild_timeline(reload_media=False, preserve_scroll=False)
 
     def _update_filter_buttons_style(self):
         cur = self.kind_filter_var.get()
@@ -1578,14 +2011,9 @@ class PeopleWindow:
                 fg="#ffffff" if active else "#d5dae8",
             )
 
-    def _rebuild_timeline(self, reload_media: bool = True):
+    def _rebuild_timeline(self, reload_media: bool = True, preserve_scroll: bool = True):
         self._update_filter_buttons_style()
         prev_selected_key = self._current_item.get("item_key") if self._current_item else None
-
-        for iid in self.tl_tree.get_children():
-            self.tl_tree.delete(iid)
-        self._tree_item_map.clear()
-        self._timeline_items.clear()
 
         evs = self._get_selected_events()
         vids = list(self._matched_videos)
@@ -1638,61 +2066,181 @@ class PeopleWindow:
         else:
             raw_items.sort(key=lambda x: (x["sort_ts"], x["priority"], x["item_key"]))
 
-        self._timeline_items = raw_items
-
-        reselect_iid = None
-        first_iid = None
         grouped = {}
         for item in raw_items:
+            k = item["kind"]
+            if k == "crop":
+                ev = item["event"]
+                tag_bit = f" [{ev['tag']}]" if ev.get("tag") else ""
+                item["_row_text"] = f"  👤 {item['time']}  {item['camera_name']}{tag_bit}"
+            elif k == "screen":
+                item["_row_text"] = tr(
+                    "ui.people.tl.screen_row",
+                    "  🖼 {time}  Full frame ({cam})",
+                    time=item["time"],
+                    cam=item["camera_name"],
+                )
+            else:
+                vid = item["video"]
+                hits_n = len(vid.get("hits") or [])
+                off_s = self._format_sec(vid.get("seek_sec", 0.0))
+                hits_bit = tr("ui.people.tl.hits_bit", " ({n} appearances)", n=hits_n) if hits_n > 1 else ""
+                item["_row_text"] = tr(
+                    "ui.people.tl.video_row",
+                    "  🎬 {time}  Video +{offset}{hits_bit} [{cam}]",
+                    time=item["time"],
+                    offset=off_s,
+                    hits_bit=hits_bit,
+                    cam=item["camera_name"],
+                )
             grouped.setdefault(item["day"], []).append(item)
 
-        for day_str in sorted(grouped.keys(), reverse=desc):
-            day_node = self.tl_tree.insert("", "end", text=f"📁 {day_str}", open=True)
-            for item in grouped[day_str]:
-                k = item["kind"]
-                if k == "crop":
-                    ev = item["event"]
-                    tag_bit = f" [{ev['tag']}]" if ev.get("tag") else ""
-                    txt = f"  👤 {item['time']}  {item['camera_name']}{tag_bit}"
-                elif k == "screen":
-                    txt = tr("ui.people.tl.screen_row", "  🖼 {time}  Full frame ({cam})", time=item["time"], cam=item["camera_name"])
+        ordered_days = sorted(grouped.keys(), reverse=desc)
+        new_tl_sig = (
+            fkind,
+            desc,
+            tuple(
+                (day_str, tuple((it["item_key"], it["_row_text"]) for it in grouped[day_str]))
+                for day_str in ordered_days
+            ),
+        )
+
+        # Швидкий шлях: рядки таймлайну не змінилися — не видаляємо дерево і не скидаємо скрол
+        if not reload_media and self._rendered_tl_sig == new_tl_sig and self.tl_tree.get_children():
+            self._timeline_items = raw_items
+            by_key = {it["item_key"]: it for it in raw_items}
+            for iid, old_it in list(self._tree_item_map.items()):
+                fresh = by_key.get(old_it["item_key"])
+                if fresh is not None:
+                    self._tree_item_map[iid] = fresh
+            if prev_selected_key and prev_selected_key in by_key:
+                self._current_item = by_key[prev_selected_key]
+                self.lbl_item_header.configure(text=self._format_item_header(self._current_item))
+                if self._current_item.get("kind") == "video":
+                    self._refresh_video_hits_bar_if_needed(self._current_item["video"])
+                self._update_item_action_buttons()
+            return
+
+        prev_day_nodes = self.tl_tree.get_children()
+        had_days = bool(prev_day_nodes)
+        open_days = set()
+        known_days = set()
+        for d_id in prev_day_nodes:
+            d_txt = self.tl_tree.item(d_id, "text")
+            if d_txt.startswith("📁 "):
+                d_name = d_txt[2:].strip()
+                known_days.add(d_name)
+                if self.tl_tree.item(d_id, "open"):
+                    open_days.add(d_name)
+
+        prev_yview_top = 0.0
+        top_anchor = None
+        if preserve_scroll and had_days:
+            try:
+                prev_yview_top = float(self.tl_tree.yview()[0])
+                if prev_yview_top > 0.001:
+                    top_iid = self.tl_tree.identify_row(4)
+                    if top_iid:
+                        if top_iid in self._tree_item_map:
+                            top_anchor = ("item", self._tree_item_map[top_iid]["item_key"])
+                        else:
+                            t_txt = self.tl_tree.item(top_iid, "text")
+                            if t_txt.startswith("📁 "):
+                                top_anchor = ("day", t_txt[2:].strip())
+            except Exception:
+                pass
+
+        self._tl_tree_syncing = True
+        try:
+            if prev_day_nodes:
+                self.tl_tree.delete(*prev_day_nodes)
+            self._tree_item_map.clear()
+            self._timeline_items = raw_items
+            self._rendered_tl_sig = new_tl_sig
+
+            reselect_iid = None
+            reselect_day_iid = None
+            first_iid = None
+
+            for day_str in ordered_days:
+                is_open = (day_str in open_days) if (had_days and day_str in known_days) else True
+                day_node = self.tl_tree.insert("", "end", text=f"📁 {day_str}", open=is_open)
+                for item in grouped[day_str]:
+                    iid = self.tl_tree.insert(day_node, "end", text=item["_row_text"])
+                    self._tree_item_map[iid] = item
+                    if first_iid is None:
+                        first_iid = iid
+                    if prev_selected_key and item["item_key"] == prev_selected_key:
+                        reselect_iid = iid
+                        reselect_day_iid = day_node
+
+            target_iid = reselect_iid or first_iid
+            if target_iid is not None:
+                if reselect_day_iid is not None:
+                    self.tl_tree.item(reselect_day_iid, open=True)
+                self.tl_tree.selection_set(target_iid)
+                self.tl_tree.focus(target_iid)
+                target_item = self._tree_item_map[target_iid]
+                same_item_kept = bool(prev_selected_key and reselect_iid is not None)
+                if reload_media or not same_item_kept:
+                    self._show_timeline_item(target_item)
                 else:
-                    vid = item["video"]
-                    hits_n = len(vid.get("hits") or [])
-                    off_s = self._format_sec(vid.get("seek_sec", 0.0))
-                    hits_bit = tr("ui.people.tl.hits_bit", " ({n} appearances)", n=hits_n) if hits_n > 1 else ""
-                    txt = tr(
-                        "ui.people.tl.video_row",
-                        "  🎬 {time}  Video +{offset}{hits_bit} [{cam}]",
-                        time=item["time"],
-                        offset=off_s,
-                        hits_bit=hits_bit,
-                        cam=item["camera_name"],
-                    )
+                    self._current_item = target_item
+                    self.lbl_item_header.configure(text=self._format_item_header(target_item))
+                    if target_item.get("kind") == "video":
+                        vid = target_item["video"]
+                        if self._vid_cap is None and not vid.get("busy"):
+                            self._show_timeline_item(target_item)
+                        else:
+                            self._refresh_video_hits_bar_if_needed(vid)
+                            self._update_item_action_buttons()
+                    else:
+                        self._update_item_action_buttons()
 
-                iid = self.tl_tree.insert(day_node, "end", text=txt)
-                self._tree_item_map[iid] = item
-                if first_iid is None:
-                    first_iid = iid
-                if prev_selected_key and item["item_key"] == prev_selected_key:
-                    reselect_iid = iid
+                if preserve_scroll and had_days:
+                    if prev_yview_top > 0.001:
+                        visible_rows = 0
+                        anchor_idx = None
+                        for d_node in self.tl_tree.get_children():
+                            d_row = visible_rows
+                            visible_rows += 1
+                            dt = self.tl_tree.item(d_node, "text")
+                            dn = dt[2:].strip() if dt.startswith("📁 ") else ""
+                            if top_anchor == ("day", dn):
+                                anchor_idx = d_row
+                            if self.tl_tree.item(d_node, "open"):
+                                for ch_id in self.tl_tree.get_children(d_node):
+                                    c_row = visible_rows
+                                    visible_rows += 1
+                                    ch_it = self._tree_item_map.get(ch_id)
+                                    if ch_it and top_anchor == ("item", ch_it["item_key"]):
+                                        anchor_idx = c_row
+                        self.tl_tree.update_idletasks()
+                        if anchor_idx is not None and visible_rows > 0:
+                            self.tl_tree.yview_moveto(max(0.0, min(1.0, anchor_idx / float(visible_rows))))
+                        else:
+                            self.tl_tree.yview_moveto(prev_yview_top)
+                elif not preserve_scroll:
+                    self.tl_tree.see(target_iid)
+            else:
+                self._clear_media_stage_by_key("ui.people.timeline.empty", "No events to display")
 
-        target_iid = reselect_iid or first_iid
-        if target_iid is not None:
-            self.tl_tree.selection_set(target_iid)
-            self.tl_tree.focus(target_iid)
-            if reload_media or reselect_iid is None:
-                self._show_timeline_item(self._tree_item_map[target_iid])
-        else:
-            self._clear_media_stage_by_key("ui.people.timeline.empty", "No events to display")
+            self.tl_tree.update_idletasks()
+        finally:
+            self._tl_tree_syncing = False
 
     def _on_timeline_select(self, event=None):
+        if self._tl_tree_syncing:
+            return
         sel = self.tl_tree.selection()
         if not sel:
             return
         item = self._tree_item_map.get(sel[0])
-        if item is not None:
-            self._show_timeline_item(item)
+        if item is None:
+            return
+        if event is not None and self._current_item is not None and item.get("item_key") == self._current_item.get("item_key"):
+            return
+        self._show_timeline_item(item)
 
     # ------------------------------------------------------------------
     # Відображення кропу, повного скріна або відеоплеєра
@@ -1700,6 +2248,8 @@ class PeopleWindow:
     def _clear_media_stage_by_key(self, key: str, default_text: str):
         self._stop_video_player()
         self._current_item = None
+        self._last_active_img_sig = None
+        self._rendered_hits_sig = None
         self._media_empty_key = (key, default_text)
         self.lbl_item_header.configure(text=tr(key, default_text))
         self.video_panel.pack_forget()
@@ -1714,6 +2264,8 @@ class PeopleWindow:
             return
         self._stop_video_player()
         self._current_item = None
+        self._last_active_img_sig = None
+        self._rendered_hits_sig = None
         self._media_empty_key = None
         self.lbl_item_header.configure(text=msg)
         self.video_panel.pack_forget()
@@ -1729,12 +2281,14 @@ class PeopleWindow:
 
         if kind == "video":
             vid = item["video"]
+            self._last_active_img_sig = None
             self.img_panel.pack_forget()
             self.video_panel.pack(fill=tk.BOTH, expand=True)
             self.lbl_item_header.configure(text=self._format_item_header(item))
             self._load_video_item(vid)
         else:
             self._stop_video_player()
+            self._last_active_img_sig = None
             self.video_panel.pack_forget()
             self.img_panel.pack(fill=tk.BOTH, expand=True)
             self.lbl_item_header.configure(text=self._format_item_header(item))
@@ -1754,9 +2308,23 @@ class PeopleWindow:
             return
         ev = item["event"]
         kind = item["kind"]
+        cp = ev.get("crop_path") or ""
+        fp = ev.get("full_path") or ""
+        avail_w = max(220, self.screen_frame_box.winfo_width() - 24)
+        avail_h = max(180, self.screen_frame_box.winfo_height() - 42)
+        img_sig = (
+            item.get("item_key"),
+            kind,
+            self._file_sig(cp) if kind == "crop" else None,
+            self._file_sig(fp),
+            avail_w,
+            avail_h,
+        )
+        if img_sig == self._last_active_img_sig:
+            return
+        self._last_active_img_sig = img_sig
 
         if kind == "crop":
-            cp = ev.get("crop_path") or ""
             self._crop_preview_tk = None
             if cp and os.path.exists(cp):
                 try:
@@ -1772,12 +2340,9 @@ class PeopleWindow:
                 self._crop_ph_key = ("ui.people.ph.crop_missing", "[Crop file missing]")
                 self.lbl_crop_preview.configure(image="", text=tr(*self._crop_ph_key))
 
-        fp = ev.get("full_path") or ""
         self._screen_preview_tk = None
         if fp and os.path.exists(fp):
             try:
-                avail_w = max(220, self.screen_frame_box.winfo_width() - 24)
-                avail_h = max(180, self.screen_frame_box.winfo_height() - 42)
                 with Image.open(fp) as pim:
                     pim.load()
                     ow, oh = pim.size
@@ -1848,6 +2413,7 @@ class PeopleWindow:
 
     def _stop_video_player(self):
         self._vid_playing = False
+        self._rendered_hits_sig = None
         if self._vid_after_id is not None:
             try:
                 self.win.after_cancel(self._vid_after_id)
@@ -1928,25 +2494,49 @@ class PeopleWindow:
         finally:
             self._vid_updating_slider = False
 
-    def _load_video_item(self, vid: dict, override_seek_sec: float = None):
-        self._stop_video_player()
-        self._vid_ph_spec = None
+    def _refresh_video_hits_bar_if_needed(self, vid: dict):
+        hits = list((vid or {}).get("hits") or [])
+        hits_sig = tuple(
+            (float(h.get("event_ts") or 0.0), float(h.get("seek_sec") or 0.0), str(h.get("time_str") or ""))
+            for h in hits
+        )
+        if (
+            self._rendered_hits_sig == hits_sig
+            and self._vid_hits_lbl is not None
+            and self._vid_hits_lbl.winfo_exists()
+        ):
+            return
+        self._rendered_hits_sig = hits_sig
         for ch in list(self.vid_hits_bar.winfo_children()):
             ch.destroy()
 
         self._vid_hits_lbl = tk.Label(
-            self.vid_hits_bar, text=tr("ui.people.vid_hits_label", "Appearances in video:"), fg="#9ba3b8", bg="#181a24", font=("Segoe UI", 8)
+            self.vid_hits_bar,
+            text=tr("ui.people.vid_hits_label", "Appearances in video:"),
+            fg="#9ba3b8",
+            bg="#181a24",
+            font=("Segoe UI", 8),
         )
         self._vid_hits_lbl.pack(side=tk.LEFT, padx=(0, 6))
-        for hit in (vid.get("hits") or []):
+        for hit in hits:
             s_sec = float(hit["seek_sec"])
             tk.Button(
                 self.vid_hits_bar,
                 text=f"▶ {hit['time_str']} (+{self._format_sec(s_sec)})",
                 command=lambda sec=s_sec: self._seek_video_sec(sec),
-                bg="#283548", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"),
-                padx=8, pady=2, cursor="hand2"
+                bg="#283548",
+                fg="#00e5ff",
+                relief=tk.FLAT,
+                font=("Segoe UI", 8, "bold"),
+                padx=8,
+                pady=2,
+                cursor="hand2",
             ).pack(side=tk.LEFT, padx=2)
+
+    def _load_video_item(self, vid: dict, override_seek_sec: float = None):
+        self._stop_video_player()
+        self._vid_ph_spec = None
+        self._refresh_video_hits_bar_if_needed(vid)
 
         fpath = str(vid.get("path") or "")
         if not fpath or not os.path.exists(fpath):
@@ -2002,6 +2592,14 @@ class PeopleWindow:
             self._vid_curr_frame = target
             self._render_video_frame(frame)
             self._update_vid_time_ui()
+
+    def _on_vid_slider_press(self, event=None):
+        self._vid_slider_dragging = True
+
+    def _on_vid_slider_release(self, event=None):
+        self._vid_slider_dragging = False
+        if self._pending_live_refresh and not self._is_live_refresh_blocked():
+            self._schedule_pending_live_refresh(delay_ms=100)
 
     def _on_vid_slider_move(self, val_str):
         if self._vid_updating_slider or self._vid_cap is None:
@@ -2095,14 +2693,20 @@ class PeopleWindow:
         db = self._get_face_db()
         if not rec or db is None:
             return
-        new_n = _ask_text_modal(
-            self.win,
-            tr("ui.people.rename.title", "Rename person"),
-            tr("ui.people.rename.prompt", "Enter a new name for this person\nUUID: {uuid}", uuid=rec["id"]),
-            rec["name"],
-        )
-        if new_n and db.rename_record(rec["id"], new_n, cameras_info=self._get_cameras_info()):
-            self.refresh_all(select_uid=rec["id"])
+        did_refresh = False
+        self._enter_modal()
+        try:
+            new_n = _ask_text_modal(
+                self.win,
+                tr("ui.people.rename.title", "Rename person"),
+                tr("ui.people.rename.prompt", "Enter a new name for this person\nUUID: {uuid}", uuid=rec["id"]),
+                rec["name"],
+            )
+            if new_n and db.rename_record(rec["id"], new_n, cameras_info=self._get_cameras_info()):
+                did_refresh = True
+                self.refresh_all(select_uid=rec["id"])
+        finally:
+            self._exit_modal(schedule_flush=not did_refresh)
 
     def _toggle_ignore_selected(self):
         if self._guard_operator_write(tr("ui.people.op_act.ignore", "Toggle ignore")):
@@ -2122,25 +2726,33 @@ class PeopleWindow:
         if not rec or db is None:
             return
         evs = self._events_by_person.get(rec["id"]) or []
-        ans = messagebox.askyesnocancel(
-            tr("ui.people.delete_person.title", "Delete person"),
-            tr(
-                "ui.people.delete_person.confirm",
-                "Delete '{name}' (UUID: {uuid})?\n\n• Yes — delete the profile AND all of its crops from disk ({n}).\n• No — delete only the gallery record from faces.txt (crops remain in 'Unassigned').\n• Cancel — do not delete.",
-                name=rec["name"],
-                uuid=rec["id"],
-                n=len(evs),
-            ),
-            parent=self.win,
-        )
-        if ans is None:
-            return
-        if ans:
-            db.delete_person_completely(rec["id"], evs, delete_files=True)
-        else:
-            db.delete_record(rec["id"])
-        self._selected_uid = None
-        self.refresh_all()
+        did_refresh = False
+        self._enter_modal()
+        try:
+            ans = messagebox.askyesnocancel(
+                tr("ui.people.delete_person.title", "Delete person"),
+                tr(
+                    "ui.people.delete_person.confirm",
+                    "Delete '{name}' (UUID: {uuid})?\n\n• Yes — delete the profile AND all of its crops from disk ({n}).\n• No — delete only the gallery record from faces.txt (crops remain in 'Unassigned').\n• Cancel — do not delete.",
+                    name=rec["name"],
+                    uuid=rec["id"],
+                    n=len(evs),
+                ),
+                parent=self.win,
+            )
+            if ans is None:
+                return
+            if ans:
+                db.delete_person_completely(rec["id"], evs, delete_files=True)
+            else:
+                db.delete_record(rec["id"])
+            self._selected_uid = None
+            self._displayed_uid = None
+            self._current_item = None
+            did_refresh = True
+            self.refresh_all(preserve_active_item=False)
+        finally:
+            self._exit_modal(schedule_flush=not did_refresh)
 
     def _on_wrong_person_clicked(self):
         if self._guard_operator_write(tr("ui.people.op_act.reanalyze_crop", "Reanalyze face crop")):
@@ -2151,54 +2763,61 @@ class PeopleWindow:
             return
         ev = item["event"]
         crop_path = str(ev.get("crop_path") or "")
-        if not crop_path or not os.path.exists(crop_path):
-            messagebox.showwarning(
-                tr("ui.people.crop_missing.title", "Crop missing"),
-                tr("ui.people.crop_missing.msg", "Face crop file was not found on disk."),
-                parent=self.win,
-            )
-            return
-
-        old_uid = str(ev.get("person_uuid") or "")
-        person_crops_map = {
-            uid: [e["crop_path"] for e in evs if e.get("crop_path")]
-            for uid, evs in self._events_by_person.items()
-        }
-        norm_cp = os.path.normpath(crop_path)
-        remaining_old = [
-            p for p in (person_crops_map.get(old_uid) or [])
-            if os.path.normpath(p) != norm_cp
-        ]
-
-        dlg = ReanalyzeCropDialog(
-            self.win,
-            db_accessor=db,
-            event_info=ev,
-            remaining_old_crops=remaining_old,
-            person_crops_map=person_crops_map,
-            default_min_sim=self._get_default_min_similarity(),
-        )
-        if dlg.result and dlg.result.get("ok"):
-            r = dlg.result
-            if r.get("deleted"):
-                self.refresh_all(select_uid=old_uid or self._selected_uid)
-                return
-            target_uid = r.get("new_uid")
-            msg = (
-                tr("ui.people.reanalyze.created_msg", "Created new person: {name}\nUUID: {uuid}", name=r["new_name"], uuid=target_uid)
-                if r.get("created_new")
-                else tr(
-                    "ui.people.reanalyze.moved_msg",
-                    "Crop moved to: {name} (similarity {pct:.1f}%)\nUUID: {uuid}",
-                    name=r["new_name"],
-                    pct=r["similarity"] * 100,
-                    uuid=target_uid,
+        did_refresh = False
+        self._enter_modal()
+        try:
+            if not crop_path or not os.path.exists(crop_path):
+                messagebox.showwarning(
+                    tr("ui.people.crop_missing.title", "Crop missing"),
+                    tr("ui.people.crop_missing.msg", "Face crop file was not found on disk."),
+                    parent=self.win,
                 )
+                return
+
+            old_uid = str(ev.get("person_uuid") or "")
+            person_crops_map = {
+                uid: [e["crop_path"] for e in evs if e.get("crop_path")]
+                for uid, evs in self._events_by_person.items()
+            }
+            norm_cp = os.path.normpath(crop_path)
+            remaining_old = [
+                p for p in (person_crops_map.get(old_uid) or [])
+                if os.path.normpath(p) != norm_cp
+            ]
+
+            dlg = ReanalyzeCropDialog(
+                self.win,
+                db_accessor=db,
+                event_info=ev,
+                remaining_old_crops=remaining_old,
+                person_crops_map=person_crops_map,
+                default_min_sim=self._get_default_min_similarity(),
             )
-            messagebox.showinfo(tr("ui.people.reanalyze.done_title", "Reanalysis complete"), msg, parent=self.win)
-            # Якщо у попередньої людини залишилися події — можемо лишитися на ній або перейти на нового власника
-            keep_uid = old_uid if (old_uid and r.get("old_remaining", 0) > 0) else target_uid
-            self.refresh_all(select_uid=keep_uid)
+            if dlg.result and dlg.result.get("ok"):
+                r = dlg.result
+                if r.get("deleted"):
+                    did_refresh = True
+                    self.refresh_all(select_uid=old_uid or self._selected_uid, preserve_active_item=False)
+                    return
+                target_uid = r.get("new_uid")
+                msg = (
+                    tr("ui.people.reanalyze.created_msg", "Created new person: {name}\nUUID: {uuid}", name=r["new_name"], uuid=target_uid)
+                    if r.get("created_new")
+                    else tr(
+                        "ui.people.reanalyze.moved_msg",
+                        "Crop moved to: {name} (similarity {pct:.1f}%)\nUUID: {uuid}",
+                        name=r["new_name"],
+                        pct=r["similarity"] * 100,
+                        uuid=target_uid,
+                    )
+                )
+                messagebox.showinfo(tr("ui.people.reanalyze.done_title", "Reanalysis complete"), msg, parent=self.win)
+                # Якщо у попередньої людини залишилися події — можемо лишитися на ній або перейти на нового власника
+                keep_uid = old_uid if (old_uid and r.get("old_remaining", 0) > 0) else target_uid
+                did_refresh = True
+                self.refresh_all(select_uid=keep_uid, preserve_active_item=False)
+        finally:
+            self._exit_modal(schedule_flush=not did_refresh)
 
     def _on_delete_crop_clicked(self):
         if self._guard_operator_write(tr("ui.people.op_act.delete_crop", "Delete face crop")):
@@ -2208,35 +2827,41 @@ class PeopleWindow:
         if not item or item.get("kind") not in ("crop", "screen") or db is None:
             return
         ev = item["event"]
-        if not messagebox.askyesno(
-            tr("ui.people.del_crop.title", "Delete crop"),
-            tr(
-                "ui.people.del_crop.confirm",
-                "Delete this crop ({day} {time}, {cam})?\nPerson embeddings will be recalculated from remaining crops.",
-                day=ev["day"],
-                time=ev["time"],
-                cam=ev["camera_name"],
-            ),
-            parent=self.win,
-        ):
-            return
-
-        old_uid = str(ev.get("person_uuid") or "")
-        norm_cp = os.path.normpath(ev.get("crop_path") or "")
-        remaining_old = [
-            e["crop_path"]
-            for e in (self._events_by_person.get(old_uid) or [])
-            if e.get("crop_path") and os.path.normpath(e["crop_path"]) != norm_cp
-        ]
-        res = db.delete_crop_event(ev, remaining_old)
-        if not res or not res.get("ok"):
-            messagebox.showerror(
-                tr("ui.people.del_crop.err_title", "Delete error"),
-                (res or {}).get("error") or tr("ui.people.del_crop.err_msg", "Failed to delete crop."),
+        did_refresh = False
+        self._enter_modal()
+        try:
+            if not messagebox.askyesno(
+                tr("ui.people.del_crop.title", "Delete crop"),
+                tr(
+                    "ui.people.del_crop.confirm",
+                    "Delete this crop ({day} {time}, {cam})?\nPerson embeddings will be recalculated from remaining crops.",
+                    day=ev["day"],
+                    time=ev["time"],
+                    cam=ev["camera_name"],
+                ),
                 parent=self.win,
-            )
-            return
-        self.refresh_all(select_uid=self._selected_uid)
+            ):
+                return
+
+            old_uid = str(ev.get("person_uuid") or "")
+            norm_cp = os.path.normpath(ev.get("crop_path") or "")
+            remaining_old = [
+                e["crop_path"]
+                for e in (self._events_by_person.get(old_uid) or [])
+                if e.get("crop_path") and os.path.normpath(e["crop_path"]) != norm_cp
+            ]
+            res = db.delete_crop_event(ev, remaining_old)
+            if not res or not res.get("ok"):
+                messagebox.showerror(
+                    tr("ui.people.del_crop.err_title", "Delete error"),
+                    (res or {}).get("error") or tr("ui.people.del_crop.err_msg", "Failed to delete crop."),
+                    parent=self.win,
+                )
+                return
+            did_refresh = True
+            self.refresh_all(select_uid=self._selected_uid, preserve_active_item=False)
+        finally:
+            self._exit_modal(schedule_flush=not did_refresh)
 
     def _on_reanalyze_all_profiles(self):
         if self._guard_operator_write(tr("ui.people.op_act.reanalyze_all", "Bulk face DB reanalysis")):
@@ -2260,24 +2885,30 @@ class PeopleWindow:
             return
         self.btn_reanalyze_all.configure(state=tk.NORMAL, text=tr("ui.people.btn_reanalyze_all", "♻ Reanalyze DB from crops"))
         self._sync_operator_mode_ui()
-        if not res or not res.get("ok"):
-            messagebox.showwarning(
-                tr("ui.people.reanalyze_all.title", "Database reanalysis"),
-                (res or {}).get("error") or tr("ui.people.reanalyze_all.err", "Failed to complete reanalysis."),
+        did_refresh = False
+        self._enter_modal()
+        try:
+            if not res or not res.get("ok"):
+                messagebox.showwarning(
+                    tr("ui.people.reanalyze_all.title", "Database reanalysis"),
+                    (res or {}).get("error") or tr("ui.people.reanalyze_all.err", "Failed to complete reanalysis."),
+                    parent=self.win,
+                )
+                return
+            messagebox.showinfo(
+                tr("ui.people.reanalyze_all.done_title", "Database reanalysis complete"),
+                tr(
+                    "ui.people.reanalyze_all.done_msg",
+                    "Profiles updated from actual crops on disk: {updated}\nSkipped (no crops on disk): {skipped}",
+                    updated=res.get("updated_profiles", 0),
+                    skipped=res.get("skipped_empty", 0),
+                ),
                 parent=self.win,
             )
-            return
-        messagebox.showinfo(
-            tr("ui.people.reanalyze_all.done_title", "Database reanalysis complete"),
-            tr(
-                "ui.people.reanalyze_all.done_msg",
-                "Profiles updated from actual crops on disk: {updated}\nSkipped (no crops on disk): {skipped}",
-                updated=res.get("updated_profiles", 0),
-                skipped=res.get("skipped_empty", 0),
-            ),
-            parent=self.win,
-        )
-        self.refresh_all(select_uid=self._selected_uid)
+            did_refresh = True
+            self.refresh_all(select_uid=self._selected_uid)
+        finally:
+            self._exit_modal(schedule_flush=not did_refresh)
 
     def _on_jump_to_matching_video(self):
         item = self._current_item
@@ -2285,27 +2916,38 @@ class PeopleWindow:
             return
         match = self._find_matching_video_for_event(item["event"])
         if not match:
-            messagebox.showinfo(
-                tr("ui.people.no_video.title", "Video not found"),
-                tr("ui.people.no_video.msg", "No saved video segment matches this timestamp."),
-                parent=self.win,
-            )
+            self._enter_modal()
+            try:
+                messagebox.showinfo(
+                    tr("ui.people.no_video.title", "Video not found"),
+                    tr("ui.people.no_video.msg", "No saved video segment matches this timestamp."),
+                    parent=self.win,
+                )
+            finally:
+                self._exit_modal(schedule_flush=True)
             return
         vid, seek_sec = match
         target_key = f"video::{vid['path']}"
         if self.kind_filter_var.get() not in ("all", "video"):
             self.kind_filter_var.set("all")
             self._update_filter_buttons_style()
-            self._rebuild_timeline()
+            self._rebuild_timeline(reload_media=False, preserve_scroll=True)
 
-        for iid, t_item in self._tree_item_map.items():
-            if t_item.get("item_key") == target_key:
-                self.tl_tree.selection_set(iid)
-                self.tl_tree.focus(iid)
-                self.tl_tree.see(iid)
-                self._show_timeline_item(t_item)
-                self._seek_video_sec(seek_sec)
-                return
+        self._tl_tree_syncing = True
+        try:
+            for iid, t_item in self._tree_item_map.items():
+                if t_item.get("item_key") == target_key:
+                    parent_iid = self.tl_tree.parent(iid)
+                    if parent_iid:
+                        self.tl_tree.item(parent_iid, open=True)
+                    self.tl_tree.selection_set(iid)
+                    self.tl_tree.focus(iid)
+                    self.tl_tree.see(iid)
+                    self._show_timeline_item(t_item)
+                    self._seek_video_sec(seek_sec)
+                    return
+        finally:
+            self._tl_tree_syncing = False
 
     def _get_current_file_path(self) -> str:
         item = self._current_item
@@ -2353,17 +2995,29 @@ class PeopleWindow:
     def notify_saved(self, mod_name: str):
         if self._is_closing or str(mod_name) != "faces":
             return
-        if self._notify_after_id is not None:
+        if self._is_live_refresh_blocked():
+            self._pending_live_refresh = True
+            return
+        if self._notify_after_id is None:
             try:
-                self.win.after_cancel(self._notify_after_id)
+                if self.win.winfo_exists():
+                    self._notify_after_id = self.win.after(900, self._on_notify_timer)
             except Exception:
                 pass
-        self._notify_after_id = self.win.after(700, lambda: self.refresh_all(select_uid=self._selected_uid))
+
+    def _on_notify_timer(self):
+        self._notify_after_id = None
+        if self._is_closing or not self.win.winfo_exists():
+            return
+        if self._is_live_refresh_blocked() or self._load_in_flight:
+            self._pending_live_refresh = True
+            return
+        self.refresh_all(select_uid=self._selected_uid, live_update=True, preserve_active_item=True)
 
     def on_modules_reloaded(self):
         if not self._is_closing:
             self._sync_operator_mode_ui()
-            self.refresh_all(select_uid=self._selected_uid)
+            self.refresh_all(select_uid=self._selected_uid, live_update=True, preserve_active_item=True)
 
     def focus(self):
         try:
@@ -2379,7 +3033,7 @@ class PeopleWindow:
         if self._is_closing:
             return
         self._is_closing = True
-        for attr in ("_init_refresh_after_id", "_notify_after_id", "_ui_poll_after_id"):
+        for attr in ("_init_refresh_after_id", "_notify_after_id", "_pending_flush_after_id", "_ui_poll_after_id"):
             aid = getattr(self, attr, None)
             if aid is not None:
                 try:
@@ -2388,6 +3042,10 @@ class PeopleWindow:
                     pass
                 setattr(self, attr, None)
         self._stop_video_player()
+        self._thumb_cache.clear()
+        self._left_thumbs.clear()
+        self._person_cards.clear()
+        self._person_card_frames.clear()
         try:
             self.geom_tracker.close()
         except Exception:

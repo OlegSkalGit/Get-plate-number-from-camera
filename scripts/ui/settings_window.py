@@ -45,6 +45,9 @@ from scripts.ui.helpers import (
     bind_single_line_ellipsis,
     set_single_line_ellipsis_text,
     bind_hover_tooltip,
+    ensure_clam_theme,
+    configure_dark_combobox_style,
+    style_dark_combobox_popdown,
 )
 
 try:
@@ -178,7 +181,6 @@ class SettingsWindow:
         self._autosetup_dlg_state = None
         self._last_caps = None
         self._last_cuda_status = None
-        self._face_thumbs_cache = []
         self._tree_syncing = False
         self._lang_var = None
         self._lang_combo = None
@@ -239,11 +241,7 @@ class SettingsWindow:
             pass
 
     def _build_ui(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+        style = ensure_clam_theme(self.win)
         style.configure(
             "SettingsNav.Treeview",
             background="#1a1c26",
@@ -258,12 +256,16 @@ class SettingsWindow:
             background=[("selected", "#007acc")],
             foreground=[("selected", "#ffffff")],
         )
-        style.configure(
-            "SettingsDark.TCombobox",
-            fieldbackground="#232635",
-            background="#2c3044",
-            foreground="#ffffff",
-            arrowcolor="#00e5ff",
+        configure_dark_combobox_style(
+            self.win,
+            style_name="SettingsDark.TCombobox",
+            field_bg="#232635",
+            hover_field_bg="#2a2e42",
+            btn_bg="#2c3044",
+            btn_hover_bg="#363b52",
+            fg="#ffffff",
+            arrow_color="#00e5ff",
+            border_color="#2e3347",
         )
         style.configure("SettingsDark.Horizontal.TProgressbar", troughcolor="#252836", background="#00e5ff")
 
@@ -416,9 +418,6 @@ class SettingsWindow:
                 pass
         self.apply_language()
 
-    def _has_face_db_capability(self) -> bool:
-        return bool(self.registry is not None and self.registry.list_by_capability("face_db"))
-
     def _rebuild_nav_tree(self, select_id=None, preserve_scroll: bool = False):
         self._tree_syncing = True
         try:
@@ -427,8 +426,6 @@ class SettingsWindow:
             self.nav_tree.insert("", "end", iid="grid", text=tr("ui.settings.nav.grid", "  ▦ Camera Grid"))
             self.nav_tree.insert("", "end", iid="hardware", text=tr("ui.settings.nav.hardware", "  ⚡ Hardware & Graphics"))
             self.nav_tree.insert("", "end", iid="modules", text=tr("ui.settings.nav.modules", "  🧩 Modules & Libraries"))
-            if self._has_face_db_capability():
-                self.nav_tree.insert("", "end", iid="faces_db", text=tr("ui.settings.nav.faces_db", "  👥 Faces DB (faces.txt)"))
             cams_node = self.nav_tree.insert("", "end", iid="cameras_root", text=tr("ui.settings.nav.cameras", "  📹 Cameras"), open=True)
 
             disabled_suf = tr("ui.settings.nav.cam_disabled_suf", " (disabled)")
@@ -513,8 +510,6 @@ class SettingsWindow:
                 self._build_page_hardware(pad)
             elif node_id == "modules":
                 self._build_page_modules(pad)
-            elif node_id == "faces_db":
-                self._build_page_faces_db(pad)
             elif node_id == "cameras_root":
                 self._build_page_cameras_root(pad)
             elif node_id.startswith("cam:"):
@@ -547,8 +542,6 @@ class SettingsWindow:
                         sec.setdefault(k, copy.deepcopy(v))
 
             target = self._current_node_id
-            if target == "faces_db" and not self._has_face_db_capability():
-                target = "modules"
             self._rebuild_nav_tree(select_id=target, preserve_scroll=(target == self._current_node_id))
         except Exception as e:
             print(f"[SettingsWindow on_modules_reloaded]: {e}")
@@ -871,6 +864,7 @@ class SettingsWindow:
                 style="SettingsDark.TCombobox",
             )
             cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            style_dark_combobox_popdown(cb)
 
             def _on_lang_selected(e=None):
                 _commit()
@@ -1104,8 +1098,16 @@ class SettingsWindow:
             _commit()
 
         def _w_mode(box, bg):
-            cb = ttk.Combobox(box, textvariable=mode_var, values=[lbl for _, lbl in mode_choices], state="readonly", width=18)
+            cb = ttk.Combobox(
+                box,
+                textvariable=mode_var,
+                values=[lbl for _, lbl in mode_choices],
+                state="readonly",
+                width=18,
+                style="SettingsDark.TCombobox",
+            )
             cb.pack(side=tk.LEFT)
+            style_dark_combobox_popdown(cb)
             cb.bind("<<ComboboxSelected>>", _sync_manual_state)
             tk.Label(
                 box,
@@ -1157,11 +1159,11 @@ class SettingsWindow:
                 return e
             return _fn
 
-        self._add_row(card, tr("ui.settings.grid.border_color_label", "Tile border color:"), "grid.border_color", _w_color(bcol_var))
+        self._add_row(card, tr("ui.settings.grid.border_color_label", "Grid line color:"), "grid.border_color", _w_color(bcol_var))
         self._add_row(card, tr("ui.settings.grid.active_border_label", "Active window color:"), "grid.active_border_color", _w_color(acol_var))
         self._add_row(card, tr("ui.settings.grid.offline_border_label", "Connection lost color:"), "grid.offline_border_color", _w_color(ocol_var))
-        self._add_row(card, tr("ui.settings.grid.border_width_label", "Border width (px):"), "grid.border_width", _w_spin(bw_var, 1, 10, []))
-        self._add_row(card, tr("ui.settings.grid.tile_gap_label", "Gap between tiles (px):"), "grid.tile_gap", _w_spin(gap_var, 0, 20, []))
+        self._add_row(card, tr("ui.settings.grid.border_width_label", "Grid line thickness (px):"), "grid.border_width", _w_spin(bw_var, 1, 10, []))
+        self._add_row(card, tr("ui.settings.grid.tile_gap_label", "Outer grid margin (px):"), "grid.tile_gap", _w_spin(gap_var, 0, 20, []))
 
         def _w_chk(var, text):
             def _fn(box, bg):
@@ -1389,8 +1391,16 @@ class SettingsWindow:
         self._page_committers.append(_commit)
 
         def _w_ai_combo(box, bg):
-            cb = ttk.Combobox(box, textvariable=ai_var, values=[lbl for _, lbl in ai_choices], state="readonly", width=52)
+            cb = ttk.Combobox(
+                box,
+                textvariable=ai_var,
+                values=[lbl for _, lbl in ai_choices],
+                state="readonly",
+                width=52,
+                style="SettingsDark.TCombobox",
+            )
             cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            style_dark_combobox_popdown(cb)
 
             def _on_ai_select(e=None):
                 _commit()
@@ -1403,8 +1413,16 @@ class SettingsWindow:
 
         def _w_combo(var, choices):
             def _fn(box, bg):
-                cb = ttk.Combobox(box, textvariable=var, values=[lbl for _, lbl in choices], state="readonly", width=52)
+                cb = ttk.Combobox(
+                    box,
+                    textvariable=var,
+                    values=[lbl for _, lbl in choices],
+                    state="readonly",
+                    width=52,
+                    style="SettingsDark.TCombobox",
+                )
                 cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                style_dark_combobox_popdown(cb)
                 cb.bind("<<ComboboxSelected>>", lambda e: _commit())
                 return cb
             return _fn
@@ -4864,229 +4882,7 @@ class SettingsWindow:
                 tk.Label(libs_card, text=tr("ui.settings.mods.no_libs", "No library data available."), fg="#888c9e", bg=l_bg).pack()
 
     # ------------------------------------------------------------------
-    # Сторінка 5: Спільна база облич (динамічно через capability 'face_db')
-    # ------------------------------------------------------------------
-    def _get_face_db_accessor(self):
-        try:
-            return self.camera_manager.get_capability_accessor("face_db")
-        except Exception:
-            return None
-
-    def _build_page_faces_db(self, parent):
-        is_op_mode = self.cfg_mgr.is_operator_mode() or self._is_draft_operator_mode()
-        self._section_header(
-            parent,
-            tr("ui.settings.faces.title", "👥 Shared Known Faces Database (faces.txt)"),
-            tr(
-                "ui.settings.faces.subtitle",
-                "Database file: {path} (shared across all system cameras).",
-                path=self.cfg_mgr.get_faces_db_path(create=False),
-            ),
-        )
-        if is_op_mode:
-            op_note = (
-                tr(
-                    "ui.settings.faces.op_view_only",
-                    "👤 Operator Mode: faces database is read-only. Renaming, ignoring, and deleting on disk are locked.",
-                )
-                if self._is_draft_operator_mode()
-                else tr(
-                    "ui.settings.faces.op_need_apply",
-                    "👤 Operator Mode is currently active: click 'Apply' to switch to Server Mode and unlock database editing on disk.",
-                )
-            )
-            op_lbl = tk.Label(
-                parent,
-                text=op_note,
-                fg="#ffcc00",
-                bg="#2c2416",
-                font=("Segoe UI", 9, "bold"),
-                padx=12,
-                pady=8,
-                anchor=tk.W,
-                justify=tk.LEFT,
-                wraplength=760,
-                highlightthickness=1,
-                highlightbackground="#66521e",
-            )
-            op_lbl.pack(fill=tk.X, pady=(0, 10))
-            self._bind_auto_wrap(op_lbl, initial=760, min_wrap=240, pad=24)
-
-        ctrl_bar = tk.Frame(parent, bg="#1c1e2a", padx=12, pady=8, highlightthickness=1, highlightbackground="#2b2e3d")
-        ctrl_bar.pack(fill=tk.X, pady=(0, 10))
-
-        search_var = tk.StringVar()
-        tk.Label(ctrl_bar, text=tr("ui.settings.faces.search_label", "🔍 Search:"), fg="#d5dae8", bg="#1c1e2a", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Entry(
-            ctrl_bar, textvariable=search_var, width=28,
-            bg="#252836", fg="#ffffff", insertbackground="white", relief=tk.FLAT, font=("Segoe UI", 9)
-        ).pack(side=tk.LEFT, ipady=3, padx=(0, 8))
-
-        count_lbl = tk.Label(ctrl_bar, text="", fg="#00e5ff", bg="#1c1e2a", font=("Segoe UI", 9, "bold"))
-        count_lbl.pack(side=tk.LEFT, padx=8)
-
-        list_container = tk.Frame(parent, bg="#161720")
-        list_container.pack(fill=tk.BOTH, expand=True)
-
-        def _render_list(*_):
-            for ch in list(list_container.winfo_children()):
-                ch.destroy()
-            self._face_thumbs_cache.clear()
-            db = self._get_face_db_accessor()
-            if db is None:
-                count_lbl.configure(text=tr("ui.common.unavailable", "Unavailable"))
-                tk.Label(
-                    list_container,
-                    text=tr(
-                        "ui.settings.faces.db_unavailable",
-                        "Face recognition module with 'face_db' capability is not currently loaded in scripts/modules/.",
-                    ),
-                    fg="#ffcc00", bg="#161720", font=("Segoe UI", 10), pady=24
-                ).pack()
-                return
-
-            records = db.list_records()
-            q = search_var.get().strip().upper()
-            if q:
-                records = [r for r in records if (q in r["id"].upper()) or (q in r["name"].upper())]
-            count_lbl.configure(text=tr("ui.settings.faces.records_count", "Records: {n}", n=len(records)))
-
-            if not records:
-                tk.Label(
-                    list_container,
-                    text=tr(
-                        "ui.settings.faces.empty_msg",
-                        "The faces database is empty (or no matches found for the filter).\nFaces are added automatically while cameras run in Server Mode.",
-                    ),
-                    fg="#888c9e", bg="#161720", font=("Segoe UI", 10), pady=24
-                ).pack()
-                return
-
-            for rec in records:
-                row = tk.Frame(list_container, bg="#1c1e2a", padx=10, pady=8, highlightthickness=1, highlightbackground="#2b2e3d")
-                row.pack(fill=tk.X, pady=3)
-
-                thumb_lbl = tk.Label(row, bg="#12131a", width=7, height=3, text="👤", fg="#70758a", font=("Segoe UI", 12))
-                tpath = rec.get("thumb_path") or ""
-                if Image is not None and ImageTk is not None and tpath and os.path.exists(tpath):
-                    try:
-                        with Image.open(tpath) as pim:
-                            pim.load()
-                            pim = pim.resize((52, 52), Image.Resampling.LANCZOS)
-                            tkimg = ImageTk.PhotoImage(pim)
-                            self._face_thumbs_cache.append(tkimg)
-                            thumb_lbl.configure(image=tkimg, text="", width=52, height=52)
-                    except Exception:
-                        pass
-                thumb_lbl.pack(side=tk.LEFT, padx=(0, 12))
-
-                info_box = tk.Frame(row, bg="#1c1e2a")
-                info_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                ign = bool(rec.get("ignore", False))
-                name_col = "#888c9e" if ign else "#ffffff"
-                ign_badge = tr("ui.settings.faces.badge_ignore", "  [IGNORE]") if ign else ""
-                tk.Label(
-                    info_box,
-                    text=f"{rec['name']}  ({rec['id']}){ign_badge}",
-                    fg=name_col, bg="#1c1e2a", font=("Segoe UI", 10, "bold"), anchor=tk.W
-                ).pack(fill=tk.X)
-                tk.Label(
-                    info_box,
-                    text=tr("ui.settings.faces.gallery_count", "Gallery angles: {n}/4", n=rec.get("gallery_count", 1)),
-                    fg="#8c92a4", bg="#1c1e2a", font=("Segoe UI", 8), anchor=tk.W
-                ).pack(fill=tk.X)
-
-                btns = tk.Frame(row, bg="#1c1e2a")
-                btns.pack(side=tk.RIGHT)
-
-                def _guard_readonly(act_lbl: str) -> bool:
-                    if not (self.cfg_mgr.is_operator_mode() or self._is_draft_operator_mode()):
-                        return False
-                    messagebox.showinfo(
-                        tr("ui.common.operator_mode", "Operator Mode"),
-                        tr(
-                            "ui.settings.faces.op_action_locked",
-                            "Action '{action}' is unavailable while Operator Mode is active (disk writes are disabled).",
-                            action=act_lbl,
-                        ),
-                        parent=self.win,
-                    )
-                    return True
-
-                def _rename(uid=rec["id"], cur_name=rec["name"]):
-                    act_title = tr("ui.settings.faces.act_rename", "Rename person")
-                    if _guard_readonly(act_title):
-                        return
-                    new_n = _ask_text_dialog(
-                        self.win,
-                        act_title,
-                        tr("ui.settings.faces.rename_prompt", "Enter a new name for {uid}:", uid=uid),
-                        cur_name,
-                    )
-                    if new_n:
-                        cams_info = [
-                            {
-                                "uuid": c["uuid"],
-                                "name": c.get("name", ""),
-                                "archive_dir": self.cfg_mgr.get_camera_archive_dir(c["uuid"]),
-                            }
-                            for c in (self.cfg_mgr.get_cameras() or [])
-                            if c.get("uuid")
-                        ]
-                        try:
-                            ok_ren = db.rename_record(uid, new_n, cameras_info=cams_info)
-                        except TypeError:
-                            ok_ren = db.rename_record(uid, new_n)
-                        if ok_ren:
-                            _render_list()
-
-                def _toggle_ign(uid=rec["id"], cur_ign=ign):
-                    if _guard_readonly(tr("ui.settings.faces.act_toggle_ignore", "Change ignore status")):
-                        return
-                    if db.set_ignore(uid, not cur_ign):
-                        _render_list()
-
-                def _delete(uid=rec["id"], cur_name=rec["name"]):
-                    act_title = tr("ui.settings.faces.act_delete", "Delete face")
-                    if _guard_readonly(act_title):
-                        return
-                    if messagebox.askyesno(
-                        act_title,
-                        tr("ui.settings.faces.delete_confirm", "Delete '{name}' ({uid}) from the faces database?", name=cur_name, uid=uid),
-                        parent=self.win,
-                    ):
-                        if db.delete_record(uid):
-                            _render_list()
-
-                btn_state = tk.DISABLED if is_op_mode else tk.NORMAL
-                btn_cursor = "arrow" if is_op_mode else "hand2"
-                tk.Button(
-                    btns, text=tr("ui.settings.faces.btn_rename", "✎ Name"), command=_rename, state=btn_state,
-                    bg="#2f3346", fg="#ffffff", disabledforeground="#6f758a",
-                    relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor=btn_cursor
-                ).pack(side=tk.LEFT, padx=3)
-                tk.Button(
-                    btns,
-                    text=tr("ui.settings.faces.btn_unignore", "✅ Unignore") if ign else tr("ui.settings.faces.btn_ignore", "🚫 Ignore"),
-                    command=_toggle_ign,
-                    state=btn_state,
-                    bg="#3a2f22" if not ign else "#1f442c",
-                    fg="#ffcc00" if not ign else "#75e08b",
-                    disabledforeground="#6f758a",
-                    relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor=btn_cursor
-                ).pack(side=tk.LEFT, padx=3)
-                tk.Button(
-                    btns, text="🗑", command=_delete, state=btn_state,
-                    bg="#44252a", fg="#ff7777", disabledforeground="#6f758a",
-                    relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor=btn_cursor
-                ).pack(side=tk.LEFT, padx=3)
-
-        tk.Button(ctrl_bar, text=tr("ui.settings.faces.btn_refresh", "↻ Refresh"), command=_render_list, bg="#2f3346", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=10, pady=4, cursor="hand2").pack(side=tk.RIGHT)
-        search_var.trace_add("write", _render_list)
-        _render_list()
-
-    # ------------------------------------------------------------------
-    # Сторінка 6: Список усіх камер
+    # Сторінка 5: Список усіх камер
     # ------------------------------------------------------------------
     def _build_template_modules(self) -> dict:
         base_mods = make_default_camera_modules(registry=self.registry)
@@ -5762,8 +5558,10 @@ class SettingsWindow:
                     cb = ttk.Combobox(
                         box, textvariable=v, values=[lbl for _, lbl in ch],
                         state="readonly", width=52,
+                        style="SettingsDark.TCombobox",
                     )
                     cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    style_dark_combobox_popdown(cb)
                     cb.bind("<<ComboboxSelected>>", _sync_dynamic_states)
                     created_widgets.append(cb)
                     return cb
@@ -5961,44 +5759,6 @@ class SettingsWindow:
                 self.on_close_cb()
             except Exception:
                 pass
-
-
-def _ask_text_dialog(parent, title: str, prompt: str, initial: str = "") -> str:
-    res = {"val": None}
-    dlg = tk.Toplevel(parent)
-    dlg.title(title)
-    dlg.configure(bg="#1c1e2a")
-    dlg.transient(parent)
-    dlg.grab_set()
-    dlg.resizable(False, False)
-
-    tk.Label(dlg, text=prompt, fg="#ffffff", bg="#1c1e2a", font=("Segoe UI", 9, "bold"), anchor=tk.W).pack(fill=tk.X, padx=16, pady=(14, 6))
-    var = tk.StringVar(value=str(initial or ""))
-    ent = tk.Entry(dlg, textvariable=var, width=36, bg="#252836", fg="#ffffff", insertbackground="white", relief=tk.FLAT, font=("Segoe UI", 10))
-    ent.pack(fill=tk.X, padx=16, pady=(0, 12), ipady=4)
-    ent.select_range(0, tk.END)
-    ent.focus_set()
-
-    btns = tk.Frame(dlg, bg="#1c1e2a")
-    btns.pack(fill=tk.X, padx=16, pady=(0, 14))
-
-    def _ok(*_):
-        v = var.get().strip()
-        if v:
-            res["val"] = v
-        dlg.destroy()
-
-    ent.bind("<Return>", _ok)
-    dlg.bind("<Escape>", lambda e: dlg.destroy())
-    tk.Button(btns, text=tr("ui.common.cancel", "Cancel"), command=dlg.destroy, bg="#353849", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4).pack(side=tk.RIGHT, padx=(6, 0))
-    tk.Button(btns, text=tr("ui.common.save", "Save"), command=_ok, bg="#28a745", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4).pack(side=tk.RIGHT)
-
-    parent.update_idletasks()
-    px = parent.winfo_rootx() + max(20, (parent.winfo_width() - 360) // 2)
-    py = parent.winfo_rooty() + max(20, (parent.winfo_height() - 140) // 2)
-    dlg.geometry(f"+{px}+{py}")
-    dlg.wait_window()
-    return res["val"]
 
 
 def _open_copy_modules_modal(parent, src_cam: dict, target_cams: list, on_done=None):

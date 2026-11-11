@@ -1,5 +1,6 @@
 import os
 import re
+import ast
 import sys
 import copy
 import json
@@ -12,6 +13,7 @@ import hashlib
 import zipfile
 import tempfile
 import importlib
+import importlib.machinery
 import subprocess
 import threading
 import urllib.request
@@ -129,20 +131,183 @@ def _get_normalized_disk_dists_map() -> dict:
     return out
 
 
+def _find_disk_ort_package_dir() -> str:
+    """Знаходить каталог активного пакета onnxruntime на диску (без звернення до sys.modules)."""
+    if getattr(sys, "frozen", False):
+        return ""
+    try:
+        importlib.invalidate_caches()
+        spec = importlib.machinery.PathFinder.find_spec("onnxruntime")
+        if spec and spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                if loc and os.path.isdir(loc):
+                    return loc
+    except Exception:
+        pass
+    for p in list(sys.path):
+        if not p:
+            continue
+        cand = os.path.join(p, "onnxruntime")
+        if os.path.isdir(os.path.join(cand, "capi")):
+            return cand
+    return ""
+
+
+def _read_disk_ort_package_info() -> tuple:
+    """
+    Читає фактичну назву варіанта та версію з активних файлів onnxruntime/ на диску
+    (capi/build_and_package_info.py або нативні маркери в capi/), не торкаючись sys.modules.
+    Повертає (pkg_name, version, cuda_version).
+    """
+    ort_dir = _find_disk_ort_package_dir()
+    if not ort_dir:
+        return ("", "", "")
+    capi_dir = os.path.join(ort_dir, "capi")
+    pkg_name = ""
+    ver_str = ""
+    cuda_ver = ""
+    bpi_path = os.path.join(capi_dir, "build_and_package_info.py")
+    if os.path.isfile(bpi_path):
+        try:
+            with open(bpi_path, "r", encoding="utf-8", errors="ignore") as fh:
+                tree = ast.parse(fh.read(), filename=bpi_path)
+            for node in getattr(tree, "body", ()):
+                if isinstance(node, ast.Assign):
+                    val_node = node.value
+                    if isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
+                        for tgt in node.targets:
+                            if isinstance(tgt, ast.Name):
+                                if tgt.id == "package_name":
+                                    pkg_name = _norm_pkg_name(val_node.value)
+                                elif tgt.id == "__version__":
+                                    ver_str = val_node.value.strip()
+                                elif tgt.id == "cuda_version":
+                                    cuda_ver = val_node.value.strip()
+        except Exception:
+            pass
+
+    if not ver_str:
+        v_path = os.path.join(ort_dir, "package_info.py")
+        if not os.path.isfile(v_path):
+            v_path = os.path.join(ort_dir, "_version.py")
+        if os.path.isfile(v_path):
+            try:
+                with open(v_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    txt = fh.read()
+                m = re.search(r"""__version__\s*=\s*['"]([^'"]+)['"]""", txt)
+                if m:
+                    ver_str = m.group(1).strip()
+            except Exception:
+                pass
+
+    if not pkg_name and os.path.isdir(capi_dir):
+        try:
+            files = {f.lower() for f in os.listdir(capi_dir)}
+        except Exception:
+            files = set()
+        if "onnxruntime_providers_cuda.dll" in files:
+            pkg_name = "onnxruntime-gpu"
+        elif "directml.dll" in files:
+            pkg_name = "onnxruntime-directml"
+        elif "onnxruntime_providers_openvino.dll" in files or "onnxruntime_providers_openvino_wrapper.dll" in files:
+            pkg_name = "onnxruntime-openvino"
+        elif any(f.startswith("onnxruntime_pybind11_state") for f in files):
+            pkg_name = "onnxruntime"
+
+    return (pkg_name, ver_str, cuda_ver)
+
+
+def get_installed_ort_conflicts() -> dict:
+    """Повертає фактичний активний пакет onnxruntime на диску та всі знайдені ORT .dist-info."""
+    disk_pkg, disk_ver, _ = _read_disk_ort_package_info()
+    dists = _get_normalized_disk_dists_map()
+    dist_pkgs = [p for p in ORT_VARIANT_PACKAGES if p in dists]
+    if not disk_pkg and dist_pkgs:
+        disk_pkg = dist_pkgs[0]
+        disk_ver = dists.get(disk_pkg, "")
+    elif disk_pkg and not disk_ver:
+        disk_ver = dists.get(disk_pkg, "")
+    stale = [p for p in dist_pkgs if disk_pkg and p != disk_pkg]
+    return {
+        "active_disk_pkg": disk_pkg,
+        "active_disk_version": disk_ver,
+        "dist_packages": dist_pkgs,
+        "stale_dist_packages": stale,
+    }
+
+
+def _detect_in_memory_ort_info() -> tuple:
+    """Визначає (pkg_name, version) саме тієї копії onnxruntime, яка завантажена в sys.modules."""
+    ort_mod = sys.modules.get("onnxruntime")
+    if ort_mod is None:
+        return ("", "")
+    pn = ""
+    ver = str(getattr(ort_mod, "__version__", "") or "").strip()
+
+    # build_and_package_info кешовано у sys.modules на момент першого import onnxruntime
+    bpi_mod = sys.modules.get("onnxruntime.capi.build_and_package_info")
+    if bpi_mod is not None:
+        try:
+            bp_name = str(getattr(bpi_mod, "package_name", "") or "").strip()
+            bp_ver = str(getattr(bpi_mod, "__version__", "") or "").strip()
+            if bp_name:
+                pn = _norm_pkg_name(bp_name)
+            if bp_ver and not ver:
+                ver = bp_ver
+        except Exception:
+            pass
+
+    if not pn or pn == "onnxruntime":
+        try:
+            provs = ort_mod.get_available_providers()
+            if "CUDAExecutionProvider" in provs:
+                pn = "onnxruntime-gpu"
+            elif "DmlExecutionProvider" in provs:
+                pn = "onnxruntime-directml"
+            elif "OpenVINOExecutionProvider" in provs:
+                pn = "onnxruntime-openvino"
+        except Exception:
+            pass
+
+    if not pn:
+        val_mod = sys.modules.get("onnxruntime.capi.onnxruntime_validation")
+        if val_mod is not None:
+            try:
+                vp, vv, _ = val_mod.get_package_name_and_version_info()
+                if vp:
+                    pn = _norm_pkg_name(vp)
+                if vv and not ver:
+                    ver = str(vv).strip()
+            except Exception:
+                pass
+
+    return (pn or "onnxruntime", ver)
+
+
 def observe_loaded_libraries():
     """Фіксує версію кожного відстежуваного пакета на момент його першого потрапляння в sys.modules."""
     dists = None
     with _MEM_STATE_LOCK:
         for imp_name, dist_cands, _is_native in _TRACKED_LIBS:
             if imp_name in sys.modules and imp_name not in _LOADED_MEM_STATE:
+                if imp_name == "onnxruntime":
+                    mem_pkg, mem_ver = _detect_in_memory_ort_info()
+                    if not mem_ver:
+                        if dists is None:
+                            dists = _get_normalized_disk_dists_map()
+                        mem_ver = dists.get(mem_pkg, "")
+                    _LOADED_MEM_STATE[imp_name] = (mem_pkg or imp_name, str(mem_ver))
+                    continue
+
                 if dists is None:
-                    dists = _get_disk_dists_map()
+                    dists = _get_normalized_disk_dists_map()
                 matched_pkg = ""
                 matched_ver = ""
                 for dc in dist_cands:
-                    if dc in dists:
+                    ndc = _norm_pkg_name(dc)
+                    if ndc in dists:
                         matched_pkg = dc
-                        matched_ver = dists[dc]
+                        matched_ver = dists[ndc]
                         break
                 if not matched_ver:
                     matched_ver = getattr(sys.modules[imp_name], "__version__", "") or ""
@@ -163,9 +328,12 @@ def get_library_versions(extra_pkgs=None) -> list:
     disk_pkg, disk_version, loaded_pkg, loaded_version, in_memory, needs_restart, status.
     """
     observe_loaded_libraries()
-    dists = _get_disk_dists_map()
+    norm_dists = _get_normalized_disk_dists_map()
     seen_groups = set()
     rows = []
+
+    disk_ort_pkg, disk_ort_ver, _ = _read_disk_ort_package_info()
+    disk_ort_dir_present = bool(disk_ort_pkg or _find_disk_ort_package_dir())
 
     with _MEM_STATE_LOCK:
         mem_snap = dict(_LOADED_MEM_STATE)
@@ -174,11 +342,28 @@ def get_library_versions(extra_pkgs=None) -> list:
         seen_groups.update(dist_cands)
         cur_pkg = ""
         cur_ver = ""
-        for dc in dist_cands:
-            if dc in dists:
-                cur_pkg = dc
-                cur_ver = dists[dc]
-                break
+        if imp_name == "onnxruntime":
+            if disk_ort_pkg:
+                cur_pkg = disk_ort_pkg
+                cur_ver = disk_ort_ver or norm_dists.get(disk_ort_pkg, "")
+            elif getattr(sys, "frozen", False):
+                cur_pkg = get_installed_ort_package()
+                if cur_pkg:
+                    cur_ver = norm_dists.get(cur_pkg, "") or str(getattr(sys.modules.get("onnxruntime"), "__version__", "") or "")
+            elif disk_ort_dir_present:
+                for dc in dist_cands:
+                    ndc = _norm_pkg_name(dc)
+                    if ndc in norm_dists:
+                        cur_pkg = dc
+                        cur_ver = norm_dists[ndc]
+                        break
+        else:
+            for dc in dist_cands:
+                ndc = _norm_pkg_name(dc)
+                if ndc in norm_dists:
+                    cur_pkg = dc
+                    cur_ver = norm_dists[ndc]
+                    break
 
         in_mem = imp_name in sys.modules
         l_pkg, l_ver = mem_snap.get(imp_name, ("", ""))
@@ -228,7 +413,6 @@ def get_library_versions(extra_pkgs=None) -> list:
         })
 
     # Додаткові бібліотеки, заявлені зовнішніми модулями у library_deps
-    norm_dists = {_norm_pkg_name(k): v for k, v in dists.items()}
     norm_seen = {_norm_pkg_name(s) for s in seen_groups}
     for ep in (extra_pkgs or []):
         low = _norm_pkg_name(ep)
@@ -496,17 +680,27 @@ def _detect_gpus_wmi():
 
 
 def get_installed_ort_package() -> str:
-    """Визначає, який саме пакет onnxruntime* встановлено в поточному середовищі."""
-    installed = set(_get_disk_dists_map().keys())
-    for pkg in ("onnxruntime-gpu", "onnxruntime-directml", "onnxruntime-openvino", "onnxruntime"):
-        if pkg in installed:
-            return pkg
+    """Визначає, який саме пакет onnxruntime* фактично встановлено на диску в поточному середовищі."""
+    disk_pkg, _disk_ver, _disk_cuda = _read_disk_ort_package_info()
+    if disk_pkg:
+        return disk_pkg
+
+    if not getattr(sys, "frozen", False):
+        # Якщо каталог onnxruntime/ у site-packages відсутній, не видаємо осиротілий .dist-info чи RAM за наявний на диску
+        if not _find_disk_ort_package_dir():
+            return ""
+        installed = set(_get_normalized_disk_dists_map().keys())
+        for pkg in ORT_VARIANT_PACKAGES:
+            if pkg in installed:
+                return pkg
+        return ""
+
     # Фолбек для замороженого EXE без dist-info
     try:
         from onnxruntime.capi import onnxruntime_validation
         pn, _pv, _cv = onnxruntime_validation.get_package_name_and_version_info()
         if pn:
-            return str(pn).strip().lower()
+            return _norm_pkg_name(pn)
     except Exception:
         pass
     if "onnxruntime" in sys.modules:
@@ -516,6 +710,8 @@ def get_installed_ort_package() -> str:
                 return "onnxruntime-gpu"
             if "DmlExecutionProvider" in provs:
                 return "onnxruntime-directml"
+            if "OpenVINOExecutionProvider" in provs:
+                return "onnxruntime-openvino"
             return "onnxruntime"
         except Exception:
             pass
@@ -527,45 +723,29 @@ def get_ort_loaded_package() -> str:
     if "onnxruntime" not in sys.modules:
         return ""
     observe_loaded_libraries()
-    try:
-        provs = sys.modules["onnxruntime"].get_available_providers()
-        if "CUDAExecutionProvider" in provs:
-            return "onnxruntime-gpu"
-        if "DmlExecutionProvider" in provs:
-            return "onnxruntime-directml"
-        if "OpenVINOExecutionProvider" in provs:
-            return "onnxruntime-openvino"
-    except Exception:
-        pass
+    mem_pkg, _mem_ver = _detect_in_memory_ort_info()
+    if mem_pkg and mem_pkg != "onnxruntime":
+        return mem_pkg
     with _MEM_STATE_LOCK:
         mem_ent = _LOADED_MEM_STATE.get("onnxruntime")
-    if mem_ent and mem_ent[0] and mem_ent[0] != "onnxruntime":
-        return str(mem_ent[0])
-    val_mod = sys.modules.get("onnxruntime.capi.onnxruntime_validation")
-    if val_mod is not None:
-        try:
-            pn, _pv, _cv = val_mod.get_package_name_and_version_info()
-            if pn:
-                return str(pn).strip().lower()
-        except Exception:
-            pass
     if mem_ent and mem_ent[0]:
         return str(mem_ent[0])
-    return "onnxruntime"
+    return mem_pkg or "onnxruntime"
 
 
 def is_onnxruntime_gpu_installed() -> bool:
     """Повертає True, якщо в середовищі встановлено саме GPU-білд onnxruntime-gpu (CUDA)."""
     pkg = get_installed_ort_package()
-    if pkg == "onnxruntime-gpu":
-        return True
-    try:
-        from onnxruntime.capi import onnxruntime_validation
-        pn, _pv, cv = onnxruntime_validation.get_package_name_and_version_info()
-        if pn == "onnxruntime-gpu" or bool(cv):
-            return True
-    except Exception:
-        pass
+    if pkg:
+        return pkg == "onnxruntime-gpu"
+    if getattr(sys, "frozen", False):
+        try:
+            from onnxruntime.capi import onnxruntime_validation
+            pn, _pv, cv = onnxruntime_validation.get_package_name_and_version_info()
+            if _norm_pkg_name(pn) == "onnxruntime-gpu" or bool(cv):
+                return True
+        except Exception:
+            pass
     return False
 
 
@@ -579,8 +759,31 @@ def has_nvidia_gpu() -> bool:
         return False
 
 
+def _cleanup_ort_swap_trash(site_dir: str = ""):
+    """Видаляє старі тимчасові каталоги .ort_swap_trash_* після попереднього перемикання ONNX Runtime у Windows."""
+    if getattr(sys, "frozen", False):
+        return
+    dirs_to_scan = []
+    if site_dir and os.path.isdir(site_dir):
+        dirs_to_scan.append(site_dir)
+    else:
+        ort_dir = _find_disk_ort_package_dir()
+        if ort_dir:
+            dirs_to_scan.append(os.path.dirname(ort_dir))
+    for parent in dirs_to_scan:
+        try:
+            for name in os.listdir(parent):
+                if name.startswith(".ort_swap_trash_"):
+                    shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
+        except Exception:
+            pass
+
+
+_cleanup_ort_swap_trash()
+
+
 def install_ort_package(package_name: str, progress_cb=None):
-    """Встановлює або перемикає пакет onnxruntime у .venv без видалення/перевстановлення вже наявного."""
+    """Встановлює або перемикає пакет onnxruntime у .venv (включно з безпечною заміною завантажених у RAM DLL у Windows)."""
     if getattr(sys, "frozen", False):
         return False, tr(
             "hw.ort.err_frozen",
@@ -597,8 +800,10 @@ def install_ort_package(package_name: str, progress_cb=None):
     installed_orts = [p for p in ORT_VARIANT_PACKAGES if p in disk_dists]
     other_orts = [p for p in installed_orts if p != package_name]
     target_already_on_disk = package_name in installed_orts
+    actual_disk_ort = get_installed_ort_package()
+    _cleanup_ort_swap_trash()
 
-    if target_already_on_disk and not other_orts:
+    if target_already_on_disk and not other_orts and (not actual_disk_ort or actual_disk_ort == package_name):
         if progress_cb:
             progress_cb(
                 tr(
@@ -628,56 +833,114 @@ def install_ort_package(package_name: str, progress_cb=None):
         if os.path.exists(cand):
             py_exe = cand
 
+    ort_in_mem = ("onnxruntime" in sys.modules)
+    moved_pairs = []
+    trash_dir = ""
+
     try:
-        if other_orts:
-            if progress_cb:
-                progress_cb(
-                    tr(
-                        "hw.ort.progress_uninstall_conflict",
-                        "Removing conflicting variant ({pkgs})...",
-                        pkgs=", ".join(other_orts),
-                    )
+        with tempfile.TemporaryDirectory(prefix="ort_dl_") as dl_dir:
+            find_links_args = []
+            if sys.platform == "win32" and ort_in_mem:
+                # У Windows завантажені в RAM .dll/.pyd блокують видалення чи перезапис (WinError 5),
+                # але дозволяють атомарне перейменування на тому самому диску NTFS.
+                # Спочатку завантажуємо wheel локально, щоб не зламати .venv за відсутності мережі.
+                if progress_cb:
+                    progress_cb(tr("hw.ort.progress_installing", "Installing {pkg}...", pkg=package_name))
+                dl_res = subprocess.run(
+                    [py_exe, "-m", "pip", "download", "--no-deps", "-d", dl_dir, package_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    creationflags=_creation_flags(),
                 )
-            subprocess.run(
-                [py_exe, "-m", "pip", "uninstall", "-y", *other_orts],
+                if dl_res.returncode != 0:
+                    err_msg = (dl_res.stderr or dl_res.stdout or "").strip()[-400:]
+                    return False, tr("hw.ort.err_pip", "pip install error:\n{err}", err=err_msg)
+                find_links_args = ["--find-links", dl_dir]
+
+                ort_dir = _find_disk_ort_package_dir()
+                if ort_dir and os.path.isdir(ort_dir):
+                    site_dir = os.path.dirname(ort_dir)
+                    trash_dir = os.path.join(site_dir, f".ort_swap_trash_{os.getpid()}_{int(time.time() * 1000)}")
+                    for walk_root, _dirs, files in os.walk(ort_dir):
+                        for fn in files:
+                            if fn.lower().endswith((".dll", ".pyd")):
+                                src = os.path.join(walk_root, fn)
+                                rel = os.path.relpath(src, ort_dir)
+                                dst = os.path.join(trash_dir, rel)
+                                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                                os.replace(src, dst)
+                                moved_pairs.append((src, dst))
+
+            if other_orts:
+                if progress_cb:
+                    progress_cb(
+                        tr(
+                            "hw.ort.progress_uninstall_conflict",
+                            "Removing conflicting variant ({pkgs})...",
+                            pkgs=", ".join(other_orts),
+                        )
+                    )
+                subprocess.run(
+                    [py_exe, "-m", "pip", "uninstall", "-y", *other_orts],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    creationflags=_creation_flags(),
+                )
+
+            if progress_cb and not (sys.platform == "win32" and ort_in_mem):
+                progress_cb(tr("hw.ort.progress_installing", "Installing {pkg}...", pkg=package_name))
+
+            install_cmd = [py_exe, "-m", "pip", "install", *find_links_args]
+            if target_already_on_disk and (other_orts or actual_disk_ort != package_name):
+                # Якщо вилучався конфліктний пакет або файли onnxruntime/ на диску не відповідають .dist-info,
+                # примусово відновлюємо файли цільового пакета без перевстановлення інших залежностей.
+                install_cmd.extend(["--force-reinstall", "--no-deps"])
+            install_cmd.append(package_name)
+            res = subprocess.run(
+                install_cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=600,
                 creationflags=_creation_flags(),
             )
-        if progress_cb:
-            progress_cb(tr("hw.ort.progress_installing", "Installing {pkg}...", pkg=package_name))
-        install_cmd = [py_exe, "-m", "pip", "install"]
-        if target_already_on_disk and other_orts:
-            # Якщо вилучався конфліктний пакет із того ж каталогу site-packages/onnxruntime/,
-            # відновлюємо файли цільового пакета без перевстановлення інших залежностей.
-            install_cmd.extend(["--force-reinstall", "--no-deps"])
-        install_cmd.append(package_name)
-        res = subprocess.run(
-            install_cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            creationflags=_creation_flags(),
-        )
-        if res.returncode == 0:
-            importlib.invalidate_caches()
-            ort_loaded = "onnxruntime" in sys.modules
-            loaded_pkg = get_ort_loaded_package() if ort_loaded else ""
-            if ort_loaded and loaded_pkg != package_name:
+            if res.returncode == 0:
+                if trash_dir and os.path.isdir(trash_dir):
+                    shutil.rmtree(trash_dir, ignore_errors=True)
+                importlib.invalidate_caches()
+                ort_loaded = "onnxruntime" in sys.modules
+                loaded_pkg = get_ort_loaded_package() if ort_loaded else ""
+                if ort_loaded and loaded_pkg and loaded_pkg != package_name:
+                    return True, tr(
+                        "hw.ort.installed_restart",
+                        "Package '{pkg}' installed on disk. Since the onnxruntime C-extension is already loaded in memory, restart the application.",
+                        pkg=package_name,
+                    )
                 return True, tr(
-                    "hw.ort.installed_restart",
-                    "Package '{pkg}' installed on disk. Since the onnxruntime C-extension is already loaded in memory, restart the application.",
+                    "hw.ort.installed_ok",
+                    "Package '{pkg}' installed successfully.",
                     pkg=package_name,
                 )
-            return True, tr(
-                "hw.ort.installed_ok",
-                "Package '{pkg}' installed successfully.",
-                pkg=package_name,
-            )
-        err_msg = (res.stderr or res.stdout or "").strip()[-400:]
-        return False, tr("hw.ort.err_pip", "pip install error:\n{err}", err=err_msg)
+
+            # Відкат переміщених бінарників у разі помилки pip install
+            for src, dst in moved_pairs:
+                if os.path.exists(dst) and not os.path.exists(src):
+                    try:
+                        os.makedirs(os.path.dirname(src), exist_ok=True)
+                        os.replace(dst, src)
+                    except Exception:
+                        pass
+            err_msg = (res.stderr or res.stdout or "").strip()[-400:]
+            return False, tr("hw.ort.err_pip", "pip install error:\n{err}", err=err_msg)
     except Exception as e:
+        for src, dst in moved_pairs:
+            if os.path.exists(dst) and not os.path.exists(src):
+                try:
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    os.replace(dst, src)
+                except Exception:
+                    pass
         return False, tr("hw.ort.err_exception", "Exception during installation: {err}", err=e)
 
 
@@ -736,38 +999,43 @@ def detect_target_cuda_major(base_dir: str = "", allow_network: bool = False) ->
     потім локальний cuda_manifest.json або PyPI JSON.
     """
     importlib.invalidate_caches()
-    # 1. Метадані встановленого на диску onnxruntime-gpu (навіть якщо в RAM ще старий CPU модуль)
-    try:
-        dist = importlib.metadata.distribution("onnxruntime-gpu")
-        reqs = dist.requires or []
-        for r in reqs:
-            low = r.lower()
-            if "cu12" in low or ("nvidia-cuda-runtime" in low and "12" in low):
-                return "12"
-            if "cu13" in low or ("nvidia-cuda-runtime" in low and "13" in low) or ("nvidia-cudnn-cu13" in low):
+    conflicts = get_installed_ort_conflicts()
+    active_disk_pkg = conflicts.get("active_disk_pkg") or ""
+    active_disk_ver = conflicts.get("active_disk_version") or ""
+
+    # 1. Метадані встановленого на диску onnxruntime-gpu (лише якщо активний саме він, а не застарілий .dist-info)
+    if active_disk_pkg == "onnxruntime-gpu":
+        try:
+            dist = importlib.metadata.distribution("onnxruntime-gpu")
+            reqs = dist.requires or []
+            for r in reqs:
+                low = r.lower()
+                if "cu12" in low or ("nvidia-cuda-runtime" in low and "12" in low):
+                    return "12"
+                if "cu13" in low or ("nvidia-cuda-runtime" in low and "13" in low) or ("nvidia-cudnn-cu13" in low):
+                    return "13"
+            if _parse_ver_tuple(active_disk_ver or dist.version) >= (1, 27):
                 return "13"
-        if _parse_ver_tuple(dist.version) >= (1, 27):
-            return "13"
-        return "12"
-    except importlib.metadata.PackageNotFoundError:
-        pass
-    except Exception:
-        pass
+            return "12"
+        except importlib.metadata.PackageNotFoundError:
+            pass
+        except Exception:
+            pass
 
     # 2. Якщо працює усередині зібраного EXE або вже завантажено onnxruntime-gpu в RAM
     if "onnxruntime" in sys.modules or getattr(sys, "frozen", False):
         try:
             from onnxruntime.capi import onnxruntime_validation
             pkg_name, ver_str, cuda_ver = onnxruntime_validation.get_package_name_and_version_info()
-            if cuda_ver:
+            if cuda_ver and (_norm_pkg_name(pkg_name) == "onnxruntime-gpu" or getattr(sys, "frozen", False)):
                 maj = str(cuda_ver).split(".")[0].strip()
                 if maj.isdigit():
                     return maj
         except Exception:
             pass
 
-    # 3. Версія вже встановленого onnxruntime на диску -> збігається з onnxruntime-gpu того ж релізу
-    disk_ort_ver = _get_disk_dists_map().get("onnxruntime-gpu") or _get_disk_dists_map().get("onnxruntime") or _get_disk_dists_map().get("onnxruntime-directml") or ""
+    # 3. Версія активного onnxruntime-gpu на диску (якщо інший варіант — питаємо актуальний реліз на PyPI)
+    disk_ort_ver = active_disk_ver if active_disk_pkg == "onnxruntime-gpu" else ""
     if allow_network:
         try:
             url = (

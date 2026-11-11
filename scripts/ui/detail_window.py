@@ -1,5 +1,6 @@
 import os
 import time
+import copy
 import numpy as np
 from datetime import datetime
 import tkinter as tk
@@ -17,6 +18,7 @@ from scripts.ui.helpers import (
     WindowGeometryTracker,
     clamp_window_geometry,
     get_current_monitor_geometry,
+    ensure_clam_theme,
 )
 
 EVT_MOTION = "<Motion>"
@@ -73,6 +75,22 @@ class CameraDetailWindow:
         self.screen_photo_tk = None
         self.roi_photo_tk = None
 
+        # Інтерактивне кадрування (зум) наживо лівою клавішею миші на main_video_canvas
+        self._live_crop_norm = None
+        self._live_last_raw_frame = None
+        self._live_last_overlay = {}
+        self._live_last_now = 0.0
+        self._main_img_id = None
+        self._main_ph_id = None
+        self._main_disp_w = 1
+        self._main_disp_h = 1
+        self._main_img_off_x = 0
+        self._main_img_off_y = 0
+        self._live_drag_start_x = None
+        self._live_drag_start_y = None
+        self._live_drag_moved = False
+        self._live_configure_after_id = None
+
         # Динамічні кнопки архіву з ModuleRegistry: mod_id -> tk.Button
         self._archive_buttons = {}
 
@@ -82,6 +100,7 @@ class CameraDetailWindow:
         self.tree_item_map = {}
         self.raw_records = []
         self.sort_mode = 0
+        self._arch_tree_syncing = False
 
         self.current_screen_img_cv = None
         self.current_preview_fpath = None
@@ -297,6 +316,8 @@ class CameraDetailWindow:
             self._update_status_bar_from_snapshot(self._last_detail_snap)
             if self.img_main_tk is None:
                 self._update_main_video_placeholder()
+            elif self._live_crop_norm is not None:
+                self._draw_live_crop_badge()
 
             self._update_roi_toolbar_labels()
             self._render_current_roi_view()
@@ -470,11 +491,7 @@ class CameraDetailWindow:
         scrollbar = tk.Scrollbar(self.tree_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+        style = ensure_clam_theme(self.win)
         style.configure("ProDark.Treeview", background="#16161d", foreground="#ffffff", fieldbackground="#16161d", font=("Segoe UI", 10), rowheight=26, borderwidth=0)
         style.map("ProDark.Treeview", background=[("selected", "#007acc")], foreground=[("selected", "#ffffff")])
 
@@ -534,16 +551,27 @@ class CameraDetailWindow:
             pw.bind(EVT_ENTER, lambda e: self._set_wheel_zone("preview"))
             pw.bind(EVT_LEAVE, lambda e: self._clear_wheel_zone("preview"))
 
-        # Живий екран
+        # Живий екран (Canvas для інтерактивного виділення/кадрування ЛКМ та скидання ПКМ)
         self.video_container = tk.Frame(self.main_body, bg="#0d0d11")
         self.video_container.pack(fill=tk.BOTH, expand=True)
-        self.main_video_label = tk.Label(
-            self.video_container, bg="#0d0d11", text=tr("ui.detail.waiting_main", "Waiting for main stream..."),
-            fg="#8c92a4", font=("Segoe UI", 12, "bold")
+        self.main_video_canvas = tk.Canvas(
+            self.video_container, bg="#0d0d11", highlightthickness=0, bd=0, cursor="cross"
         )
-        self.main_video_label.pack(fill=tk.BOTH, expand=True)
+        self.main_video_canvas.pack(fill=tk.BOTH, expand=True)
+        self._main_ph_id = self.main_video_canvas.create_text(
+            320, 180,
+            text=tr("ui.detail.waiting_main", "Waiting for main stream..."),
+            fill="#8c92a4",
+            font=("Segoe UI", 12, "bold"),
+            justify=tk.CENTER,
+            tags="live_ph",
+        )
 
-        self.main_video_label.bind(EVT_BTN_PRESS, self._on_video_area_click)
+        self.main_video_canvas.bind("<Configure>", self._on_main_canvas_configure)
+        self.main_video_canvas.bind(EVT_BTN_PRESS, self._on_main_canvas_press)
+        self.main_video_canvas.bind(EVT_B1_MOTION, self._on_main_canvas_motion)
+        self.main_video_canvas.bind(EVT_BTN_RELEASE, self._on_main_canvas_release)
+        self.main_video_canvas.bind(EVT_RIGHT_CLICK, self._on_main_canvas_right_click)
         self.video_container.bind(EVT_BTN_PRESS, self._on_video_area_click)
 
         # Плаваюче вікно детального ROI/кадру
@@ -864,7 +892,7 @@ class CameraDetailWindow:
         self.status_lbl.configure(text=st_txt, fg=st_col)
 
     def _update_main_video_placeholder(self):
-        if self.img_main_tk is not None or not hasattr(self, "main_video_label"):
+        if self.img_main_tk is not None or not hasattr(self, "main_video_canvas"):
             return
         if self._last_main_offline:
             msg = (
@@ -874,7 +902,19 @@ class CameraDetailWindow:
             )
         else:
             msg = tr("ui.detail.waiting_main", "Waiting for main stream...")
-        self.main_video_label.configure(image="", text=msg)
+        self.main_video_canvas.delete("live_img")
+        self.main_video_canvas.delete("live_crop_badge")
+        self.main_video_canvas.delete("live_drag_rect")
+        self._main_img_id = None
+        self._main_img_off_x = 0
+        self._main_img_off_y = 0
+        self._main_disp_w = 1
+        self._main_disp_h = 1
+        cw = max(self.main_video_canvas.winfo_width(), 320)
+        ch = max(self.main_video_canvas.winfo_height(), 180)
+        if self._main_ph_id is not None:
+            self.main_video_canvas.itemconfigure(self._main_ph_id, text=msg, state=tk.NORMAL)
+            self.main_video_canvas.coords(self._main_ph_id, cw // 2, ch // 2)
 
     def _render_tick(self):
         if self._is_closing:
@@ -900,6 +940,7 @@ class CameraDetailWindow:
                     self._draw_overlays_and_present(frame, snap.get("overlay") or {}, now)
                 elif frame_ref is None and st in ("offline", "reconnecting"):
                     self.img_main_tk = None
+                    self._live_last_raw_frame = None
                     self._last_main_offline = True
                     self._update_main_video_placeholder()
         except Exception as e:
@@ -908,9 +949,25 @@ class CameraDetailWindow:
         if not self._is_closing:
             self._render_after_id = self.win.after(interval_ms, self._render_tick)
 
-    def _draw_overlays_and_present(self, frame: np.ndarray, overlay: dict, now: float):
+    def _draw_overlays_and_present(self, frame: np.ndarray, overlay: dict, now: float, cache_raw: bool = True):
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return
+
+        if cache_raw:
+            try:
+                self._live_last_raw_frame = frame.copy()
+                try:
+                    self._live_last_overlay = copy.deepcopy(overlay or {})
+                except Exception:
+                    self._live_last_overlay = {
+                        k: (dict(v) if isinstance(v, dict) else v)
+                        for k, v in (overlay or {}).items()
+                    }
+                self._live_last_now = float(now)
+            except Exception:
+                pass
+
         mods = (self.cam_cfg or {}).get("modules") or {}
-        frame_h, frame_w = frame.shape[:2]
 
         if cv2 is not None and self.registry is not None:
             for ent in self.registry.list_modules(kind="ai"):
@@ -928,12 +985,29 @@ class CameraDetailWindow:
                     except Exception:
                         pass
 
-        cont_w = self.video_container.winfo_width()
-        cont_h = self.video_container.winfo_height()
-        lbl_w = cont_w if cont_w > 100 else max(self.main_video_label.winfo_width(), 640)
-        lbl_h = cont_h if cont_h > 100 else max(self.main_video_label.winfo_height(), 360)
+        view_frame = frame
+        crop_norm = self._live_crop_norm
+        if crop_norm is not None:
+            fh, fw = frame.shape[:2]
+            if fw > 1 and fh > 1:
+                nx1, ny1, nx2, ny2 = crop_norm
+                cx1 = max(0, min(fw - 1, int(round(nx1 * fw))))
+                cy1 = max(0, min(fh - 1, int(round(ny1 * fh))))
+                cx2 = max(cx1 + 1, min(fw, int(round(nx2 * fw))))
+                cy2 = max(cy1 + 1, min(fh, int(round(ny2 * fh))))
+                if cx2 > cx1 and cy2 > cy1:
+                    view_frame = frame[cy1:cy2, cx1:cx2]
 
-        scale = min(lbl_w / float(frame_w), lbl_h / float(frame_h))
+        frame_h, frame_w = view_frame.shape[:2]
+        can_w = self.main_video_canvas.winfo_width()
+        can_h = self.main_video_canvas.winfo_height()
+        if can_w <= 16 or can_h <= 16:
+            cont_w = self.video_container.winfo_width()
+            cont_h = self.video_container.winfo_height()
+            can_w = cont_w if cont_w > 100 else max(can_w, 640)
+            can_h = cont_h if cont_h > 100 else max(can_h, 360)
+
+        scale = min(can_w / float(frame_w), can_h / float(frame_h))
         new_w = max(1, int(round(frame_w * scale)))
         new_h = max(1, int(round(frame_h * scale)))
 
@@ -941,20 +1015,198 @@ class CameraDetailWindow:
             interp_name = str(self.hw_cfg.get("display_resize_method", "linear"))
             if interp_name == "nearest":
                 interp = cv2.INTER_NEAREST
-            elif interp_name == "lanczos":
+            elif interp_name == "lanczos" or (crop_norm is not None and scale > 1.0):
                 interp = cv2.INTER_LANCZOS4
             else:
                 interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
 
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+            resized = cv2.resize(view_frame, (new_w, new_h), interpolation=interp)
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
         else:
-            rgb = frame[:, :, ::-1] if frame.ndim == 3 and frame.shape[2] >= 3 else frame
+            rgb = view_frame[:, :, ::-1] if view_frame.ndim == 3 and view_frame.shape[2] >= 3 else view_frame
             pil_img = Image.fromarray(rgb).resize((new_w, new_h), Image.Resampling.BILINEAR)
 
         self.img_main_tk = ImageTk.PhotoImage(image=pil_img)
-        self.main_video_label.configure(image=self.img_main_tk, text="")
+        off_x = max(0, (can_w - new_w) // 2)
+        off_y = max(0, (can_h - new_h) // 2)
+        self._main_disp_w = new_w
+        self._main_disp_h = new_h
+        self._main_img_off_x = off_x
+        self._main_img_off_y = off_y
+
+        if self._main_ph_id is not None:
+            self.main_video_canvas.itemconfigure(self._main_ph_id, state=tk.HIDDEN)
+
+        if self._main_img_id is None:
+            self._main_img_id = self.main_video_canvas.create_image(
+                off_x, off_y, anchor=tk.NW, image=self.img_main_tk, tags="live_img"
+            )
+        else:
+            self.main_video_canvas.coords(self._main_img_id, off_x, off_y)
+            self.main_video_canvas.itemconfigure(self._main_img_id, image=self.img_main_tk)
+
+        if crop_norm is not None:
+            self._draw_live_crop_badge()
+        else:
+            self.main_video_canvas.delete("live_crop_badge")
+
+        if self._live_drag_moved:
+            try:
+                self.main_video_canvas.tag_raise("live_drag_rect")
+            except Exception:
+                pass
+
+    def _draw_live_crop_badge(self):
+        if not hasattr(self, "main_video_canvas"):
+            return
+        self.main_video_canvas.delete("live_crop_badge")
+        if self._live_crop_norm is None or self.img_main_tk is None:
+            return
+        can_h = max(self.main_video_canvas.winfo_height(), 80)
+        txt = tr("ui.detail.live_crop_badge", "🔍 Live Crop (RMB — reset)")
+        bx = 16
+        by = max(28, can_h - 14)
+        txt_id = self.main_video_canvas.create_text(
+            bx, by,
+            text=txt,
+            fill="#00e5ff",
+            font=("Segoe UI", 9, "bold"),
+            anchor=tk.SW,
+            tags="live_crop_badge",
+        )
+        bbox = self.main_video_canvas.bbox(txt_id)
+        if bbox:
+            bg_id = self.main_video_canvas.create_rectangle(
+                bbox[0] - 8, bbox[1] - 4, bbox[2] + 8, bbox[3] + 4,
+                fill="#0d111a", outline="#00e5ff", width=1,
+                tags="live_crop_badge",
+            )
+            self.main_video_canvas.tag_lower(bg_id, txt_id)
+
+    def _rerender_live_cached(self):
+        if self._is_closing:
+            return
+        if self._live_last_raw_frame is not None:
+            self._draw_overlays_and_present(
+                self._live_last_raw_frame.copy(),
+                self._live_last_overlay,
+                self._live_last_now,
+                cache_raw=False,
+            )
+        else:
+            self._update_main_video_placeholder()
+
+    def _on_main_canvas_configure(self, event=None):
+        if self._is_closing:
+            return
+        if self.img_main_tk is None and self._main_ph_id is not None and event is not None:
+            try:
+                self.main_video_canvas.coords(
+                    self._main_ph_id, max(1, int(event.width)) // 2, max(1, int(event.height)) // 2
+                )
+            except Exception:
+                pass
+        if self._live_last_raw_frame is not None:
+            if self._live_configure_after_id is not None:
+                try:
+                    self.win.after_cancel(self._live_configure_after_id)
+                except Exception:
+                    pass
+            self._live_configure_after_id = self.win.after(16, self._on_main_canvas_configure_debounced)
+
+    def _on_main_canvas_configure_debounced(self):
+        self._live_configure_after_id = None
+        self._rerender_live_cached()
+
+    def _on_main_canvas_press(self, event):
+        if self.img_main_tk is None or self._main_disp_w <= 1 or self._main_disp_h <= 1:
+            self._live_drag_start_x = None
+            self._live_drag_start_y = None
+            self._live_drag_moved = False
+            self._on_video_area_click(event)
+            return
+        self._live_drag_start_x = max(
+            self._main_img_off_x, min(self._main_img_off_x + self._main_disp_w, event.x)
+        )
+        self._live_drag_start_y = max(
+            self._main_img_off_y, min(self._main_img_off_y + self._main_disp_h, event.y)
+        )
+        self._live_drag_moved = False
+
+    def _on_main_canvas_motion(self, event):
+        if self._live_drag_start_x is None or self._live_drag_start_y is None:
+            return
+        cur_x = max(self._main_img_off_x, min(self._main_img_off_x + self._main_disp_w, event.x))
+        cur_y = max(self._main_img_off_y, min(self._main_img_off_y + self._main_disp_h, event.y))
+        if abs(cur_x - self._live_drag_start_x) >= 6 or abs(cur_y - self._live_drag_start_y) >= 6:
+            self._live_drag_moved = True
+        if self._live_drag_moved:
+            self.main_video_canvas.delete("live_drag_rect")
+            self.main_video_canvas.create_rectangle(
+                self._live_drag_start_x, self._live_drag_start_y, cur_x, cur_y,
+                outline="#00ff00", width=2, tags="live_drag_rect"
+            )
+            self.main_video_canvas.tag_raise("live_drag_rect")
+
+    def _on_main_canvas_release(self, event):
+        if self._live_drag_start_x is None or self._live_drag_start_y is None:
+            self._live_drag_moved = False
+            return
+
+        end_x = max(self._main_img_off_x, min(self._main_img_off_x + self._main_disp_w, event.x))
+        end_y = max(self._main_img_off_y, min(self._main_img_off_y + self._main_disp_h, event.y))
+        x1 = min(self._live_drag_start_x, end_x) - self._main_img_off_x
+        x2 = max(self._live_drag_start_x, end_x) - self._main_img_off_x
+        y1 = min(self._live_drag_start_y, end_y) - self._main_img_off_y
+        y2 = max(self._live_drag_start_y, end_y) - self._main_img_off_y
+
+        was_moved = self._live_drag_moved
+        self._live_drag_start_x = None
+        self._live_drag_start_y = None
+        self._live_drag_moved = False
+        self.main_video_canvas.delete("live_drag_rect")
+
+        if not was_moved or (x2 - x1) < 8 or (y2 - y1) < 8 or self._main_disp_w <= 1 or self._main_disp_h <= 1:
+            self._on_video_area_click(event)
+            return
+
+        rx1 = max(0.0, min(1.0, x1 / float(self._main_disp_w)))
+        ry1 = max(0.0, min(1.0, y1 / float(self._main_disp_h)))
+        rx2 = max(0.0, min(1.0, x2 / float(self._main_disp_w)))
+        ry2 = max(0.0, min(1.0, y2 / float(self._main_disp_h)))
+
+        base_x1, base_y1, base_x2, base_y2 = self._live_crop_norm or (0.0, 0.0, 1.0, 1.0)
+        span_w = base_x2 - base_x1
+        span_h = base_y2 - base_y1
+        nx1 = base_x1 + rx1 * span_w
+        nx2 = base_x1 + rx2 * span_w
+        ny1 = base_y1 + ry1 * span_h
+        ny2 = base_y1 + ry2 * span_h
+
+        min_span = 0.01
+        if (nx2 - nx1) < min_span:
+            mid_x = 0.5 * (nx1 + nx2)
+            nx1 = max(0.0, min(1.0 - min_span, mid_x - 0.5 * min_span))
+            nx2 = nx1 + min_span
+        if (ny2 - ny1) < min_span:
+            mid_y = 0.5 * (ny1 + ny2)
+            ny1 = max(0.0, min(1.0 - min_span, mid_y - 0.5 * min_span))
+            ny2 = ny1 + min_span
+
+        self._live_crop_norm = (nx1, ny1, nx2, ny2)
+        self._rerender_live_cached()
+
+    def _on_main_canvas_right_click(self, event=None):
+        self._live_drag_start_x = None
+        self._live_drag_start_y = None
+        self._live_drag_moved = False
+        if hasattr(self, "main_video_canvas"):
+            self.main_video_canvas.delete("live_drag_rect")
+        if self._live_crop_norm is not None:
+            self._live_crop_norm = None
+            self._rerender_live_cached()
+        return "break"
 
     # ------------------------------------------------------------------
     # Архівний сайдбар та кропер (повністю ізольовано на archive_dir камери)
@@ -1554,48 +1806,95 @@ class CameraDetailWindow:
         prev_sel = self.items_tree.selection()
         selected_fpath = self.tree_item_map.get(prev_sel[0]) if prev_sel else self.current_preview_fpath
 
-        self.items_tree.delete(*prev_day_nodes)
-        self.tree_item_map.clear()
+        prev_yview_top = 0.0
+        top_anchor = None
+        if had_days:
+            try:
+                prev_yview_top = float(self.items_tree.yview()[0])
+                if prev_yview_top > 0.001:
+                    top_iid = self.items_tree.identify_row(4)
+                    if top_iid:
+                        if top_iid in self.tree_item_map:
+                            top_anchor = ("item", self.tree_item_map[top_iid])
+                        else:
+                            t_txt = self.items_tree.item(top_iid, "text")
+                            if t_txt.startswith("📁 "):
+                                top_anchor = ("day", t_txt[2:].strip())
+            except Exception:
+                pass
 
-        query = self.search_var.get().strip().upper()
-        filtered = [
-            r for r in self.raw_records
-            if not query or (query in r["name"].upper()) or (query in r["time"]) or (query in r["day"])
-        ]
+        self._arch_tree_syncing = True
+        try:
+            if prev_day_nodes:
+                self.items_tree.delete(*prev_day_nodes)
+            self.tree_item_map.clear()
 
-        if self.sort_mode == 0:
-            filtered.sort(key=lambda x: x["mtime"], reverse=True)
-        elif self.sort_mode == 1:
-            filtered.sort(key=lambda x: x["mtime"], reverse=False)
-        else:
-            filtered.sort(key=lambda x: x["name"].upper())
+            query = self.search_var.get().strip().upper()
+            filtered = [
+                r for r in self.raw_records
+                if not query or (query in r["name"].upper()) or (query in r["time"]) or (query in r["day"])
+            ]
 
-        grouped = {}
-        for r in filtered:
-            grouped.setdefault(r["day"], []).append(r)
-
-        arch = self._get_archive_spec(self.sidebar_mode)
-        icon = str(arch.get("icon") or "📄")
-
-        item_to_reselect = None
-        for idx, day_str in enumerate(sorted(grouped.keys(), reverse=(self.sort_mode != 1))):
-            if not had_days:
-                is_open = (idx == 0)
+            if self.sort_mode == 0:
+                filtered.sort(key=lambda x: x["mtime"], reverse=True)
+            elif self.sort_mode == 1:
+                filtered.sort(key=lambda x: x["mtime"], reverse=False)
             else:
-                is_open = (day_str in open_days) or (idx == 0 and day_str not in known_days)
+                filtered.sort(key=lambda x: x["name"].upper())
 
-            day_node = self.items_tree.insert("", "end", text=f"📁 {day_str}", tags=("day_tag",), open=is_open)
-            for rec in grouped[day_str]:
-                disp_str = f"🕒 {rec['time']}   {icon} {rec['name']}"
-                item_id = self.items_tree.insert(day_node, "end", text=f"  {disp_str}", tags=("item_tag",))
-                self.tree_item_map[item_id] = rec["fpath"]
-                if selected_fpath and rec["fpath"] == selected_fpath:
-                    item_to_reselect = item_id
-                    self.items_tree.item(day_node, open=True)
+            grouped = {}
+            for r in filtered:
+                grouped.setdefault(r["day"], []).append(r)
 
-        if item_to_reselect is not None:
-            self.items_tree.selection_set(item_to_reselect)
-            self.items_tree.focus(item_to_reselect)
+            arch = self._get_archive_spec(self.sidebar_mode)
+            icon = str(arch.get("icon") or "📄")
+
+            item_to_reselect = None
+            for idx, day_str in enumerate(sorted(grouped.keys(), reverse=(self.sort_mode != 1))):
+                if not had_days:
+                    is_open = (idx == 0)
+                else:
+                    is_open = (day_str in open_days) or (idx == 0 and day_str not in known_days)
+
+                day_node = self.items_tree.insert("", "end", text=f"📁 {day_str}", tags=("day_tag",), open=is_open)
+                for rec in grouped[day_str]:
+                    disp_str = f"🕒 {rec['time']}   {icon} {rec['name']}"
+                    item_id = self.items_tree.insert(day_node, "end", text=f"  {disp_str}", tags=("item_tag",))
+                    self.tree_item_map[item_id] = rec["fpath"]
+                    if selected_fpath and rec["fpath"] == selected_fpath:
+                        item_to_reselect = item_id
+                        self.items_tree.item(day_node, open=True)
+
+            if item_to_reselect is not None:
+                self.items_tree.selection_set(item_to_reselect)
+                self.items_tree.focus(item_to_reselect)
+
+            if had_days and prev_yview_top > 0.001:
+                visible_rows = 0
+                anchor_idx = None
+                for d_node in self.items_tree.get_children():
+                    d_row = visible_rows
+                    visible_rows += 1
+                    dt = self.items_tree.item(d_node, "text")
+                    dn = dt[2:].strip() if dt.startswith("📁 ") else ""
+                    if top_anchor == ("day", dn):
+                        anchor_idx = d_row
+                    if self.items_tree.item(d_node, "open"):
+                        for ch_id in self.items_tree.get_children(d_node):
+                            c_row = visible_rows
+                            visible_rows += 1
+                            ch_fp = self.tree_item_map.get(ch_id)
+                            if ch_fp and top_anchor == ("item", ch_fp):
+                                anchor_idx = c_row
+                self.items_tree.update_idletasks()
+                if anchor_idx is not None and visible_rows > 0:
+                    self.items_tree.yview_moveto(max(0.0, min(1.0, anchor_idx / float(visible_rows))))
+                else:
+                    self.items_tree.yview_moveto(prev_yview_top)
+
+            self.items_tree.update_idletasks()
+        finally:
+            self._arch_tree_syncing = False
 
     def _show_item_in_preview(self, fpath):
         if not fpath or not os.path.exists(fpath):
@@ -1979,18 +2278,25 @@ class CameraDetailWindow:
         self.roi_btn_speed.configure(text=txt)
 
     def _on_item_selected(self, event):
+        if self._arch_tree_syncing:
+            return
         sel = self.items_tree.selection()
         if not sel:
             return
         fpath = self.tree_item_map.get(sel[0])
         if not fpath:
             return
-        if event is not None and fpath == self.current_preview_fpath and self.current_screen_img_cv is not None:
+        rtype = self._get_current_record_type()
+        already_loaded = (
+            (self.arch_cap is not None and self.arch_fpath == fpath)
+            if rtype == "video"
+            else (self.current_screen_img_cv is not None)
+        )
+        if event is not None and fpath == self.current_preview_fpath and already_loaded:
             return
 
         self.current_preview_fpath = fpath
         self._preview_revision += 1
-        rtype = self._get_current_record_type()
 
         if rtype == "video":
             self._load_archive_video(fpath, auto_play=True)
@@ -2353,6 +2659,12 @@ class CameraDetailWindow:
             except Exception:
                 pass
             self._refresh_debounce_id = None
+        if self._live_configure_after_id is not None:
+            try:
+                self.win.after_cancel(self._live_configure_after_id)
+            except Exception:
+                pass
+            self._live_configure_after_id = None
 
         self._hide_roi_panel(clear_coords=False)
         self._stop_archive_player()
