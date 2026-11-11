@@ -387,15 +387,18 @@ def rectify_and_enhance(plate_crop):
 
 class PlateTrack:
     """Об'єкт трекінгу номера із захистом від UNKNOWN і збереженням найрізкішого кадру на кожен варіант тексту."""
-    def __init__(self, track_id, bbox, plate_img, frame, text, conf, sharpness):
+    def __init__(self, track_id, bbox, plate_img, frame, text, conf, sharpness, frame_ts=None, seen_ts=None):
         self.track_id = track_id
         self.bbox = bbox
-        self.last_seen = time.time()
-        self.first_seen = self.last_seen
+        s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else s_ts
+        self.last_seen = s_ts
+        self.first_seen = s_ts
         self.saved = False
 
         self.best_plate_img = plate_img
         self.best_frame = frame
+        self.best_frame_ts = ev_ts
         self.best_sharpness = sharpness
         self.best_conf = conf if text != "UNKNOWN" else 0.0
         self.best_text = text
@@ -409,11 +412,13 @@ class PlateTrack:
         self.frames_tracked = 0
         self.best_candidates_by_text = {}
 
-        self.append_record(bbox, plate_img, frame, text, conf, sharpness, initial_score)
+        self.append_record(bbox, plate_img, frame, text, conf, sharpness, initial_score, frame_ts=ev_ts, seen_ts=s_ts)
 
-    def append_record(self, bbox, plate_img, frame, text, conf, sharpness, score):
+    def append_record(self, bbox, plate_img, frame, text, conf, sharpness, score, frame_ts=None, seen_ts=None):
         self.frames_tracked += 1
-        t_rel = round(time.time() - self.first_seen, 3)
+        s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else s_ts
+        t_rel = round(s_ts - self.first_seen, 3)
         self.history_records.append({
             "rel_time": t_rel,
             "text": text,
@@ -430,36 +435,52 @@ class PlateTrack:
                 self.best_candidates_by_text[text] = {
                     "plate_img": plate_img,
                     "frame": frame,
+                    "frame_ts": float(ev_ts),
                     "text": text,
                     "conf": conf,
                     "sharpness": sharpness,
                     "score": score
                 }
 
-    def update(self, bbox, plate_img, frame, text, conf, sharpness):
+    def update(self, bbox, plate_img, frame, text, conf, sharpness, frame_ts=None, seen_ts=None):
+        s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else s_ts
         self.bbox = bbox
-        self.last_seen = time.time()
+        self.last_seen = s_ts
         current_score = evaluate_plate_quality(plate_img, text, conf, sharpness)
 
-        self.append_record(bbox, plate_img, frame, text, conf, sharpness, current_score)
+        self.append_record(bbox, plate_img, frame, text, conf, sharpness, current_score, frame_ts=ev_ts, seen_ts=s_ts)
 
         if current_score > self.best_score and text != "UNKNOWN":
             self.best_score = current_score
             self.best_plate_img = plate_img
             self.best_frame = frame
+            self.best_frame_ts = ev_ts
             self.best_sharpness = sharpness
             self.best_conf = conf
             self.best_text = text
 
-    def get_best_candidate(self, consensus_text=None):
-        """Знаходить абсолютно найчіткіший збережений кадр для узгодженого номера."""
+    def get_best_candidate_info(self, consensus_text=None):
+        """Знаходить абсолютно найчіткіший збережений кадр та його timestamp для узгодженого номера."""
         if not self.best_candidates_by_text:
-            return self.best_plate_img, self.best_frame, self.best_sharpness, self.best_conf
+            return {
+                "plate_img": self.best_plate_img,
+                "frame": self.best_frame,
+                "sharpness": self.best_sharpness,
+                "conf": self.best_conf,
+                "frame_ts": float(getattr(self, "best_frame_ts", 0.0) or 0.0),
+            }
 
         target_text = consensus_text or self.best_text
         if target_text in self.best_candidates_by_text:
             best_item = self.best_candidates_by_text[target_text]
-            return best_item["plate_img"], best_item["frame"], best_item["sharpness"], best_item["conf"]
+            return {
+                "plate_img": best_item["plate_img"],
+                "frame": best_item["frame"],
+                "sharpness": best_item["sharpness"],
+                "conf": best_item["conf"],
+                "frame_ts": float(best_item.get("frame_ts") or getattr(self, "best_frame_ts", 0.0) or 0.0),
+            }
 
         candidates = list(self.best_candidates_by_text.values())
         matching = [item for item in candidates if are_plates_similar(item["text"], target_text, max_diff=1)]
@@ -467,7 +488,18 @@ class PlateTrack:
             matching = candidates
 
         best_item = max(matching, key=lambda x: x["sharpness"])
-        return best_item["plate_img"], best_item["frame"], best_item["sharpness"], best_item["conf"]
+        return {
+            "plate_img": best_item["plate_img"],
+            "frame": best_item["frame"],
+            "sharpness": best_item["sharpness"],
+            "conf": best_item["conf"],
+            "frame_ts": float(best_item.get("frame_ts") or getattr(self, "best_frame_ts", 0.0) or 0.0),
+        }
+
+    def get_best_candidate(self, consensus_text=None):
+        """Знаходить абсолютно найчіткіший збережений кадр для узгодженого номера."""
+        info = self.get_best_candidate_info(consensus_text=consensus_text)
+        return info["plate_img"], info["frame"], info["sharpness"], info["conf"]
 
     def get_consensus_text_and_conf(self):
         """Визначення найбільш ймовірного номера методом Majority Voting."""
@@ -1640,9 +1672,10 @@ class PlateEngine:
             return plate_str, plate_conf
         return "UNKNOWN", 0.0
 
-    def _update_tracks_from_detections(self, frame, current_detections, now: float = None):
+    def _update_tracks_from_detections(self, frame, current_detections, now: float = None, frame_ts: float = None):
         if now is None:
             now = time.time()
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else float(now)
         unmatched_detections = list(range(len(current_detections)))
 
         with self._state_lock:
@@ -1667,7 +1700,9 @@ class PlateEngine:
                         frame,
                         det["text"],
                         det["conf"],
-                        det["sharpness"]
+                        det["sharpness"],
+                        frame_ts=ev_ts,
+                        seen_ts=now,
                     )
                     unmatched_detections.remove(best_match_idx)
 
@@ -1692,7 +1727,9 @@ class PlateEngine:
                     frame=frame,
                     text=det["text"],
                     conf=det["conf"],
-                    sharpness=det["sharpness"]
+                    sharpness=det["sharpness"],
+                    frame_ts=ev_ts,
+                    seen_ts=now,
                 )
 
             for t_id, track in list(self.active_tracks.items()):
@@ -1721,7 +1758,7 @@ class PlateEngine:
 
         return display_boxes, overlay_info
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, frame_ts: float = None):
         """Обробка кадру з детекцією, OCR, трекінгом та поверненням даних для оверлею."""
         if frame is None or frame.size == 0:
             return [], None
@@ -1753,7 +1790,7 @@ class PlateEngine:
                     "sharpness": cand["sharpness"],
                 })
 
-        return self._update_tracks_from_detections(frame, current_detections)
+        return self._update_tracks_from_detections(frame, current_detections, frame_ts=frame_ts)
 
     def flush_tracks(self):
         """Примусове збереження всіх активних незавершених треків."""
@@ -1772,7 +1809,11 @@ class PlateEngine:
         if text == "UNKNOWN" or len(text) < 4:
             return
 
-        best_plate_img, best_frame, best_sharpness, best_conf = track.get_best_candidate(text)
+        cand_info = track.get_best_candidate_info(text)
+        best_plate_img = cand_info["plate_img"]
+        best_frame = cand_info["frame"]
+        best_sharpness = cand_info["sharpness"]
+        best_conf = cand_info["conf"]
         if best_plate_img is None:
             return
 
@@ -1798,10 +1839,13 @@ class PlateEngine:
 
         self.recently_saved_plates[text] = now
 
-        now_dt = datetime.now()
-        day_folder = now_dt.strftime("%Y-%m-%d")
-        time_prefix = now_dt.strftime("%H-%M-%S") + f"-{int(now_dt.microsecond / 1000):03d}"
-        time_display = now_dt.strftime("%H:%M:%S")
+        event_ts = float(cand_info.get("frame_ts") or getattr(track, "best_frame_ts", 0.0) or 0.0)
+        if event_ts <= 0.0:
+            event_ts = now
+        ev_dt = datetime.fromtimestamp(event_ts)
+        day_folder = ev_dt.strftime("%Y-%m-%d")
+        time_prefix = ev_dt.strftime("%H-%M-%S") + f"-{int(ev_dt.microsecond / 1000):03d}"
+        time_display = ev_dt.strftime("%H:%M:%S")
 
         os.makedirs(self.plates_dir, exist_ok=True)
         day_dir = os.path.join(self.plates_dir, day_folder)
@@ -1810,10 +1854,17 @@ class PlateEngine:
         safe_plate = sanitize_filename_part(text, fallback="PLATE")
         base_name = f"{time_prefix}_plate_{safe_plate}_{conf_pct}%"
         plate_filename = f"{base_name}.jpg"
+        plate_path = os.path.join(day_dir, plate_filename)
+        if os.path.exists(plate_path):
+            c_idx = 2
+            while os.path.exists(os.path.join(day_dir, f"{base_name}_fix{c_idx}.jpg")):
+                c_idx += 1
+            base_name = f"{base_name}_fix{c_idx}"
+            plate_filename = f"{base_name}.jpg"
+            plate_path = os.path.join(day_dir, plate_filename)
         full_filename = f"{time_prefix}_full.jpg"
         debug_filename = f"{base_name}_debug.txt"
 
-        plate_path = os.path.join(day_dir, plate_filename)
         full_path = os.path.join(day_dir, full_filename)
         debug_path = os.path.join(day_dir, debug_filename)
 
@@ -1980,8 +2031,9 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
     engine.update_config(cfg_copy)
 
 
-def _process_and_pack(engine, frame, prev_state=None):
-    boxes, overlay_info = engine.process_frame(frame)
+def _process_and_pack(engine, frame, prev_state=None, meta=None):
+    frame_ts = meta.get("frame_ts") if isinstance(meta, dict) else None
+    boxes, overlay_info = engine.process_frame(frame, frame_ts=frame_ts)
     state = dict(prev_state or {})
     state["boxes"] = boxes
     if overlay_info is not None:
@@ -2069,7 +2121,14 @@ def _process_batch_and_pack(items: list, shared_resources=None) -> list:
         for local_i, idx in enumerate(idxs):
             it = items[idx]
             eng = it["engine"]
-            boxes, overlay_info = eng._update_tracks_from_detections(frames_g[local_i], per_item_dets[local_i], now=now)
+            meta = it.get("meta") if isinstance(it.get("meta"), dict) else {}
+            frame_ts = meta.get("frame_ts")
+            boxes, overlay_info = eng._update_tracks_from_detections(
+                frames_g[local_i],
+                per_item_dets[local_i],
+                now=now,
+                frame_ts=frame_ts,
+            )
             state = dict(it.get("prev_state") or {})
             state["boxes"] = boxes
             if overlay_info is not None:

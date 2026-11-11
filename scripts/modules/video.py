@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import time
+import json
+import math
 import shutil
 import importlib
 import threading
@@ -55,6 +57,40 @@ STREAM_PREFIXES = ("rtsp://", "rtsps://", "http://", "https://", "rtmp://", "udp
 
 _CAP_LOCK = threading.Lock()
 _CACHED_FFMPEG_ENCODERS = None
+
+
+def _video_meta_path(video_path: str) -> str:
+    return f"{os.path.splitext(str(video_path or ''))[0]}.json"
+
+
+def _read_video_meta(video_path: str) -> dict:
+    mpath = _video_meta_path(video_path)
+    if not mpath or not os.path.exists(mpath):
+        return {}
+    try:
+        with open(mpath, "r", encoding="utf-8") as mf:
+            data = json.load(mf)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_video_meta(video_path: str, payload: dict):
+    if not video_path or not isinstance(payload, dict):
+        return
+    mpath = _video_meta_path(video_path)
+    tmp = f"{mpath}.tmp"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(mpath)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="\n") as mf:
+            json.dump(payload, mf, ensure_ascii=False, indent=2)
+        os.replace(tmp, mpath)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 def _creation_flags():
@@ -299,6 +335,7 @@ class VideoEngine:
         self.current_time_display = ""
 
         self._active_encoder_label = ""
+        self._active_seg_meta = None
         self._hw_fallback_triggered = False
         self._copy_restart_requested = False
 
@@ -423,16 +460,17 @@ class VideoEngine:
             if allow_write:
                 self.start()
 
-    def push_frame(self, clean_frame: np.ndarray, allowed: bool = True):
+    def push_frame(self, clean_frame: np.ndarray, allowed: bool = True, frame_ts: float = None):
         """Передача чистого кадру (без рамок детекції) у буфер запису."""
         if clean_frame is None:
             return
+        ts_val = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else time.time()
         with self.lock:
             eff_allowed = bool(allowed) and bool(self.allow_disk_write)
             self.recording_allowed = eff_allowed
             if eff_allowed and not self.is_direct_copy_active():
                 self.latest_frame = clean_frame
-                self.latest_frame_ts = time.time()
+                self.latest_frame_ts = ts_val
 
     def set_allowed(self, allowed: bool):
         """Оновлення дозволу запису (наприклад, за межами дат або пауза)."""
@@ -469,13 +507,15 @@ class VideoEngine:
                 continue
             self._finalize_copied_segment(src)
 
-    def _finalize_copied_segment(self, src_path: str):
+    def _finalize_copied_segment(self, src_path: str, close_ts: float = None, prev_close_ts: float = None):
         if not self.allow_disk_write:
             return
         if not src_path or not os.path.exists(src_path):
             return
         try:
-            size_bytes = os.path.getsize(src_path)
+            st_src = os.stat(src_path)
+            size_bytes = st_src.st_size
+            ctime_ts = float(getattr(st_src, "st_ctime", 0.0) or 0.0)
         except Exception:
             return
         if size_bytes < 1024:
@@ -507,6 +547,38 @@ class VideoEngine:
         except Exception as e:
             print(f"[VideoEngine Copy Move Error]: {e}")
             return
+
+        try:
+            st_dest = os.stat(dest_path)
+            m_bits = time_prefix.split("_")[0].split("-")
+            if len(m_bits) >= 3:
+                fn_ts = float(datetime.strptime(f"{day_folder} {m_bits[0]}:{m_bits[1]}:{m_bits[2]}", "%Y-%m-%d %H:%M:%S").timestamp())
+            else:
+                fn_ts = float(ctime_ts or st_dest.st_mtime)
+            dur_sec, fps_val = _probe_video_info(dest_path, st_dest.st_size, st_dest.st_mtime_ns, fn_ts, float(st_dest.st_mtime))
+            start_ts = fn_ts
+            cands = []
+            if close_ts is not None and dur_sec > 0.1:
+                cands.append(float(close_ts) - float(dur_sec))
+            if prev_close_ts is not None:
+                cands.append(float(prev_close_ts))
+            if ctime_ts > 0.0:
+                cands.append(float(ctime_ts))
+            for cand in cands:
+                if (fn_ts - 0.5) <= cand <= (fn_ts + 3.0):
+                    start_ts = float(cand)
+                    break
+            meta_payload = {
+                "start_ts": float(start_ts),
+                "end_ts": float(start_ts + dur_sec) if dur_sec > 0 else float(close_ts or fn_ts),
+                "duration_sec": float(dur_sec),
+                "fps": float(fps_val),
+                "codec": "copy",
+                "finalized": True,
+            }
+            _write_video_meta(dest_path, meta_payload)
+        except Exception:
+            pass
 
         time_display = time_prefix.replace("-", ":")
         print(f"[ВІДЕОЗАПИС COPY ЗБЕРЕЖЕНО] {dest_path}")
@@ -586,16 +658,19 @@ class VideoEngine:
                 start_ts = time.time()
 
                 def _read_stdout():
+                    prev_close = None
                     try:
                         for line in proc.stdout:
                             clean_line = line.strip()
                             if clean_line:
+                                close_now = time.time()
                                 seg_path = (
                                     clean_line
                                     if os.path.isabs(clean_line)
                                     else os.path.join(self._staging_dir, clean_line)
                                 )
-                                self._finalize_copied_segment(seg_path)
+                                self._finalize_copied_segment(seg_path, close_ts=close_now, prev_close_ts=prev_close)
+                                prev_close = close_now
                     except Exception:
                         pass
 
@@ -840,18 +915,22 @@ class VideoEngine:
         print(f"[ВІДЕОЗАПИС СТАРТ] {out_path} ({res_info} @ {self.fps:g} fps, {used_label})")
         return True
 
-    def _close_segment_async(self, block: bool = False):
+    def _close_segment_async(self, block: bool = False, meta_info: dict = None):
         proc = self.ffmpeg_proc
         writer = self.cv_writer
         fpath = self.active_filepath
         day_folder = self.current_day_folder
         time_display = self.current_time_display
+        seg_start_fallback = float(self.segment_start_ts or 0.0)
+        default_fps = float(self.fps or 15.0)
 
         self.ffmpeg_proc = None
         self.cv_writer = None
         with self.lock:
             self.active_filepath = None
             self._active_encoder_label = ""
+            meta_snap = dict(meta_info or self._active_seg_meta or {})
+            self._active_seg_meta = None
             if fpath:
                 self.finalizing_paths.add(os.path.normpath(fpath))
 
@@ -881,6 +960,37 @@ class VideoEngine:
                         pass
             finally:
                 if fpath:
+                    try:
+                        if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+                            st_fin = os.stat(fpath)
+                            start_ts_fin = float(meta_snap.get("start_ts") or seg_start_fallback or st_fin.st_mtime)
+                            fps_hint = float(meta_snap.get("fps") or default_fps or 15.0)
+                            frames_meta = int(meta_snap.get("frames") or 0)
+                            probed_dur, probed_fps = _probe_video_info(
+                                fpath,
+                                st_fin.st_size,
+                                st_fin.st_mtime_ns,
+                                start_ts_fin,
+                                float(st_fin.st_mtime),
+                            )
+                            final_fps = float(probed_fps) if probed_fps > 0.1 else fps_hint
+                            if probed_dur > 0.1:
+                                final_dur = float(probed_dur)
+                            elif frames_meta > 0 and final_fps > 0.1:
+                                final_dur = float(frames_meta) / float(final_fps)
+                            else:
+                                final_dur = max(0.5, float(st_fin.st_mtime) - start_ts_fin)
+                            _write_video_meta(fpath, {
+                                "start_ts": float(start_ts_fin),
+                                "end_ts": float(start_ts_fin + final_dur),
+                                "duration_sec": float(final_dur),
+                                "fps": float(final_fps),
+                                "frames": int(frames_meta),
+                                "codec": str(meta_snap.get("codec") or ""),
+                                "finalized": True,
+                            })
+                    except Exception:
+                        pass
                     norm = os.path.normpath(fpath)
                     with self.lock:
                         self.finalizing_paths.discard(norm)
@@ -902,8 +1012,16 @@ class VideoEngine:
             t.start()
 
     def _writer_loop(self):
-        interval = 1.0 / max(1.0, self.fps)
-        next_tick = time.perf_counter()
+        seg_fps = max(1.0, float(self.fps))
+        interval = 1.0 / seg_fps
+        seg_perf0 = time.perf_counter()
+        seg_frames_written = 0
+        last_src_frame = None
+        last_out_buf = None
+        last_cv_frame = None
+        prev_out_buf = None
+        prev_cv_frame = None
+        seg_meta_cur = None
 
         try:
             while True:
@@ -920,16 +1038,23 @@ class VideoEngine:
                     break
 
                 if self.is_direct_copy_active():
-                    self._close_segment_async(block=True)
+                    self._close_segment_async(block=True, meta_info=dict(seg_meta_cur) if seg_meta_cur else None)
+                    seg_meta_cur = None
                     self._direct_copy_loop()
                     return
 
                 now_wall = time.time()
                 if not allowed or frame is None or (now_wall - frame_ts) > 3.0:
                     if self.ffmpeg_proc is not None or self.cv_writer is not None:
-                        self._close_segment_async(block=False)
+                        self._close_segment_async(block=False, meta_info=dict(seg_meta_cur) if seg_meta_cur else None)
+                    seg_meta_cur = None
+                    seg_frames_written = 0
+                    last_src_frame = None
+                    last_out_buf = None
+                    last_cv_frame = None
+                    prev_out_buf = None
+                    prev_cv_frame = None
                     time.sleep(0.1)
-                    next_tick = time.perf_counter()
                     continue
 
                 fh, fw = frame.shape[:2]
@@ -937,36 +1062,92 @@ class VideoEngine:
                 even_h = fh - (fh % 2)
                 today_str = datetime.now().strftime("%Y-%m-%d")
 
+                dur_by_frames = (seg_frames_written / seg_fps) if seg_frames_written > 0 else 0.0
                 need_rotate = (
                     restart_req
                     or (self.ffmpeg_proc is None and self.cv_writer is None)
                     or (even_w != self.segment_w or even_h != self.segment_h)
-                    or ((now_wall - self.segment_start_ts) >= self.segment_duration_sec)
+                    or (dur_by_frames >= self.segment_duration_sec)
+                    or ((now_wall - self.segment_start_ts) >= (self.segment_duration_sec + 2.0))
                     or (today_str != self.current_day_folder)
                 )
 
                 if need_rotate:
                     if self.ffmpeg_proc is not None or self.cv_writer is not None:
-                        self._close_segment_async(block=False)
-                    interval = 1.0 / max(1.0, self.fps)
+                        self._close_segment_async(block=False, meta_info=dict(seg_meta_cur) if seg_meta_cur else None)
+                    seg_meta_cur = None
                     if not self._open_segment(fw, fh):
                         time.sleep(0.5)
-                        next_tick = time.perf_counter()
                         continue
+                    with self.lock:
+                        fresh_fr = self.latest_frame
+                        fresh_ts = self.latest_frame_ts
+                    if fresh_fr is not None:
+                        fh2, fw2 = fresh_fr.shape[:2]
+                        if (fw2 - (fw2 % 2), fh2 - (fh2 % 2)) == (self.segment_w, self.segment_h):
+                            frame = fresh_fr
+                            frame_ts = fresh_ts
+                    now_wall = time.time()
+                    seg_wall0 = (
+                        float(frame_ts)
+                        if (frame_ts and 0.0 <= (now_wall - float(frame_ts)) <= 0.5)
+                        else now_wall
+                    )
+                    age0 = max(0.0, min(0.5, now_wall - seg_wall0))
+                    seg_perf0 = time.perf_counter() - age0
+                    seg_frames_written = 0
+                    last_src_frame = None
+                    last_out_buf = None
+                    last_cv_frame = None
+                    prev_out_buf = None
+                    prev_cv_frame = None
+                    self.segment_start_ts = seg_wall0
+                    seg_fps = max(1.0, float(self.fps))
+                    interval = 1.0 / seg_fps
+                    seg_meta_cur = {
+                        "start_ts": float(seg_wall0),
+                        "fps": float(seg_fps),
+                        "frames": 0,
+                        "codec": self._active_encoder_label,
+                        "finalized": False,
+                    }
+                    with self.lock:
+                        self._active_seg_meta = seg_meta_cur
+                    _write_video_meta(self.active_filepath, dict(seg_meta_cur))
 
-                frame_to_write = frame[:self.segment_h, :self.segment_w]
+                elapsed = max(0.0, time.perf_counter() - seg_perf0)
+                target_frames_now = 1 + int(elapsed * seg_fps)
+                need_n = max(1, target_frames_now - seg_frames_written)
+                stall_limit = max(15, int(round(seg_fps * 15.0)))
+                if need_n > stall_limit:
+                    seg_perf0 = time.perf_counter() - (seg_frames_written * interval)
+                    write_n = 1
+                else:
+                    write_n = min(need_n, max(2, int(round(seg_fps * 2.0))))
 
                 write_ok = True
                 if self.ffmpeg_proc is not None:
                     try:
-                        out_frame = frame_to_write
-                        if cv2 is not None and (self.output_w, self.output_h) != (self.segment_w, self.segment_h):
-                            out_frame = cv2.resize(frame_to_write, (self.output_w, self.output_h), interpolation=cv2.INTER_AREA)
-                        buf = np.ascontiguousarray(out_frame)
+                        if frame is not last_src_frame or last_out_buf is None:
+                            frame_to_write = frame[:self.segment_h, :self.segment_w]
+                            out_frame = frame_to_write
+                            if cv2 is not None and (self.output_w, self.output_h) != (self.segment_w, self.segment_h):
+                                out_frame = cv2.resize(frame_to_write, (self.output_w, self.output_h), interpolation=cv2.INTER_AREA)
+                            last_out_buf = np.ascontiguousarray(out_frame)
+                            last_src_frame = frame
+                        dup_buf = prev_out_buf if prev_out_buf is not None else last_out_buf
+                        mv_dup = memoryview(dup_buf) if write_n > 1 else None
+                        mv_cur = memoryview(last_out_buf)
+                        for _ in range(write_n - 1):
+                            try:
+                                self.ffmpeg_proc.stdin.write(mv_dup)
+                            except TypeError:
+                                self.ffmpeg_proc.stdin.write(dup_buf.tobytes())
                         try:
-                            self.ffmpeg_proc.stdin.write(memoryview(buf))
+                            self.ffmpeg_proc.stdin.write(mv_cur)
                         except TypeError:
-                            self.ffmpeg_proc.stdin.write(buf.tobytes())
+                            self.ffmpeg_proc.stdin.write(last_out_buf.tobytes())
+                        prev_out_buf = last_out_buf
                     except Exception as e:
                         print(f"[VideoEngine Write Error]: {e}")
                         if self._active_encoder_label != "libx264":
@@ -974,25 +1155,44 @@ class VideoEngine:
                         write_ok = False
                 elif self.cv_writer is not None and cv2 is not None:
                     try:
-                        out_frame = frame_to_write
-                        if (self.output_w, self.output_h) != (self.segment_w, self.segment_h):
-                            out_frame = cv2.resize(frame_to_write, (self.output_w, self.output_h), interpolation=cv2.INTER_AREA)
-                        self.cv_writer.write(out_frame)
+                        if frame is not last_src_frame or last_cv_frame is None:
+                            frame_to_write = frame[:self.segment_h, :self.segment_w]
+                            out_frame = frame_to_write
+                            if (self.output_w, self.output_h) != (self.segment_w, self.segment_h):
+                                out_frame = cv2.resize(frame_to_write, (self.output_w, self.output_h), interpolation=cv2.INTER_AREA)
+                            last_cv_frame = out_frame
+                            last_src_frame = frame
+                        dup_fr = prev_cv_frame if prev_cv_frame is not None else last_cv_frame
+                        for _ in range(write_n - 1):
+                            self.cv_writer.write(dup_fr)
+                        self.cv_writer.write(last_cv_frame)
+                        prev_cv_frame = last_cv_frame
                     except Exception as e:
                         print(f"[VideoEngine OpenCV Write Error]: {e}")
                         write_ok = False
+                else:
+                    write_ok = False
 
-                if not write_ok:
-                    self._close_segment_async(block=False)
+                if write_ok:
+                    seg_frames_written += write_n
+                    if seg_meta_cur is not None:
+                        seg_meta_cur["frames"] = int(seg_frames_written)
+                else:
+                    self._close_segment_async(block=False, meta_info=dict(seg_meta_cur) if seg_meta_cur else None)
+                    seg_meta_cur = None
+                    seg_frames_written = 0
+                    last_src_frame = None
+                    last_out_buf = None
+                    last_cv_frame = None
+                    prev_out_buf = None
+                    prev_cv_frame = None
 
-                next_tick += interval
+                next_tick = seg_perf0 + (seg_frames_written * interval)
                 sleep_dur = next_tick - time.perf_counter()
                 if sleep_dur > 0:
-                    time.sleep(sleep_dur)
-                elif sleep_dur < -interval * 3:
-                    next_tick = time.perf_counter()
+                    time.sleep(min(0.25, sleep_dur))
         finally:
-            self._close_segment_async(block=True)
+            self._close_segment_async(block=True, meta_info=dict(seg_meta_cur) if seg_meta_cur else None)
 
 
 # ------------------------------------------------------------------
@@ -1034,10 +1234,10 @@ def _parse_archive_record(fpath: str, base_name: str, root_dir: str, rel_dir: st
 _DAY_FOLDER_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SEG_TIME_RE = re.compile(r"^(\d{2})-(\d{2})-(\d{2})")
 _VIDEO_DUR_LOCK = threading.Lock()
-_VIDEO_DUR_CACHE = {}  # (fpath, size_bytes, mtime_ns) -> float duration_sec
+_VIDEO_DUR_CACHE = {}  # (fpath, size_bytes, mtime_ns) -> (duration_sec, fps)
 
 
-def _probe_video_duration_sec(fpath: str, size_bytes: int, mtime_ns: int, start_ts: float, mtime_sec: float) -> float:
+def _probe_video_info(fpath: str, size_bytes: int, mtime_ns: int, start_ts: float, mtime_sec: float) -> tuple:
     key = (os.path.normpath(fpath), int(size_bytes), int(mtime_ns))
     with _VIDEO_DUR_LOCK:
         cached = _VIDEO_DUR_CACHE.get(key)
@@ -1045,6 +1245,7 @@ def _probe_video_duration_sec(fpath: str, size_bytes: int, mtime_ns: int, start_
         return cached
 
     dur = None
+    fps_out = 0.0
     if cv2 is not None and size_bytes > 0:
         cap = None
         try:
@@ -1063,8 +1264,10 @@ def _probe_video_duration_sec(fpath: str, size_bytes: int, mtime_ns: int, start_
             if cap is not None and cap.isOpened():
                 fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
                 cnt = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
-                if 0.1 < fps <= 240.0 and cnt > 0.0:
-                    dur = cnt / fps
+                if not math.isnan(fps) and 0.1 < fps <= 240.0:
+                    fps_out = fps
+                    if not math.isnan(cnt) and cnt > 0.0:
+                        dur = cnt / fps
         except Exception:
             dur = None
         finally:
@@ -1074,23 +1277,27 @@ def _probe_video_duration_sec(fpath: str, size_bytes: int, mtime_ns: int, start_
                 except Exception:
                     pass
 
-    if dur is None or dur <= 0.0 or np.isnan(dur):
+    if dur is None or dur <= 0.0 or math.isnan(dur):
         diff = mtime_sec - start_ts
-        dur = diff if (1.0 <= diff <= 14400.0) else 300.0
+        dur = diff if (0.5 <= diff <= 14400.0) else 300.0
 
-    dur = max(0.5, float(dur))
+    res = (max(0.5, float(dur)), float(fps_out))
     with _VIDEO_DUR_LOCK:
         if len(_VIDEO_DUR_CACHE) > 2048:
             _VIDEO_DUR_CACHE.clear()
-        _VIDEO_DUR_CACHE[key] = dur
-    return dur
+        _VIDEO_DUR_CACHE[key] = res
+    return res
+
+
+def _probe_video_duration_sec(fpath: str, size_bytes: int, mtime_ns: int, start_ts: float, mtime_sec: float) -> float:
+    return _probe_video_info(fpath, size_bytes, mtime_ns, start_ts, mtime_sec)[0]
 
 
 def list_video_segments(cam_archive_dir: str, target_timestamps=None, margin_sec: float = 2.0) -> list:
     """
     Повертає список відеофрагментів камери з точним часом початку/кінця (start_ts, end_ts).
-    Якщо передано target_timestamps, ефективно фільтрує й детально аналізує лише сегменти,
-    які перетинають хоча б одну з вказаних міток часу.
+    Використовує <stem>.json sidecar при наявності та віддає пріоритет строгому
+    потраплянню [start_ts, end_ts] над дотичними ±margin_sec сусідами.
     """
     video_root = os.path.join(str(cam_archive_dir or ""), "video")
     if not video_root or not os.path.isdir(video_root):
@@ -1100,7 +1307,7 @@ def list_video_segments(cam_archive_dir: str, target_timestamps=None, margin_sec
     if ts_list is not None and not ts_list:
         return []
 
-    out = []
+    candidates = []
     for root_dir, _, files in os.walk(video_root):
         if "_staging" in root_dir:
             continue
@@ -1136,19 +1343,38 @@ def list_video_segments(cam_archive_dir: str, target_timestamps=None, margin_sec
 
             if ts_list is not None:
                 coarse_end = mtime_sec if mtime_sec > (start_ts + 1.0) else (start_ts + 1800.0)
-                if not any((start_ts - margin_sec) <= t <= (coarse_end + margin_sec + 5.0) for t in ts_list):
+                if not any((start_ts - margin_sec - 3.0) <= t <= (coarse_end + margin_sec + 5.0) for t in ts_list):
                     continue
 
-            dur_sec = _probe_video_duration_sec(fpath, st.st_size, st.st_mtime_ns, start_ts, mtime_sec)
+            meta = _read_video_meta(fpath)
+            meta_start = meta.get("start_ts")
+            if isinstance(meta_start, (int, float)) and not math.isnan(float(meta_start)) and float(meta_start) > 0:
+                start_ts = float(meta_start)
+
+            meta_dur = meta.get("duration_sec")
+            meta_fps = meta.get("fps")
+            if (
+                meta.get("finalized") is True
+                and isinstance(meta_dur, (int, float))
+                and not math.isnan(float(meta_dur))
+                and float(meta_dur) > 0.1
+                and isinstance(meta_fps, (int, float))
+                and not math.isnan(float(meta_fps))
+                and float(meta_fps) > 0.1
+            ):
+                dur_sec = float(meta_dur)
+                fps_val = float(meta_fps)
+            else:
+                dur_sec, fps_val = _probe_video_info(fpath, st.st_size, st.st_mtime_ns, start_ts, mtime_sec)
+                if fps_val <= 0.1 and isinstance(meta_fps, (int, float)) and not math.isnan(float(meta_fps)) and float(meta_fps) > 0.1:
+                    fps_val = float(meta_fps)
             end_ts = start_ts + dur_sec
 
-            hits = []
             if ts_list is not None:
-                hits = sorted(t for t in ts_list if (start_ts - margin_sec) <= t <= (end_ts + margin_sec))
-                if not hits:
+                if not any((start_ts - margin_sec) <= t <= (end_ts + margin_sec) for t in ts_list):
                     continue
 
-            out.append({
+            candidates.append({
                 "path": fpath,
                 "filename": fname,
                 "day": day_str,
@@ -1156,9 +1382,31 @@ def list_video_segments(cam_archive_dir: str, target_timestamps=None, margin_sec
                 "start_ts": float(start_ts),
                 "end_ts": float(end_ts),
                 "duration_sec": float(dur_sec),
+                "fps": float(fps_val),
                 "size_mb": round(st.st_size / (1024.0 * 1024.0), 2),
-                "hit_timestamps": hits,
+                "hit_timestamps": [],
             })
+
+    if ts_list is None:
+        out = candidates
+    else:
+        for t in sorted(ts_list):
+            strict_segs = [s for s in candidates if s["start_ts"] <= t <= s["end_ts"]]
+            if strict_segs:
+                for s in strict_segs:
+                    s["hit_timestamps"].append(t)
+            else:
+                near_segs = [s for s in candidates if (s["start_ts"] - margin_sec) <= t <= (s["end_ts"] + margin_sec)]
+                if near_segs:
+                    best_s = min(
+                        near_segs,
+                        key=lambda s: (
+                            min(abs(t - s["start_ts"]), abs(t - s["end_ts"])),
+                            abs(t - (s["start_ts"] + s["end_ts"]) * 0.5),
+                        ),
+                    )
+                    best_s["hit_timestamps"].append(t)
+        out = [s for s in candidates if s["hit_timestamps"]]
 
     out.sort(key=lambda s: (s["start_ts"], s["filename"]))
     return out
@@ -1324,7 +1572,7 @@ MODULE_SPEC = {
     "stop_engine": lambda eng, wait=True: eng.stop(wait=wait) if eng is not None else None,
     "restart_if_mode_changed": lambda eng: eng.restart_if_mode_changed() if eng is not None else None,
     "set_allowed": lambda eng, allowed: eng.set_allowed(allowed) if eng is not None else None,
-    "push_frame": lambda eng, frame, allowed=True: eng.push_frame(frame, allowed=allowed) if eng is not None else None,
+    "push_frame": lambda eng, frame, allowed=True, frame_ts=None: eng.push_frame(frame, allowed=allowed, frame_ts=frame_ts) if eng is not None else None,
     "needs_decoded_frames": lambda eng, cfg, src: not (eng is not None and eng.is_direct_copy_active()),
     "is_recording": lambda eng: bool(eng is not None and eng.is_currently_recording()),
     "get_active_encoder_label": lambda eng: eng.get_active_encoder_label() if eng is not None else "",

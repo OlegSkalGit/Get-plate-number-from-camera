@@ -19,6 +19,9 @@ from scripts.ui.helpers import (
     clamp_window_geometry,
     get_current_monitor_geometry,
     ensure_clam_theme,
+    update_scale_range_and_value,
+    open_video_capture_for_playback,
+    seek_video_capture,
 )
 
 EVT_MOTION = "<Motion>"
@@ -2089,10 +2092,8 @@ class CameraDetailWindow:
         self.roi_time_lbl.configure(text=time_str)
         self.arch_updating_slider = True
         try:
-            self.arch_slider.configure(to=max(1, total - 1))
-            self.arch_slider_var.set(curr)
-            self.roi_slider.configure(to=max(1, total - 1))
-            self.roi_slider_var.set(curr)
+            update_scale_range_and_value(self.arch_slider, self.arch_slider_var, curr, max(1, total - 1))
+            update_scale_range_and_value(self.roi_slider, self.roi_slider_var, curr, max(1, total - 1))
         finally:
             self.arch_updating_slider = False
 
@@ -2125,8 +2126,8 @@ class CameraDetailWindow:
         self.roi_time_lbl.configure(text="00:00/00:00")
         self.arch_updating_slider = True
         try:
-            self.arch_slider_var.set(0)
-            self.roi_slider_var.set(0)
+            update_scale_range_and_value(self.arch_slider, self.arch_slider_var, 0, 1)
+            update_scale_range_and_value(self.roi_slider, self.roi_slider_var, 0, 1)
         finally:
             self.arch_updating_slider = False
         self._sync_roi_controls_visibility()
@@ -2151,30 +2152,13 @@ class CameraDetailWindow:
                 self._render_current_roi_view()
             return
 
-        cap = None
-        if hasattr(cv2, "CAP_PROP_N_THREADS") and hasattr(cv2, "CAP_FFMPEG"):
-            try:
-                cap = cv2.VideoCapture(fpath, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 2])
-            except Exception:
-                cap = None
-        if cap is None or not cap.isOpened():
-            if cap is not None:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-            cap = cv2.VideoCapture(fpath)
-        if not cap.isOpened():
+        cap, fps, total_frames = open_video_capture_for_playback(cv2, fpath)
+        if cap is None:
             self._set_screen_canvas_placeholder_key("ui.detail.ph.video_open_err", "[Failed to open video]", color="#ff5555")
             if self.roi_visible or self.roi_panel.winfo_ismapped():
                 self._sync_roi_controls_visibility()
                 self._render_current_roi_view()
             return
-
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 15.0)
-        if fps <= 0 or fps > 120 or np.isnan(fps):
-            fps = 15.0
-        total_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
 
         self.arch_cap = cap
         self.arch_fpath = fpath
@@ -2182,8 +2166,16 @@ class CameraDetailWindow:
         self.arch_total_frames = total_frames
         self.arch_curr_frame_idx = 0
 
-        ret, frame = cap.read()
+        ret, frame, landed_idx, updated_tot = seek_video_capture(
+            cap,
+            cv2,
+            fps,
+            total_frames,
+            target_frame=0,
+        )
         if ret and frame is not None:
+            self.arch_curr_frame_idx = landed_idx
+            self.arch_total_frames = updated_tot
             keep = bool(self.current_roi_coords is not None and (self.roi_visible or self.roi_panel.winfo_ismapped()))
             self._display_cv_in_screen_canvas(frame, keep_roi=keep)
         else:
@@ -2234,7 +2226,11 @@ class CameraDetailWindow:
             self._update_arch_play_buttons()
             return
 
-        self.arch_curr_frame_idx += 1
+        pos_f = float(self.arch_cap.get(cv2.CAP_PROP_POS_FRAMES) or 0.0) if cv2 is not None else 0.0
+        if pos_f >= 1.0:
+            self.arch_curr_frame_idx = max(0, int(round(pos_f)) - 1)
+        else:
+            self.arch_curr_frame_idx += 1
         if self.arch_curr_frame_idx >= self.arch_total_frames:
             self.arch_total_frames = self.arch_curr_frame_idx + 1
 
@@ -2270,11 +2266,16 @@ class CameraDetailWindow:
     def _seek_archive_video(self, frame_idx: int):
         if self.arch_cap is None or cv2 is None:
             return
-        target = max(0, min(max(0, self.arch_total_frames - 1), int(frame_idx)))
-        self.arch_cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-        ret, frame = self.arch_cap.read()
+        ret, frame, landed_idx, updated_tot = seek_video_capture(
+            self.arch_cap,
+            cv2,
+            self.arch_fps,
+            self.arch_total_frames,
+            target_frame=int(frame_idx),
+        )
         if ret and frame is not None:
-            self.arch_curr_frame_idx = target
+            self.arch_total_frames = updated_tot
+            self.arch_curr_frame_idx = landed_idx
             self._display_cv_in_screen_canvas(frame, keep_roi=True)
             self._update_arch_time_ui()
 

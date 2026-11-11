@@ -10,7 +10,15 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
 from scripts.core.i18n import tr
-from scripts.ui.helpers import WindowGeometryTracker, ScrollableFrame, ensure_clam_theme
+from scripts.ui.helpers import (
+    WindowGeometryTracker,
+    ScrollableFrame,
+    ensure_clam_theme,
+    update_scale_range_and_value,
+    select_best_video_segment_for_event,
+    open_video_capture_for_playback,
+    seek_video_capture,
+)
 
 try:
     import cv2
@@ -590,6 +598,8 @@ class PeopleWindow:
         self._vid_after_id = None
         self._vid_updating_slider = False
         self._vid_photo_tk = None
+        self._vid_last_frame_bgr = None
+        self._vid_last_render_size = None
 
         # Змінні фільтрів
         self.search_var = tk.StringVar()
@@ -1204,11 +1214,13 @@ class PeopleWindow:
             for seg in (segs or []):
                 fpath = seg["path"]
                 is_busy = bool(unit and unit.is_archive_file_busy("video", fpath))
+                seg_fps = float(seg.get("fps") or 0.0)
+                end_pad = min(0.25, 0.5 / seg_fps) if seg_fps > 0.1 else 0.05
                 hits = []
                 for h_ts in (seg.get("hit_timestamps") or []):
                     rel_sec = max(0.0, float(h_ts) - float(seg["start_ts"]))
                     if seg.get("duration_sec"):
-                        rel_sec = min(rel_sec, max(0.0, float(seg["duration_sec"]) - 0.5))
+                        rel_sec = min(rel_sec, max(0.0, float(seg["duration_sec"]) - end_pad))
                     hits.append({
                         "event_ts": float(h_ts),
                         "seek_sec": rel_sec,
@@ -1227,6 +1239,7 @@ class PeopleWindow:
                     "start_ts": float(seg["start_ts"]),
                     "end_ts": float(seg["end_ts"]),
                     "duration_sec": float(seg["duration_sec"]),
+                    "fps": seg_fps,
                     "size_mb": float(seg["size_mb"]),
                     "busy": is_busy,
                     "hits": hits,
@@ -2274,7 +2287,7 @@ class PeopleWindow:
         self._screen_preview_tk = None
         self._update_item_action_buttons()
 
-    def _show_timeline_item(self, item: dict):
+    def _show_timeline_item(self, item: dict, override_seek_sec: float = None):
         self._current_item = item
         self._media_empty_key = None
         kind = item["kind"]
@@ -2285,7 +2298,11 @@ class PeopleWindow:
             self.img_panel.pack_forget()
             self.video_panel.pack(fill=tk.BOTH, expand=True)
             self.lbl_item_header.configure(text=self._format_item_header(item))
-            self._load_video_item(vid)
+            try:
+                self.video_panel.update_idletasks()
+            except Exception:
+                pass
+            self._load_video_item(vid, override_seek_sec=override_seek_sec)
         else:
             self._stop_video_player()
             self._last_active_img_sig = None
@@ -2361,15 +2378,7 @@ class PeopleWindow:
             self.lbl_screen_preview.configure(image="", text=tr(*self._screen_ph_key))
 
     def _find_matching_video_for_event(self, ev: dict):
-        if not ev:
-            return None
-        ev_ts = float(ev.get("timestamp") or 0.0)
-        cam_uid = str(ev.get("camera_uuid") or "")
-        for v in self._matched_videos:
-            if v.get("camera_uuid") == cam_uid and (v["start_ts"] - 2.5) <= ev_ts <= (v["end_ts"] + 2.5):
-                seek_sec = max(0.0, min(max(0.0, v["duration_sec"] - 0.5), ev_ts - v["start_ts"]))
-                return v, seek_sec
-        return None
+        return select_best_video_segment_for_event(self._matched_videos, ev, margin_sec=2.5)
 
     def _update_item_action_buttons(self):
         item = self._current_item
@@ -2430,11 +2439,13 @@ class PeopleWindow:
         self._vid_total_frames = 0
         self._vid_curr_frame = 0
         self._vid_photo_tk = None
+        self._vid_last_frame_bgr = None
+        self._vid_last_render_size = None
         try:
             self.btn_vid_play.configure(text="▶", bg="#28a745")
             self.lbl_vid_time.configure(text="00:00/00:00")
             self._vid_updating_slider = True
-            self.vid_slider_var.set(0)
+            update_scale_range_and_value(self.vid_slider, self.vid_slider_var, 0, 1)
         except Exception:
             pass
         finally:
@@ -2453,6 +2464,11 @@ class PeopleWindow:
         ch = max(64, self.vid_canvas.winfo_height())
         if self.vid_canvas.find_withtag("ph"):
             self.vid_canvas.coords("ph", cw // 2, ch // 2)
+        if self._vid_last_frame_bgr is not None:
+            prev_sz = self._vid_last_render_size
+            if prev_sz is None or abs(cw - prev_sz[0]) > 2 or abs(ch - prev_sz[1]) > 2:
+                self._render_video_frame(self._vid_last_frame_bgr)
+                return
         if self.vid_canvas.find_withtag("vframe"):
             self.vid_canvas.coords("vframe", cw // 2, ch // 2)
 
@@ -2476,6 +2492,8 @@ class PeopleWindow:
             else:
                 rgb = bgr_img[:, :, ::-1]
                 pil_img = Image.fromarray(rgb).resize((dw, dh), Image.Resampling.BILINEAR)
+            self._vid_last_frame_bgr = bgr_img
+            self._vid_last_render_size = (cw, ch)
             self._vid_photo_tk = ImageTk.PhotoImage(pil_img)
             self.vid_canvas.delete("all")
             self.vid_canvas.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self._vid_photo_tk, tags="vframe")
@@ -2489,8 +2507,7 @@ class PeopleWindow:
         self.lbl_vid_time.configure(text=f"{self._format_sec(cur / fps)}/{self._format_sec(tot / fps)}")
         self._vid_updating_slider = True
         try:
-            self.vid_slider.configure(to=max(1, tot - 1))
-            self.vid_slider_var.set(cur)
+            update_scale_range_and_value(self.vid_slider, self.vid_slider_var, cur, max(1, tot - 1))
         finally:
             self._vid_updating_slider = False
 
@@ -2556,28 +2573,11 @@ class PeopleWindow:
             self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ffcc00")
             return
 
-        cap = None
-        if hasattr(cv2, "CAP_PROP_N_THREADS") and hasattr(cv2, "CAP_FFMPEG"):
-            try:
-                cap = cv2.VideoCapture(fpath, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 2])
-            except Exception:
-                cap = None
-        if cap is None or not cap.isOpened():
-            if cap is not None:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-            cap = cv2.VideoCapture(fpath)
-        if not cap.isOpened():
+        cap, fps, total_f = open_video_capture_for_playback(cv2, fpath, vid_meta=vid)
+        if cap is None:
             self._vid_ph_spec = ("ui.people.vid_ph.open_err", "[Failed to open video file]", "#ff6666")
             self._set_video_placeholder(tr(*self._vid_ph_spec[:2]), color="#ff6666")
             return
-
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 15.0)
-        if fps <= 0 or fps > 120:
-            fps = 15.0
-        total_f = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
 
         self._vid_cap = cap
         self._vid_path = fpath
@@ -2585,23 +2585,37 @@ class PeopleWindow:
         self._vid_total_frames = total_f
 
         seek_sec = float(override_seek_sec if override_seek_sec is not None else vid.get("seek_sec", 0.0))
-        target_frame = max(0, min(total_f - 1, int(round(seek_sec * fps))))
-        self._seek_video_frame(target_frame)
+        self._seek_video_sec(seek_sec)
 
     def _seek_video_sec(self, sec: float):
-        if self._vid_cap is None:
+        if self._vid_cap is None or cv2 is None:
             return
-        fidx = max(0, min(max(0, self._vid_total_frames - 1), int(round(float(sec) * max(1.0, self._vid_fps)))))
-        self._seek_video_frame(fidx)
+        ret, frame, landed_idx, updated_tot = seek_video_capture(
+            self._vid_cap,
+            cv2,
+            self._vid_fps,
+            self._vid_total_frames,
+            target_sec=max(0.0, float(sec)),
+        )
+        if ret and frame is not None:
+            self._vid_total_frames = updated_tot
+            self._vid_curr_frame = landed_idx
+            self._render_video_frame(frame)
+            self._update_vid_time_ui()
 
     def _seek_video_frame(self, frame_idx: int):
         if self._vid_cap is None or cv2 is None:
             return
-        target = max(0, min(max(0, self._vid_total_frames - 1), int(frame_idx)))
-        self._vid_cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-        ret, frame = self._vid_cap.read()
+        ret, frame, landed_idx, updated_tot = seek_video_capture(
+            self._vid_cap,
+            cv2,
+            self._vid_fps,
+            self._vid_total_frames,
+            target_frame=int(frame_idx),
+        )
         if ret and frame is not None:
-            self._vid_curr_frame = target
+            self._vid_total_frames = updated_tot
+            self._vid_curr_frame = landed_idx
             self._render_video_frame(frame)
             self._update_vid_time_ui()
 
@@ -2676,7 +2690,13 @@ class PeopleWindow:
             self._vid_playing = False
             self.btn_vid_play.configure(text="▶", bg="#28a745")
             return
-        self._vid_curr_frame += 1
+        pos_f = float(self._vid_cap.get(cv2.CAP_PROP_POS_FRAMES) or 0.0) if cv2 is not None else 0.0
+        if pos_f >= 1.0:
+            self._vid_curr_frame = max(0, int(round(pos_f)) - 1)
+        else:
+            self._vid_curr_frame += 1
+        if self._vid_curr_frame >= self._vid_total_frames:
+            self._vid_total_frames = self._vid_curr_frame + 1
         self._render_video_frame(frame)
         self._update_vid_time_ui()
 
@@ -2955,8 +2975,7 @@ class PeopleWindow:
                     self.tl_tree.selection_set(iid)
                     self.tl_tree.focus(iid)
                     self.tl_tree.see(iid)
-                    self._show_timeline_item(t_item)
-                    self._seek_video_sec(seek_sec)
+                    self._show_timeline_item(t_item, override_seek_sec=seek_sec)
                     return
         finally:
             self._tl_tree_syncing = False

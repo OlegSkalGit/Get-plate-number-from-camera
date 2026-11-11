@@ -471,7 +471,7 @@ class PersonEngine:
             if detect_transport is not None:
                 self.detect_vehicles = bool(detect_transport)
 
-    def _handle_detections(self, frame: np.ndarray, detections: list):
+    def _handle_detections(self, frame: np.ndarray, detections: list, frame_ts: float = None):
         if not detections:
             return []
 
@@ -485,12 +485,12 @@ class PersonEngine:
                 should_save = True
 
         if should_save:
-            self._save_screenshot(frame, detections)
+            self._save_screenshot(frame, detections, frame_ts=frame_ts)
 
         display_boxes = [(det["box"], int(round(det["conf"] * 100)), det.get("label", "Person")) for det in detections]
         return display_boxes
 
-    def process_frame(self, frame: np.ndarray):
+    def process_frame(self, frame: np.ndarray, frame_ts: float = None):
         if frame is None or frame.size == 0:
             return []
         with self._state_lock:
@@ -498,14 +498,15 @@ class PersonEngine:
             det_veh = self.detect_vehicles
 
         detections = self.detector.predict(frame, conf_thresh=conf_t, detect_vehicles=det_veh)
-        return self._handle_detections(frame, detections)
+        return self._handle_detections(frame, detections, frame_ts=frame_ts)
 
-    def _save_screenshot(self, frame: np.ndarray, detections: list):
+    def _save_screenshot(self, frame: np.ndarray, detections: list, frame_ts: float = None):
         if not self.allow_disk_write:
             return
         os.makedirs(self.people_dir, exist_ok=True)
-        now_dt = datetime.now()
-        day_folder = now_dt.strftime("%Y-%m-%d")
+        eff_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else time.time()
+        ev_dt = datetime.fromtimestamp(eff_ts)
+        day_folder = ev_dt.strftime("%Y-%m-%d")
         day_dir = os.path.join(self.people_dir, day_folder)
         os.makedirs(day_dir, exist_ok=True)
 
@@ -514,16 +515,16 @@ class PersonEngine:
         slug_label = "-".join(detected_labels)
 
         if self.timer_ms < 1000:
-            time_prefix = now_dt.strftime("%H-%M-%S") + f"_{int(now_dt.microsecond / 1000):03d}"
+            time_prefix = ev_dt.strftime("%H-%M-%S") + f"_{int(ev_dt.microsecond / 1000):03d}"
         else:
-            time_prefix = now_dt.strftime("%H-%M-%S")
+            time_prefix = ev_dt.strftime("%H-%M-%S")
 
         filename = f"{time_prefix}_{slug_label}.jpg"
         full_path = os.path.join(day_dir, filename)
 
         async_write_image(full_path, frame)
 
-        time_display = now_dt.strftime("%H:%M:%S")
+        time_display = ev_dt.strftime("%H:%M:%S")
         print(f"[ФІКСАЦІЯ ОБ'ЄКТА ({summary_label})] Збережено скріншот: {full_path}")
 
         if self.on_saved_callback:
@@ -565,8 +566,9 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
     engine.update_config(cfg_copy)
 
 
-def _process_and_pack(engine, frame, prev_state=None):
-    boxes = engine.process_frame(frame)
+def _process_and_pack(engine, frame, prev_state=None, meta=None):
+    frame_ts = meta.get("frame_ts") if isinstance(meta, dict) else None
+    boxes = engine.process_frame(frame, frame_ts=frame_ts)
     return {"boxes": boxes}
 
 
@@ -617,9 +619,11 @@ def _process_batch_and_pack(items: list, shared_resources=None) -> list:
             it = items[idx]
             eng = it["engine"]
             meta = it.get("meta")
+            frame_ts = None
             if isinstance(meta, dict):
                 meta["person_hint"] = bool(hints_list[local_i])
-            boxes = eng._handle_detections(frames_g[local_i], dets_list[local_i])
+                frame_ts = meta.get("frame_ts")
+            boxes = eng._handle_detections(frames_g[local_i], dets_list[local_i], frame_ts=frame_ts)
             out_states[idx] = {"boxes": boxes}
 
     return out_states

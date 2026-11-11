@@ -1,3 +1,4 @@
+import math
 import sys
 import tkinter as tk
 from tkinter import ttk
@@ -1014,3 +1015,325 @@ def style_dark_combobox_popdown(
     except Exception:
         pass
     return cb
+
+
+def update_scale_range_and_value(scale, var, value: float, max_to: float):
+    """
+    Безпечно оновлює діапазон `to` та значення `tk.Scale` так, щоб Tk не обрізав
+    старе значення під менший `to` (інакше Tk ставить асинхронний idle callback
+    і викликає `command` уже після зняття прапорця оновлення слайдера).
+    """
+    if scale is None:
+        return
+    new_to = max(1, int(round(float(max_to))))
+    cur_val = max(0, min(new_to, int(round(float(value)))))
+    try:
+        old_to = float(scale.cget("to"))
+    except Exception:
+        old_to = float(new_to)
+    if new_to < old_to:
+        if var is not None:
+            var.set(cur_val)
+        scale.configure(to=new_to)
+    else:
+        scale.configure(to=new_to)
+        if var is not None:
+            var.set(cur_val)
+
+
+def select_best_video_segment_for_event(matched_videos: list, ev: dict, margin_sec: float = 2.5):
+    """
+    Обирає найкращий відеосегмент для події (віддає строгий пріоритет сегменту,
+    інтервал [start_ts, end_ts] якого містить timestamp події, а не сусідньому
+    дотичному файлу в межах margin_sec) та обчислює точний `seek_sec`.
+    """
+    if not ev or not matched_videos:
+        return None
+    try:
+        ev_ts = float(ev.get("timestamp") or 0.0)
+    except Exception:
+        return None
+    if math.isnan(ev_ts) or ev_ts <= 0.0:
+        return None
+    cam_uid = str(ev.get("camera_uuid") or "")
+    margin = max(0.0, float(margin_sec or 0.0))
+
+    candidates = []
+    for v in matched_videos:
+        if str(v.get("camera_uuid") or "") != cam_uid:
+            continue
+        try:
+            s_ts = float(v.get("start_ts") or 0.0)
+            e_ts = float(v.get("end_ts") or 0.0)
+        except Exception:
+            continue
+        if (s_ts - margin) <= ev_ts <= (e_ts + margin):
+            is_outside = 0 if (s_ts <= ev_ts <= e_ts) else 1
+            boundary_dist = 0.0 if is_outside == 0 else min(abs(ev_ts - s_ts), abs(ev_ts - e_ts))
+            mid_dist = abs(ev_ts - (s_ts + e_ts) * 0.5)
+            candidates.append(((is_outside, boundary_dist, mid_dist, s_ts), v))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    best = candidates[0][1]
+    s_ts = float(best.get("start_ts") or 0.0)
+    e_ts = float(best.get("end_ts") or s_ts)
+    dur_raw = best.get("duration_sec")
+    dur = float(dur_raw) if isinstance(dur_raw, (int, float)) else max(0.0, e_ts - s_ts)
+    dur = max(0.0, dur)
+    try:
+        fps_hint = float(best.get("fps") or 0.0)
+    except Exception:
+        fps_hint = 0.0
+    end_pad = min(0.25, 0.5 / fps_hint) if (not math.isnan(fps_hint) and fps_hint > 0.1) else 0.05
+    seek_sec = max(0.0, min(max(0.0, dur - end_pad), ev_ts - s_ts))
+    return best, seek_sec
+
+
+def open_video_capture_for_playback(cv2_mod, fpath: str, vid_meta: dict = None):
+    """
+    Відкриває відеофайл через OpenCV для точного UI-перегляду і повертає
+    `(cap, fps, total_frames)` з безпечним захистом від NaN / 0 у метаданих контейнера.
+    """
+    if cv2_mod is None or not fpath:
+        return None, 15.0, 0
+    cap = None
+    if hasattr(cv2_mod, "CAP_PROP_N_THREADS") and hasattr(cv2_mod, "CAP_FFMPEG"):
+        try:
+            cap = cv2_mod.VideoCapture(fpath, cv2_mod.CAP_FFMPEG, [cv2_mod.CAP_PROP_N_THREADS, 2])
+        except Exception:
+            cap = None
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        cap = cv2_mod.VideoCapture(fpath)
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        return None, 15.0, 0
+
+    meta = vid_meta if isinstance(vid_meta, dict) else {}
+    try:
+        fps = float(cap.get(cv2_mod.CAP_PROP_FPS) or 0.0)
+    except Exception:
+        fps = 0.0
+    if math.isnan(fps) or fps <= 0.1 or fps > 240.0:
+        try:
+            mfps = float(meta.get("fps") or 0.0)
+        except Exception:
+            mfps = 0.0
+        fps = mfps if (not math.isnan(mfps) and 0.1 < mfps <= 240.0) else 15.0
+
+    try:
+        cnt = float(cap.get(cv2_mod.CAP_PROP_FRAME_COUNT) or 0.0)
+    except Exception:
+        cnt = 0.0
+    if not math.isnan(cnt) and cnt > 0.5:
+        total_frames = int(round(cnt))
+    else:
+        try:
+            mdur = float(meta.get("duration_sec") or 0.0)
+        except Exception:
+            mdur = 0.0
+        total_frames = int(round(mdur * fps)) if (not math.isnan(mdur) and mdur > 0.1) else 1
+    total_frames = max(1, total_frames)
+    return cap, float(fps), int(total_frames)
+
+
+def seek_video_capture(
+    cap,
+    cv2_mod,
+    fps: float,
+    total_frames: int,
+    target_frame: int = None,
+    target_sec: float = None,
+):
+    """
+    Точно позиціонує відкритий `cv2.VideoCapture` на потрібний кадр або час:
+    - визначає реальний індекс декодованого кадру за `POS_FRAMES - 1`;
+    - при перемотці за часом (`target_sec`) звіряє фактичний PTS (`CAP_PROP_POS_MSEC`)
+      і за потреби виконує швидкий бінарний пошук + короткий лінійний добір для VFR/`copy`;
+    - компенсує відкат OpenCV на попередній keyframe за допомогою `grab()`.
+    Повертає `(ret, frame, landed_idx, updated_total_frames)`.
+    """
+    if cap is None or cv2_mod is None:
+        return False, None, 0, max(1, int(total_frames or 1))
+
+    try:
+        fps_eff = float(fps or 15.0)
+    except Exception:
+        fps_eff = 15.0
+    if math.isnan(fps_eff) or fps_eff <= 0.1:
+        fps_eff = 15.0
+    tot = max(1, int(total_frames or 1))
+
+    use_time = target_sec is not None
+    t_sec = max(0.0, float(target_sec)) if use_time else 0.0
+    if use_time:
+        target = max(0, min(tot - 1, int(round(t_sec * fps_eff))))
+    else:
+        target = max(0, min(tot - 1, int(target_frame or 0)))
+
+    def _read_at(idx: int):
+        idx_c = max(0, min(tot - 1, int(idx)))
+        cap.set(cv2_mod.CAP_PROP_POS_FRAMES, idx_c)
+        r, fr = cap.read()
+        used_idx = idx_c
+        if (not r or fr is None) and idx_c >= max(0, tot - 4) and idx_c > 0:
+            for back in range(1, min(6, idx_c + 1)):
+                alt = idx_c - back
+                cap.set(cv2_mod.CAP_PROP_POS_FRAMES, alt)
+                r2, fr2 = cap.read()
+                if r2 and fr2 is not None:
+                    r, fr = r2, fr2
+                    used_idx = alt
+                    break
+        try:
+            pos_f = float(cap.get(cv2_mod.CAP_PROP_POS_FRAMES) or 0.0)
+        except Exception:
+            pos_f = 0.0
+        if not math.isnan(pos_f) and pos_f >= 1.0:
+            landed = max(0, int(round(pos_f)) - 1)
+        else:
+            landed = used_idx
+        try:
+            pos_ms = float(cap.get(cv2_mod.CAP_PROP_POS_MSEC))
+        except Exception:
+            pos_ms = -1.0
+        if math.isnan(pos_ms) or pos_ms < 0.0:
+            pos_ms = -1.0
+        return bool(r and fr is not None), fr, landed, pos_ms
+
+    ret, frame, landed_idx, pos_ms = _read_at(target)
+    if not ret or frame is None:
+        return False, None, max(0, min(tot - 1, target)), tot
+    cursor_idx = landed_idx
+
+    did_pts_search = False
+    if use_time and pos_ms >= 0.0 and tot > 4:
+        target_ms = t_sec * 1000.0
+        pts_tol_ms = max(60.0, min(160.0, 1200.0 / fps_eff))
+        if abs(pos_ms - target_ms) > pts_tol_ms:
+            r0, fr0, idx0, ms0 = _read_at(0)
+            if r0:
+                cursor_idx = idx0
+            base_ms = ms0 if (r0 and 0.0 <= ms0 < 10000.0) else 0.0
+            want_ms = base_ms + target_ms
+            if abs(pos_ms - want_ms) > pts_tol_ms:
+                did_pts_search = True
+                best_err = abs(pos_ms - want_ms)
+                best_idx = landed_idx
+                best_fr = frame
+                if r0 and fr0 is not None:
+                    err0 = abs(ms0 - want_ms)
+                    if err0 < best_err:
+                        best_err, best_idx, best_fr = err0, idx0, fr0
+
+                if want_ms <= base_ms:
+                    if r0 and fr0 is not None:
+                        frame, landed_idx = fr0, idx0
+                else:
+                    lo, hi = 0, tot - 1
+                    rlast, frlast, idxlast, mslast = _read_at(hi)
+                    if rlast:
+                        cursor_idx = idxlast
+                    if rlast and frlast is not None and mslast >= 0.0:
+                        errl = abs(mslast - want_ms)
+                        if errl < best_err:
+                            best_err, best_idx, best_fr = errl, idxlast, frlast
+                    if rlast and mslast >= 0.0 and want_ms >= mslast:
+                        frame, landed_idx = frlast, idxlast
+                    else:
+                        steps = 0
+                        while (hi - lo) > 24 and steps < 12:
+                            steps += 1
+                            mid = (lo + hi) // 2
+                            rm, frm, idxm, msm = _read_at(mid)
+                            if rm:
+                                cursor_idx = idxm
+                            if not rm or frm is None or msm < 0.0:
+                                hi = mid - 1
+                                continue
+                            errm = abs(msm - want_ms)
+                            if errm < best_err:
+                                best_err, best_idx, best_fr = errm, idxm, frm
+                            if errm <= max(40.0, 500.0 / fps_eff):
+                                lo = hi = idxm
+                                break
+                            if msm < want_ms:
+                                lo = max(lo + 1, idxm)
+                            else:
+                                hi = min(hi - 1, idxm)
+
+                        if (hi - lo) > 0 and best_err > max(40.0, 500.0 / fps_eff):
+                            rlo, frlo, idxlo, mslo = _read_at(lo)
+                            if rlo:
+                                cursor_idx = idxlo
+                            if rlo and frlo is not None and mslo >= 0.0:
+                                errlo = abs(mslo - want_ms)
+                                if errlo < best_err:
+                                    best_err, best_idx, best_fr = errlo, idxlo, frlo
+                                cur_idx = idxlo
+                                cur_ms = mslo
+                                scan_lim = min(36, (hi - lo) + 4)
+                                for _ in range(scan_lim):
+                                    if cur_ms >= want_ms:
+                                        break
+                                    rc, frc = cap.read()
+                                    if not rc or frc is None:
+                                        break
+                                    cur_idx += 1
+                                    cursor_idx = cur_idx
+                                    try:
+                                        cur_ms = float(cap.get(cv2_mod.CAP_PROP_POS_MSEC))
+                                    except Exception:
+                                        break
+                                    if math.isnan(cur_ms) or cur_ms < 0.0:
+                                        break
+                                    errc = abs(cur_ms - want_ms)
+                                    if errc < best_err:
+                                        best_err, best_idx, best_fr = errc, cur_idx, frc
+
+                        frame, landed_idx = best_fr, best_idx
+
+    sync_target = landed_idx if did_pts_search else target
+    if cursor_idx != landed_idx:
+        r_s, _, idx_s, _ = _read_at(landed_idx)
+        if r_s:
+            cursor_idx = idx_s
+
+    if 0 <= cursor_idx < sync_target and (sync_target - cursor_idx) <= 45:
+        gap = sync_target - cursor_idx
+        ok_grab = True
+        cur_i = cursor_idx
+        for _ in range(gap - 1):
+            if not cap.grab():
+                ok_grab = False
+                break
+            cur_i += 1
+        if ok_grab:
+            r_t, fr_t = cap.read()
+            if r_t and fr_t is not None:
+                if not did_pts_search:
+                    frame = fr_t
+                cur_i += 1
+                try:
+                    pf = float(cap.get(cv2_mod.CAP_PROP_POS_FRAMES) or 0.0)
+                except Exception:
+                    pf = 0.0
+                if not math.isnan(pf) and pf >= 1.0:
+                    landed_idx = max(0, int(round(pf)) - 1)
+                else:
+                    landed_idx = cur_i
+
+    landed_idx = max(0, int(landed_idx))
+    updated_tot = max(tot, landed_idx + 1)
+    return True, frame, landed_idx, updated_tot

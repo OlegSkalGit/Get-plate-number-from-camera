@@ -1854,17 +1854,20 @@ class FallbackFaceDB(_BaseFaceDB):
 
 
 class FaceTrack:
-    def __init__(self, track_id, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0, max_pool_size=5):
+    def __init__(self, track_id, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0, max_pool_size=5, frame_ts=None, seen_ts=None):
         self.track_id = track_id
         self.bbox = bbox
-        self.last_seen = time.time()
-        self.first_seen = self.last_seen
+        s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else s_ts
+        self.last_seen = s_ts
+        self.first_seen = s_ts
         self.saved = False
         self.max_pool_size = max_pool_size
 
         self.face_pool = [(face_crop, sharpness)]
         self.best_face_img = face_crop
         self.best_frame = frame
+        self.best_frame_ts = ev_ts
         self.best_sharpness = sharpness
         self.best_yaw = abs(float(yaw))
         self.best_pitch = abs(float(pitch))
@@ -1897,15 +1900,18 @@ class FaceTrack:
             return entry[1]
         return None
 
-    def update(self, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0):
+    def update(self, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0, frame_ts=None, seen_ts=None):
+        s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else s_ts
         self.bbox = bbox
-        self.last_seen = time.time()
+        self.last_seen = s_ts
         self.frames_tracked += 1
 
         if sharpness > self.best_sharpness:
             self.best_sharpness = sharpness
             self.best_face_img = face_crop
             self.best_frame = frame
+            self.best_frame_ts = ev_ts
             self.best_yaw = abs(float(yaw))
             self.best_pitch = abs(float(pitch))
 
@@ -2060,8 +2066,9 @@ class FaceEngine:
                     needed.append((t, c))
         return needed
 
-    def _match_tracks_locked(self, frame, current_faces, now: float):
+    def _match_tracks_locked(self, frame, current_faces, now: float, frame_ts: float = None):
         self._prune_recently_saved_locked(now)
+        ev_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else float(now)
         unmatched_faces = list(range(len(current_faces)))
         preview_tracks = []
         save_tracks = []
@@ -2087,7 +2094,8 @@ class FaceEngine:
                 det = current_faces[best_idx]
                 f_track.update(
                     det["box"], det["crop"], frame, det["sharpness"],
-                    yaw=det["yaw"], pitch=det["pitch"]
+                    yaw=det["yaw"], pitch=det["pitch"],
+                    frame_ts=ev_ts, seen_ts=now,
                 )
                 unmatched_faces.remove(best_idx)
 
@@ -2108,7 +2116,8 @@ class FaceEngine:
             self.next_track_id += 1
             self.active_tracks[f_tid] = FaceTrack(
                 f_tid, det["box"], det["crop"], frame, det["sharpness"],
-                yaw=det["yaw"], pitch=det["pitch"]
+                yaw=det["yaw"], pitch=det["pitch"],
+                frame_ts=ev_ts, seen_ts=now,
             )
 
         for f_id, f_track in list(self.active_tracks.items()):
@@ -2141,14 +2150,14 @@ class FaceEngine:
 
         return [(t.bbox, t.face_name, t.status_tag) for t in self.active_tracks.values()]
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, frame_ts: float = None):
         if frame is None or frame.size == 0:
             return []
         current_faces = self._detect_and_align(frame)
         now = time.time()
         with self._state_lock:
             self._last_full_scrfd_ts = now
-            preview_tracks, save_tracks = self._match_tracks_locked(frame, current_faces, now)
+            preview_tracks, save_tracks = self._match_tracks_locked(frame, current_faces, now, frame_ts=frame_ts)
             needed = self._collect_track_crops_needed(preview_tracks, save_tracks)
 
         if needed:
@@ -2247,10 +2256,13 @@ class FaceEngine:
             return
         self.recently_saved[u_id] = now
 
-        now_dt = datetime.now()
-        day_folder = now_dt.strftime("%Y-%m-%d")
-        time_prefix = now_dt.strftime("%H-%M-%S") + f"-{int(now_dt.microsecond / 1000):03d}"
-        time_display = now_dt.strftime("%H:%M:%S")
+        event_ts = float(getattr(track, "best_frame_ts", 0.0) or 0.0)
+        if event_ts <= 0.0:
+            event_ts = now
+        ev_dt = datetime.fromtimestamp(event_ts)
+        day_folder = ev_dt.strftime("%Y-%m-%d")
+        time_prefix = ev_dt.strftime("%H-%M-%S") + f"-{int(ev_dt.microsecond / 1000):03d}"
+        time_display = ev_dt.strftime("%H:%M:%S")
         day_dir = os.path.join(self.faces_dir, day_folder)
         os.makedirs(day_dir, exist_ok=True)
 
@@ -2259,6 +2271,12 @@ class FaceEngine:
         face_filename = f"{time_prefix}_face_{safe_name}_{safe_tag}.jpg"
         full_filename = f"{time_prefix}_full.jpg"
         face_path = os.path.join(day_dir, face_filename)
+        if os.path.exists(face_path):
+            c_idx = 2
+            while os.path.exists(os.path.join(day_dir, f"{time_prefix}_face_{safe_name}_{safe_tag}_{c_idx}.jpg")):
+                c_idx += 1
+            face_filename = f"{time_prefix}_face_{safe_name}_{safe_tag}_{c_idx}.jpg"
+            face_path = os.path.join(day_dir, face_filename)
         full_path = os.path.join(day_dir, full_filename)
         meta_path = _sidecar_path_for_crop(face_path)
 
@@ -2266,7 +2284,7 @@ class FaceEngine:
             "person_uuid": str(u_id),
             "person_name": str(f_name),
             "tag": str(status_tag),
-            "timestamp": float(now_dt.timestamp()),
+            "timestamp": float(event_ts),
             "day": day_folder,
             "time": time_display,
             "crop_file": face_filename,
@@ -2417,8 +2435,9 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
     engine.update_config(eff_cfg)
 
 
-def _process_and_pack(engine, frame, prev_state=None):
-    boxes = engine.process_frame(frame)
+def _process_and_pack(engine, frame, prev_state=None, meta=None):
+    frame_ts = meta.get("frame_ts") if isinstance(meta, dict) else None
+    boxes = engine.process_frame(frame, frame_ts=frame_ts)
     return {"boxes": boxes}
 
 
@@ -2459,8 +2478,10 @@ def _process_batch_and_pack(items: list, shared_resources=None) -> list:
         it = items[idx]
         eng = it["engine"]
         fr = it["frame"]
+        meta = it.get("meta") if isinstance(it.get("meta"), dict) else {}
+        frame_ts = meta.get("frame_ts")
         with eng._state_lock:
-            preview_tracks, save_tracks = eng._match_tracks_locked(fr, faces_list, now)
+            preview_tracks, save_tracks = eng._match_tracks_locked(fr, faces_list, now, frame_ts=frame_ts)
             needed = eng._collect_track_crops_needed(preview_tracks, save_tracks)
         per_item_tasks[idx] = (preview_tracks, save_tracks)
         if needed:

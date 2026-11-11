@@ -977,6 +977,7 @@ class CameraUnit:
                     continue
 
                 consec_fails = 0
+                t_cap = time.time()
                 fps_cnt += 1
                 if (t0 - fps_t0) >= 1.0:
                     cur_fps = fps_cnt / max(0.001, t0 - fps_t0)
@@ -994,7 +995,12 @@ class CameraUnit:
                     # 1. Запис чистого основного кадру усіма активними recorder-модулями (frame read-only ref)
                     for rec_eng, push_fn in active_rec_feed:
                         try:
-                            push_fn(rec_eng, frame, allowed=True)
+                            push_fn(rec_eng, frame, allowed=True, frame_ts=t_cap)
+                        except TypeError:
+                            try:
+                                push_fn(rec_eng, frame, allowed=True)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -1006,15 +1012,15 @@ class CameraUnit:
                     with self.lock:
                         self._latest_main_bgr = frame
                         self._latest_main_seq += 1
-                        self._latest_main_ts = t0
+                        self._latest_main_ts = t_cap
 
                     # 4. Передача свіжого кадру в AI-чергу з урахуванням ліміту AI FPS на камеру (frame read-only)
-                    if ai_due or (ai_active_now and (t0 - self._last_ai_submit_ts) >= (1.0 / ai_fps_limit)):
+                    if ai_due or (ai_active_now and (t_cap - self._last_ai_submit_ts) >= (1.0 / ai_fps_limit)):
                         with self.lock:
                             if not self._ai_busy and self._pending_ai_frame is None:
                                 self._pending_ai_frame = frame
-                                self._pending_ai_ts = t0
-                                self._last_ai_submit_ts = t0
+                                self._pending_ai_ts = t_cap
+                                self._last_ai_submit_ts = t_cap
 
                 if is_file:
                     sleep_d = frame_delay - (time.time() - t0)
@@ -1027,14 +1033,19 @@ class CameraUnit:
                 except Exception:
                     pass
 
-    def pop_pending_ai_frame(self):
+    def pop_pending_ai_item(self):
         with self.lock:
             if self._ai_busy or self._pending_ai_frame is None:
                 return None
             self._ai_busy = True
             fr = self._pending_ai_frame
+            ts = float(self._pending_ai_ts or 0.0)
             self._pending_ai_frame = None
-            return fr
+            return (fr, ts)
+
+    def pop_pending_ai_frame(self):
+        item = self.pop_pending_ai_item()
+        return item[0] if item is not None else None
 
     def clear_ai_busy(self):
         with self.lock:
@@ -1050,7 +1061,7 @@ class CameraUnit:
         except Exception:
             return None
 
-    def _prepare_wave_item(self, frame: np.ndarray, ai_entries: list, now: float = None) -> dict:
+    def _prepare_wave_item(self, frame: np.ndarray, ai_entries: list, now: float = None, frame_ts: float = None) -> dict:
         """
         Готує контекст кадру для AI-хвилі:
         - робить flush/очищення вимкнених або поза-розкладових модулів;
@@ -1059,6 +1070,7 @@ class CameraUnit:
         """
         if now is None:
             now = time.time()
+        eff_frame_ts = float(frame_ts) if (frame_ts is not None and float(frame_ts) > 0) else float(now)
         mods = self.cam_cfg.get("modules") or {}
 
         with self._engines_lock:
@@ -1166,15 +1178,16 @@ class CameraUnit:
             "base_states": base_states,
             "prev_states": prev_states,
             "active_items": active_items,
-            "meta": {},
+            "meta": {"frame_ts": eff_frame_ts},
         }
 
-    def run_ai_step(self, frame: np.ndarray):
+    def run_ai_step(self, frame: np.ndarray, frame_ts: float = None):
         """Виконує AI-обробку одного кадру через усі підключені модулі (викликається з AIWorkerPool або напряму)."""
         try:
+            now_t = time.time()
             all_ai = self.registry.list_modules(kind="ai")
             ai_entries = _sort_ai_entries_for_cascade(all_ai)
-            plan = self._prepare_wave_item(frame, ai_entries, now=time.time())
+            plan = self._prepare_wave_item(frame, ai_entries, now=now_t, frame_ts=frame_ts)
             if plan.get("skip"):
                 return
 
@@ -1200,7 +1213,10 @@ class CameraUnit:
                         st = res[0] if res else {}
                         new_states[mid] = st if isinstance(st, dict) else {}
                     elif callable(proc_fn):
-                        new_states[mid] = proc_fn(eng, fr_arg, prev_st) or {}
+                        try:
+                            new_states[mid] = proc_fn(eng, fr_arg, prev_st, meta=unit_meta) or {}
+                        except TypeError:
+                            new_states[mid] = proc_fn(eng, fr_arg, prev_st) or {}
                 except Exception as me:
                     print(f"[AI Module Error '{mid}' @ {self.cam_cfg.get('name')}]: {me}")
                     new_states[mid] = dict(prev_st or {})
@@ -1425,9 +1441,10 @@ class CameraManager:
                     continue
                 active_cams += 1
                 if len(popped) < max_batch:
-                    fr = u.pop_pending_ai_frame()
-                    if fr is not None:
-                        popped.append((u, fr))
+                    item = u.pop_pending_ai_item()
+                    if item is not None:
+                        fr, fr_ts = item
+                        popped.append((u, fr, fr_ts))
                         popped_indices.add(idx)
                         last_offset = idx + 1
 
@@ -1439,9 +1456,10 @@ class CameraManager:
                         break
                     if idx in popped_indices or not u.running:
                         continue
-                    fr = u.pop_pending_ai_frame()
-                    if fr is not None:
-                        popped.append((u, fr))
+                    item = u.pop_pending_ai_item()
+                    if item is not None:
+                        fr, fr_ts = item
+                        popped.append((u, fr, fr_ts))
                         popped_indices.add(idx)
                         if (idx + 1) > last_offset:
                             last_offset = idx + 1
@@ -1461,9 +1479,9 @@ class CameraManager:
 
                 wave_plans = []
                 module_buckets = {}
-                for u, fr in popped:
+                for u, fr, fr_ts in popped:
                     try:
-                        plan = u._prepare_wave_item(fr, ai_entries, now=now)
+                        plan = u._prepare_wave_item(fr, ai_entries, now=now, frame_ts=fr_ts)
                     except Exception as pe:
                         print(f"[AI Wave Prepare Error @ {u.cam_cfg.get('name')}]: {pe}")
                         u.clear_ai_busy()
@@ -1519,7 +1537,10 @@ class CameraManager:
                         for b in bucket:
                             try:
                                 fr_arg = b["frame"] if is_builtin else b["frame"].copy()
-                                b["plan"]["new_states"][mid] = proc_fn(b["engine"], fr_arg, b["prev_state"]) or {}
+                                try:
+                                    b["plan"]["new_states"][mid] = proc_fn(b["engine"], fr_arg, b["prev_state"], meta=b["meta"]) or {}
+                                except TypeError:
+                                    b["plan"]["new_states"][mid] = proc_fn(b["engine"], fr_arg, b["prev_state"]) or {}
                             except Exception as me:
                                 cname = b["plan"]["unit"].cam_cfg.get("name")
                                 print(f"[AI Module Error '{mid}' @ {cname}]: {me}")
@@ -1532,7 +1553,7 @@ class CameraManager:
             except Exception as e:
                 print(f"[AI Wave Scheduler Error]: {e}")
             finally:
-                for u, _fr in popped:
+                for u, _fr, _ts in popped:
                     u.clear_ai_busy()
 
     def get_unit(self, cam_uuid: str):
