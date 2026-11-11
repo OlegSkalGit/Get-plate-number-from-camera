@@ -39,6 +39,7 @@ from scripts.ui.helpers import (
 from scripts.ui.detail_window import CameraDetailWindow
 from scripts.ui.settings_window import SettingsWindow
 from scripts.ui.people_window import PeopleWindow
+from scripts.ui.plates_window import PlatesWindow
 
 # Базова папка додатку (підтримка PyInstaller EXE та структури scripts/ui/main_window.py)
 if getattr(sys, "frozen", False):
@@ -110,6 +111,11 @@ class MainGridWindow:
 
         # 2. Телеметрія заліза, спільний пул ресурсів та менеджер камер
         self.hw_monitor = HardwareMonitor(self.base_dir)
+        get_plates_fn = getattr(self.cfg_mgr, "get_plates_db_path", None)
+        if callable(get_plates_fn):
+            plates_db_path = get_plates_fn(create=allow_write)
+        else:
+            plates_db_path = os.path.join(self.cfg_mgr.get_archive_root(), "plates_db", "plates.json")
         self.inference_pool = InferencePool(
             self.base_dir,
             self.registry,
@@ -117,6 +123,7 @@ class MainGridWindow:
                 "operation_mode": op_mode,
                 "allow_disk_write": allow_write,
                 "faces_db_path": self.cfg_mgr.get_faces_db_path(create=allow_write),
+                "plates_db_path": plates_db_path,
             },
             ai_backend=hw_cfg.get("ai_backend", "cpu"),
             ai_threads=int(hw_cfg.get("ai_threads", 2)),
@@ -131,6 +138,7 @@ class MainGridWindow:
         # Відкриті дочірні вікна
         self.settings_win = None
         self.people_win = None
+        self.plates_win = None
         self.detail_windows = {}  # cam_uuid -> CameraDetailWindow
 
         # Стан сітки та пагінації
@@ -242,6 +250,13 @@ class MainGridWindow:
             relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4, cursor="hand2"
         )
         self.btn_people.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_plates = tk.Button(
+            left_box, text=tr("ui.main.btn_plates", "🚘 Plates"), command=self.open_plates,
+            bg="#27493d", fg="#ffffff", activebackground="#336151", activeforeground="#ffffff",
+            relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4, cursor="hand2"
+        )
+        self.btn_plates.pack(side=tk.LEFT, padx=(0, 8))
 
         # Блок пагінації (видимий лише коли в ручній сітці > 1 сторінки)
         self.page_box = tk.Frame(self.ctrl_frame, bg="#171923")
@@ -537,6 +552,13 @@ class MainGridWindow:
                 except Exception:
                     pass
 
+            if self.plates_win is not None:
+                try:
+                    if self.plates_win.win.winfo_exists():
+                        self.plates_win.on_modules_reloaded()
+                except Exception:
+                    pass
+
             for dwin in list(self.detail_windows.values()):
                 try:
                     if dwin.win.winfo_exists():
@@ -702,6 +724,7 @@ class MainGridWindow:
             self._refresh_mode_badge()
             self.btn_settings.configure(text=tr("ui.main.btn_settings", "⚙ Settings"))
             self.btn_people.configure(text=tr("ui.main.btn_people", "👥 People"))
+            self.btn_plates.configure(text=tr("ui.main.btn_plates", "🚘 Plates"))
             self._apply_exit_btn_text()
             self.lbl_page.configure(
                 text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages)
@@ -749,6 +772,13 @@ class MainGridWindow:
             try:
                 if self.people_win.win.winfo_exists():
                     self.people_win.apply_language()
+            except Exception:
+                pass
+
+        if self.plates_win is not None:
+            try:
+                if self.plates_win.win.winfo_exists():
+                    self.plates_win.apply_language()
             except Exception:
                 pass
 
@@ -873,6 +903,29 @@ class MainGridWindow:
     def _on_people_closed(self):
         self.people_win = None
 
+    def open_plates(self):
+        if self._is_closing:
+            return
+        if self.plates_win is not None:
+            try:
+                if self.plates_win.win.winfo_exists():
+                    self.plates_win.focus()
+                    return
+            except Exception:
+                pass
+            self.plates_win = None
+
+        self.plates_win = PlatesWindow(
+            self.root,
+            cfg_mgr=self.cfg_mgr,
+            camera_manager=self.camera_manager,
+            registry=self.registry,
+            on_close_cb=self._on_plates_closed,
+        )
+
+    def _on_plates_closed(self):
+        self.plates_win = None
+
     def _refresh_mode_badge(self):
         if not hasattr(self, "lbl_mode_badge"):
             return
@@ -928,6 +981,13 @@ class MainGridWindow:
             try:
                 if self.people_win.win.winfo_exists():
                     self.people_win.on_modules_reloaded()
+            except Exception:
+                pass
+
+        if self.plates_win is not None:
+            try:
+                if self.plates_win.win.winfo_exists():
+                    self.plates_win.on_modules_reloaded()
             except Exception:
                 pass
 
@@ -990,6 +1050,12 @@ class MainGridWindow:
             try:
                 if self.people_win.win.winfo_exists():
                     self.people_win.notify_saved(mod_name)
+            except Exception:
+                pass
+        if self.plates_win is not None:
+            try:
+                if self.plates_win.win.winfo_exists():
+                    self.plates_win.notify_saved(mod_name)
             except Exception:
                 pass
 
@@ -1346,7 +1412,7 @@ class MainGridWindow:
             if uid in self.detail_windows:
                 hl_state, bcol = "active", col_active
             elif unit is not None:
-                snap = unit.get_grid_snapshot()
+                snap = unit.get_grid_snapshot() or {}
                 if snap.get("sub_status") in ("offline", "reconnecting") and snap.get("main_status") != "active":
                     hl_state, bcol = "offline", col_offline
                 else:
@@ -1665,6 +1731,13 @@ class MainGridWindow:
             except Exception:
                 pass
             self.people_win = None
+
+        if self.plates_win is not None:
+            try:
+                self.plates_win.close()
+            except Exception:
+                pass
+            self.plates_win = None
 
         for dwin in list(self.detail_windows.values()):
             try:

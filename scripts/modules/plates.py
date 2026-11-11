@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import time
 import math
 import inspect
@@ -17,6 +18,11 @@ try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    from PIL import Image as _PILImage
+except ImportError:
+    _PILImage = None
 
 try:
     from fast_alpr.default_ocr import DefaultOCR
@@ -180,12 +186,49 @@ def ensure_resources(base_dir: str = "", download: bool = True, progress_cb=None
     }
 
 
+def _imwrite_bgr(path: str, bgr_img) -> bool:
+    if bgr_img is None or getattr(bgr_img, "size", 0) == 0:
+        return False
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if cv2 is not None:
+        ext = os.path.splitext(path)[1] or ".jpg"
+        ok, buf = cv2.imencode(ext, bgr_img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
+        if ok:
+            buf.tofile(path)
+            return True
+    if _PILImage is not None:
+        rgb = bgr_img[:, :, ::-1]
+        _PILImage.fromarray(rgb).save(path, quality=94)
+        return True
+    return False
+
+
+def _imread_bgr(path: str):
+    if not path or not os.path.exists(path):
+        return None
+    if cv2 is not None:
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if img is not None:
+                return img
+        except Exception:
+            pass
+    if _PILImage is not None:
+        try:
+            with _PILImage.open(path) as pim:
+                rgb = pim.convert("RGB")
+                return np.asarray(rgb, dtype=np.uint8)[:, :, ::-1].copy()
+        except Exception:
+            pass
+    return None
+
+
 def async_write_image(path, img):
     """Асинхронний запис зображення на диск через спільний обмежений пул."""
     def _worker():
         try:
-            if cv2 is not None and img is not None:
-                cv2.imwrite(path, img)
+            _imwrite_bgr(path, img)
         except Exception:
             pass
     submit_io(_worker)
@@ -195,6 +238,7 @@ def async_write_text(path, content):
     """Асинхронний запис дебаг-лога на диск через спільний обмежений пул."""
     def _worker():
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
         except Exception:
@@ -790,6 +834,698 @@ def _merge_runtime_write_cfg(flat_cfg: dict, app_context: dict = None) -> dict:
     return cfg
 
 
+_CYR_TO_LAT_PLATE = str.maketrans("АВЕІКМНОРСТХУЁЫЭЯИЙ", "ABEIKMHOPCTXYEYERII")
+_DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_PFX_RE = re.compile(r"^(\d{2})-(\d{2})-(\d{2})(?:-(\d{1,6}))?")
+_PLATE_CONF_TAIL_RE = re.compile(r"_(\d{1,3})%?$")
+VALID_PLATE_STATUSES = ("normal", "whitelist", "blacklist", "ignore")
+
+
+def normalize_plate_text(text: str) -> str:
+    raw = str(text or "").strip().upper().translate(_CYR_TO_LAT_PLATE)
+    return re.sub(r"[^A-Z0-9]", "", raw)
+
+
+def sanitize_filename_part(name: str, fallback: str = "PLATE") -> str:
+    s = re.sub(r'[<>:"/\\|?*\r\n\t]+', "_", str(name or "").strip())
+    s = s.strip(" .")
+    return s or fallback
+
+
+def _debug_path_for_crop(crop_path: str) -> str:
+    if not crop_path:
+        return ""
+    stem, _ = os.path.splitext(crop_path)
+    return f"{stem}_debug.txt"
+
+
+def _sidecar_path_for_crop(crop_path: str) -> str:
+    if not crop_path:
+        return ""
+    stem, _ = os.path.splitext(crop_path)
+    return f"{stem}.json"
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            curr.append(min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _parse_ts_from_day_and_filename(day_key: str, fname: str, fallback_mtime: float):
+    day_str = str(day_key or "").strip().replace("\\", "/")
+    if "/" in day_str:
+        for part in reversed(day_str.split("/")):
+            if _DAY_DIR_RE.match(part):
+                day_str = part
+                break
+    m_t = _TIME_PFX_RE.match(str(fname or ""))
+    if _DAY_DIR_RE.match(day_str) and m_t:
+        hh, mm, ss, ms = m_t.group(1), m_t.group(2), m_t.group(3), m_t.group(4)
+        time_str = f"{hh}:{mm}:{ss}"
+        try:
+            dt = datetime.strptime(f"{day_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+            extra_ms = (int(ms[:3]) / 1000.0) if ms else 0.0
+            return dt.timestamp() + extra_ms, day_str, time_str
+        except Exception:
+            pass
+    dt_f = datetime.fromtimestamp(float(fallback_mtime or time.time()))
+    if not _DAY_DIR_RE.match(day_str):
+        day_str = dt_f.strftime("%Y-%m-%d")
+    time_str = f"{m_t.group(1)}:{m_t.group(2)}:{m_t.group(3)}" if m_t else dt_f.strftime("%H:%M:%S")
+    return float(fallback_mtime or dt_f.timestamp()), day_str, time_str
+
+
+def _parse_plate_filename(fname: str):
+    """Розбирає {time_prefix}_plate_{TEXT}_{CONF}%[_fixN].jpg у нормалізовані поля."""
+    if not fname:
+        return None
+    lower = fname.lower()
+    if "_full" in lower or lower.endswith(("_debug.txt", ".json")):
+        return None
+    stem = os.path.splitext(fname)[0]
+    if "_plate_" not in stem:
+        return None
+    time_prefix, tail = stem.split("_plate_", 1)
+    # Прибираємо технічний суфікс колізій (_fix2, _fix3, ...)
+    tail_clean = re.sub(r"_fix\d+$", "", tail, flags=re.IGNORECASE)
+    conf = None
+    m_conf = _PLATE_CONF_TAIL_RE.search(tail_clean)
+    if m_conf:
+        raw_plate = tail_clean[:m_conf.start()]
+        try:
+            conf_val = int(m_conf.group(1))
+            if 0 <= conf_val <= 100:
+                conf = conf_val
+        except Exception:
+            conf = None
+    else:
+        raw_plate = tail_clean
+
+    norm_plate = normalize_plate_text(raw_plate)
+    if not norm_plate:
+        norm_plate = raw_plate.strip().upper()
+    if not norm_plate:
+        return None
+
+    m_t = _TIME_PFX_RE.match(time_prefix)
+    time_display = f"{m_t.group(1)}:{m_t.group(2)}:{m_t.group(3)}" if m_t else "--:--:--"
+    return {
+        "time_prefix": time_prefix,
+        "time_display": time_display,
+        "plate": norm_plate,
+        "raw_plate": raw_plate,
+        "conf": conf,
+    }
+
+
+class _BasePlateDB:
+    """
+    Крос-камерна база метаданих номерних знаків (<archive_root>/plates_db/plates.json),
+    колекціонування подій по архівах усіх камер, виправлення OCR / перейменування та безпечне видалення.
+    """
+
+    def __init__(self, db_path: str, base_dir: str = "", ocr=None, allow_disk_write: bool = True):
+        self.db_path = os.path.abspath(db_path)
+        self.base_dir = os.path.abspath(base_dir) if base_dir else ""
+        self.allow_disk_write = bool(allow_disk_write)
+        self._ocr = ocr
+        self._ocr_lock = threading.Lock()
+        self._db_lock = threading.Lock()
+        self._db_sig = None
+        self._meta_by_plate = {}
+        self._load_database_locked()
+
+    def set_allow_disk_write(self, allow: bool):
+        self.allow_disk_write = bool(allow)
+
+    @staticmethod
+    def _file_sig(path: str):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            st = os.stat(path)
+            return (os.path.normpath(path), int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            return None
+
+    def _get_ocr(self):
+        with self._ocr_lock:
+            if self._ocr is not None:
+                return self._ocr
+            if not self.base_dir or DefaultOCR is None:
+                return None
+            ocr_p = os.path.join(self.base_dir, "models", "cct_xs_v2_global.onnx")
+            cfg_p = os.path.join(self.base_dir, "models", "cct_xs_v2_global_plate_config.yaml")
+            if not os.path.exists(ocr_p) or not os.path.exists(cfg_p):
+                return None
+            try:
+                self._ocr = ThreadSafePlateOCR(ocr_p, cfg_p, providers=["CPUExecutionProvider"])
+                return self._ocr
+            except Exception as e:
+                print(f"[PlateDB OCR Init Error]: {e}")
+                return None
+
+    def _load_database_locked(self):
+        self._meta_by_plate = {}
+        if os.path.exists(self.db_path):
+            try:
+                with open(self.db_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                plates_dict = raw.get("plates") if isinstance(raw, dict) else {}
+                if isinstance(plates_dict, dict):
+                    for k, v in plates_dict.items():
+                        if not isinstance(v, dict):
+                            continue
+                        norm_k = normalize_plate_text(v.get("plate") or k)
+                        if not norm_k:
+                            continue
+                        st = str(v.get("status") or "normal").strip().lower()
+                        if st not in VALID_PLATE_STATUSES:
+                            st = "normal"
+                        self._meta_by_plate[norm_k] = {
+                            "plate": norm_k,
+                            "label": str(v.get("label") or "").strip(),
+                            "status": st,
+                            "notes": str(v.get("notes") or "").strip(),
+                            "manual": bool(v.get("manual", False)),
+                            "created_ts": float(v.get("created_ts") or 0.0),
+                            "updated_ts": float(v.get("updated_ts") or 0.0),
+                        }
+            except Exception as e:
+                print(f"[PlateDB Load Error]: {e}")
+        self._db_sig = self._file_sig(self.db_path)
+
+    def _sync_if_modified_locked(self):
+        if not os.path.exists(self.db_path):
+            if self._meta_by_plate:
+                self._meta_by_plate.clear()
+            self._db_sig = None
+            return
+        cur_sig = self._file_sig(self.db_path)
+        if cur_sig != self._db_sig:
+            self._load_database_locked()
+
+    def _save_database_locked(self):
+        if not getattr(self, "allow_disk_write", True):
+            return
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        os.makedirs(db_dir, exist_ok=True)
+        tmp_path = f"{self.db_path}.tmp"
+        bak_path = f"{self.db_path}.bak"
+        payload = {
+            "version": 1,
+            "plates": {k: self._meta_by_plate[k] for k in sorted(self._meta_by_plate.keys())},
+        }
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        if os.path.exists(self.db_path):
+            try:
+                if os.path.exists(bak_path):
+                    os.remove(bak_path)
+                os.replace(self.db_path, bak_path)
+            except Exception:
+                pass
+        os.replace(tmp_path, self.db_path)
+        self._db_sig = self._file_sig(self.db_path)
+
+    def list_records(self) -> list:
+        with self._db_lock:
+            self._sync_if_modified_locked()
+            return [dict(v) for v in self._meta_by_plate.values()]
+
+    def get_plate_status(self, plate_text: str) -> str:
+        norm = normalize_plate_text(plate_text)
+        if not norm:
+            return "normal"
+        with self._db_lock:
+            self._sync_if_modified_locked()
+            rec = self._meta_by_plate.get(norm)
+            return rec["status"] if rec else "normal"
+
+    def is_ignored(self, plate_text: str) -> bool:
+        return self.get_plate_status(plate_text) == "ignore"
+
+    def set_plate_metadata(
+        self,
+        plate_text: str,
+        label: str = None,
+        status: str = None,
+        notes: str = None,
+        manual: bool = None,
+    ) -> dict:
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.plates.err.operator_write_disabled", "Operator mode: disk writes are disabled.")}
+        norm = normalize_plate_text(plate_text)
+        if len(norm) < 2:
+            return {"ok": False, "error": tr("mod.plates.err.invalid_plate", "Enter a valid license plate (at least 2 alphanumeric characters).")}
+
+        now = time.time()
+        with self._db_lock:
+            self._sync_if_modified_locked()
+            cur = dict(self._meta_by_plate.get(norm) or {
+                "plate": norm,
+                "label": "",
+                "status": "normal",
+                "notes": "",
+                "manual": False,
+                "created_ts": now,
+                "updated_ts": now,
+            })
+            if label is not None:
+                cur["label"] = str(label).strip()
+            if notes is not None:
+                cur["notes"] = str(notes).strip()
+            if status is not None:
+                st = str(status).strip().lower()
+                if st in VALID_PLATE_STATUSES:
+                    cur["status"] = st
+            if manual is not None:
+                cur["manual"] = bool(manual)
+            cur["plate"] = norm
+            cur["updated_ts"] = now
+            if not cur.get("created_ts"):
+                cur["created_ts"] = now
+
+            if cur["status"] == "normal" and not cur["label"] and not cur["notes"] and not cur["manual"]:
+                self._meta_by_plate.pop(norm, None)
+            else:
+                self._meta_by_plate[norm] = cur
+            self._save_database_locked()
+        return {"ok": True, "plate": norm, "record": dict(cur)}
+
+    def add_plate_record(self, plate_text: str, label: str = "", status: str = "whitelist", notes: str = "") -> dict:
+        return self.set_plate_metadata(
+            plate_text,
+            label=label,
+            status=status,
+            notes=notes,
+            manual=True,
+        )
+
+    def delete_db_record(self, plate_text: str) -> bool:
+        if not getattr(self, "allow_disk_write", True):
+            return False
+        norm = normalize_plate_text(plate_text)
+        if not norm:
+            return False
+        with self._db_lock:
+            self._sync_if_modified_locked()
+            if norm in self._meta_by_plate:
+                self._meta_by_plate.pop(norm, None)
+                self._save_database_locked()
+                return True
+        return False
+
+    def collect_plate_events(self, cameras_info: list) -> dict:
+        """
+        Сканує архіви номерів (<cam_archive_dir>/plates/) по всіх камерах
+        та об'єднує їх із базою метаданих <archive_root>/plates_db/plates.json.
+        """
+        with self._db_lock:
+            self._sync_if_modified_locked()
+            meta_by_plate = {k: dict(v) for k, v in self._meta_by_plate.items()}
+
+        events_by_plate = {}
+
+        for cam in (cameras_info or []):
+            cam_uid = str(cam.get("uuid") or "")
+            cam_name = str(cam.get("name") or cam_uid or tr("camera.default_single", "Camera"))
+            cam_arch = str(cam.get("archive_dir") or "")
+            plates_dir = os.path.join(cam_arch, "plates") if cam_arch else ""
+            if not plates_dir or not os.path.isdir(plates_dir):
+                continue
+
+            for root_dir, _, files in os.walk(plates_dir):
+                if "_staging" in root_dir:
+                    continue
+                files_set = set(files)
+                rel_dir = os.path.relpath(root_dir, plates_dir)
+                day_key = rel_dir if rel_dir != "." else ""
+                for fname in files:
+                    lower = fname.lower()
+                    if not lower.endswith((".jpg", ".jpeg", ".png")):
+                        continue
+                    parsed = _parse_plate_filename(fname)
+                    if not parsed:
+                        continue
+
+                    crop_path = os.path.join(root_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(crop_path)
+                    except Exception:
+                        continue
+
+                    time_prefix = parsed["time_prefix"]
+                    full_cand_name = f"{time_prefix}_full.jpg"
+                    full_path = os.path.join(root_dir, full_cand_name) if full_cand_name in files_set else ""
+                    stem = os.path.splitext(fname)[0]
+                    dbg_name = f"{stem}_debug.txt"
+                    debug_path = os.path.join(root_dir, dbg_name) if dbg_name in files_set else ""
+
+                    ts_val, day_str, time_str = _parse_ts_from_day_and_filename(day_key, fname, mtime)
+                    if parsed["time_display"] != "--:--:--":
+                        time_str = parsed["time_display"]
+
+                    plate_key = parsed["plate"]
+                    ev = {
+                        "event_id": crop_path,
+                        "plate": plate_key,
+                        "conf": parsed["conf"],
+                        "sharpness": None,
+                        "camera_uuid": cam_uid,
+                        "camera_name": cam_name,
+                        "day": day_str,
+                        "time": time_str,
+                        "timestamp": float(ts_val),
+                        "crop_path": crop_path,
+                        "full_path": full_path,
+                        "debug_path": debug_path,
+                        "filename": fname,
+                    }
+                    events_by_plate.setdefault(plate_key, []).append(ev)
+
+        all_keys = sorted(set(meta_by_plate.keys()) | set(events_by_plate.keys()))
+        plate_records = []
+        summary = {}
+
+        for plate_key in all_keys:
+            ev_list = events_by_plate.setdefault(plate_key, [])
+            ev_list.sort(key=lambda e: (e["timestamp"], e["filename"]))
+
+            cams_seen = []
+            confs = []
+            best_conf_ev = None
+            for e in ev_list:
+                if e["camera_name"] not in cams_seen:
+                    cams_seen.append(e["camera_name"])
+                if isinstance(e.get("conf"), (int, float)):
+                    c_val = int(e["conf"])
+                    confs.append(c_val)
+                    if best_conf_ev is None or c_val >= int(best_conf_ev.get("conf") or -1):
+                        best_conf_ev = e
+
+            meta = meta_by_plate.get(plate_key) or {}
+            thumb_path = ""
+            if ev_list:
+                thumb_path = (best_conf_ev or ev_list[-1]).get("crop_path") or ev_list[-1].get("crop_path") or ""
+
+            best_conf = max(confs) if confs else None
+            avg_conf = int(round(sum(confs) / float(len(confs)))) if confs else None
+
+            plate_records.append({
+                "plate": plate_key,
+                "label": meta.get("label", ""),
+                "status": meta.get("status", "normal"),
+                "notes": meta.get("notes", ""),
+                "manual": bool(meta.get("manual", False)),
+                "in_db": plate_key in meta_by_plate,
+                "updated_ts": float(meta.get("updated_ts", 0.0)),
+                "thumb_path": thumb_path,
+            })
+            summary[plate_key] = {
+                "event_count": len(ev_list),
+                "screen_count": sum(1 for e in ev_list if e.get("full_path")),
+                "first_ts": ev_list[0]["timestamp"] if ev_list else 0.0,
+                "last_ts": ev_list[-1]["timestamp"] if ev_list else float(meta.get("updated_ts", 0.0) or 0.0),
+                "best_conf": best_conf,
+                "avg_conf": avg_conf,
+                "cameras": cams_seen,
+            }
+
+        return {
+            "plates": plate_records,
+            "events_by_plate": events_by_plate,
+            "summary": summary,
+        }
+
+    def reanalyze_crop_ocr(
+        self,
+        crop_path: str,
+        current_plate: str = "",
+        known_plates: list = None,
+        max_diff: int = 2,
+    ) -> dict:
+        """Запускає OCR на збереженому кропі номера та знаходить схожі відомі номери в архіві/БД."""
+        if not crop_path or not os.path.exists(crop_path):
+            return {"ok": False, "error": tr("mod.plates.err.crop_missing_disk", "Plate snapshot file was not found on disk.")}
+
+        bgr = _imread_bgr(crop_path)
+        if bgr is None or getattr(bgr, "size", 0) == 0:
+            return {"ok": False, "error": tr("mod.plates.err.crop_read", "Failed to read plate snapshot image.")}
+
+        ocr_text = ""
+        ocr_conf_pct = 0
+        ocr = self._get_ocr()
+        if ocr is not None:
+            try:
+                res = ocr.predict(bgr)
+                txt, conf = PlateEngine._parse_ocr_result(res)
+                if txt and txt != "UNKNOWN":
+                    ocr_text = txt
+                    ocr_conf_pct = int(round(float(conf) * 100.0))
+            except Exception as e:
+                print(f"[PlateDB Re-OCR Error]: {e}")
+
+        sharpness = calculate_sharpness(bgr)
+        dbg_path = _debug_path_for_crop(crop_path)
+        debug_text = ""
+        if dbg_path and os.path.exists(dbg_path):
+            try:
+                with open(dbg_path, "r", encoding="utf-8") as df:
+                    debug_text = df.read()
+            except Exception:
+                debug_text = ""
+
+        cur_norm = normalize_plate_text(current_plate)
+        pool_keys = set()
+        for p in (known_plates or []):
+            np_k = normalize_plate_text(p)
+            if np_k:
+                pool_keys.add(np_k)
+        with self._db_lock:
+            self._sync_if_modified_locked()
+            pool_keys.update(self._meta_by_plate.keys())
+            meta_snap = {k: dict(v) for k, v in self._meta_by_plate.items()}
+
+        ref_tokens = [t for t in (cur_norm, ocr_text) if t]
+        similar = []
+        for cand in sorted(pool_keys):
+            if cand == cur_norm:
+                continue
+            best_dist = min((_levenshtein(cand, rt) for rt in ref_tokens), default=99)
+            same_len_sim = any(are_plates_similar(cand, rt, max_diff=1) for rt in ref_tokens)
+            if best_dist <= int(max_diff) or same_len_sim:
+                meta = meta_snap.get(cand) or {}
+                similar.append({
+                    "plate": cand,
+                    "distance": best_dist,
+                    "label": meta.get("label", ""),
+                    "status": meta.get("status", "normal"),
+                })
+        similar.sort(key=lambda item: (item["distance"], item["plate"]))
+
+        return {
+            "ok": True,
+            "ocr_plate": ocr_text,
+            "ocr_conf": ocr_conf_pct,
+            "sharpness": round(float(sharpness), 1),
+            "ocr_available": ocr is not None,
+            "similar": similar[:12],
+            "debug_text": debug_text,
+        }
+
+    def correct_event_plate(self, event_info: dict, new_plate_text: str, new_conf: int = None) -> dict:
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.plates.err.operator_write_disabled", "Operator mode: disk writes are disabled.")}
+        if not event_info:
+            return {"ok": False, "error": tr("mod.plates.err.crop_missing_disk", "Plate snapshot file was not found on disk.")}
+
+        norm_new = normalize_plate_text(new_plate_text)
+        if len(norm_new) < 2:
+            return {"ok": False, "error": tr("mod.plates.err.invalid_plate", "Enter a valid license plate (at least 2 alphanumeric characters).")}
+
+        crop_path = str(event_info.get("crop_path") or "")
+        if not crop_path or not os.path.exists(crop_path):
+            return {"ok": False, "error": tr("mod.plates.err.crop_missing_disk", "Plate snapshot file was not found on disk.")}
+
+        day_dir = os.path.dirname(crop_path)
+        fname = os.path.basename(crop_path)
+        ext = os.path.splitext(fname)[1] or ".jpg"
+        parsed = _parse_plate_filename(fname) or {}
+        time_prefix = parsed.get("time_prefix") or fname.split("_plate_", 1)[0]
+        old_plate = parsed.get("plate") or str(event_info.get("plate") or "")
+
+        if new_conf is not None:
+            conf_val = max(0, min(100, int(new_conf)))
+        else:
+            conf_val = parsed.get("conf")
+            if conf_val is None and event_info.get("conf") is not None:
+                try:
+                    conf_val = max(0, min(100, int(event_info["conf"])))
+                except Exception:
+                    conf_val = None
+
+        safe_plate = sanitize_filename_part(norm_new, fallback="PLATE")
+        base_stem = f"{time_prefix}_plate_{safe_plate}_{conf_val}%" if conf_val is not None else f"{time_prefix}_plate_{safe_plate}"
+
+        target_crop = os.path.join(day_dir, f"{base_stem}{ext}")
+        suffix_idx = 2
+        while os.path.normcase(os.path.abspath(target_crop)) != os.path.normcase(os.path.abspath(crop_path)) and os.path.exists(target_crop):
+            target_crop = os.path.join(day_dir, f"{base_stem}_fix{suffix_idx}{ext}")
+            suffix_idx += 1
+
+        old_debug = _debug_path_for_crop(crop_path)
+        new_debug = _debug_path_for_crop(target_crop)
+        try:
+            if os.path.normcase(os.path.abspath(target_crop)) != os.path.normcase(os.path.abspath(crop_path)):
+                os.replace(crop_path, target_crop)
+                if old_debug and os.path.exists(old_debug):
+                    try:
+                        os.replace(old_debug, new_debug)
+                    except Exception:
+                        pass
+            return {
+                "ok": True,
+                "old_plate": old_plate,
+                "new_plate": norm_new,
+                "old_crop_path": crop_path,
+                "new_crop_path": target_crop,
+                "conf": conf_val,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def merge_or_rename_plate(self, old_plate: str, new_plate: str, events: list) -> dict:
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.plates.err.operator_write_disabled", "Operator mode: disk writes are disabled.")}
+        norm_old = normalize_plate_text(old_plate)
+        norm_new = normalize_plate_text(new_plate)
+        if len(norm_new) < 2:
+            return {"ok": False, "error": tr("mod.plates.err.invalid_plate", "Enter a valid license plate (at least 2 alphanumeric characters).")}
+
+        moved = 0
+        failed = 0
+        for ev in (events or []):
+            r = self.correct_event_plate(ev, norm_new)
+            if r and r.get("ok"):
+                moved += 1
+            else:
+                failed += 1
+
+        if norm_old and norm_old != norm_new:
+            with self._db_lock:
+                self._sync_if_modified_locked()
+                old_rec = self._meta_by_plate.pop(norm_old, None)
+                if old_rec is not None:
+                    new_rec = self._meta_by_plate.get(norm_new)
+                    if new_rec is None:
+                        old_rec["plate"] = norm_new
+                        old_rec["updated_ts"] = time.time()
+                        self._meta_by_plate[norm_new] = old_rec
+                    else:
+                        if not new_rec.get("label") and old_rec.get("label"):
+                            new_rec["label"] = old_rec["label"]
+                        if not new_rec.get("notes") and old_rec.get("notes"):
+                            new_rec["notes"] = old_rec["notes"]
+                        if new_rec.get("status", "normal") == "normal" and old_rec.get("status", "normal") != "normal":
+                            new_rec["status"] = old_rec["status"]
+                        new_rec["manual"] = bool(new_rec.get("manual") or old_rec.get("manual"))
+                        new_rec["updated_ts"] = time.time()
+                    self._save_database_locked()
+
+        return {"ok": failed == 0 or moved > 0, "new_plate": norm_new, "moved": moved, "failed": failed}
+
+    def delete_crop_event(self, event_info: dict) -> dict:
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.plates.err.operator_write_disabled", "Operator mode: disk writes are disabled.")}
+        if not event_info:
+            return {"ok": False, "error": tr("mod.plates.err.event_missing", "Snapshot event is missing.")}
+
+        crop_path = str(event_info.get("crop_path") or "")
+        full_path = str(event_info.get("full_path") or "")
+        debug_path = str(event_info.get("debug_path") or _debug_path_for_crop(crop_path))
+
+        removed = []
+        for p in (crop_path, debug_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                    removed.append(p)
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+
+        # Видаляємо _full.jpg лише якщо жоден інший _plate_ кроп не ділить цей самий time_prefix
+        if crop_path and not full_path:
+            day_dir = os.path.dirname(crop_path)
+            fname = os.path.basename(crop_path)
+            if "_plate_" in fname:
+                tpfx = fname.split("_plate_", 1)[0]
+                cand_full = os.path.join(day_dir, f"{tpfx}_full.jpg")
+                if os.path.exists(cand_full):
+                    full_path = cand_full
+
+        if full_path and os.path.exists(full_path):
+            day_dir = os.path.dirname(full_path)
+            time_pfx = os.path.basename(full_path).split("_full", 1)[0]
+            has_sibling = False
+            try:
+                for fn in os.listdir(day_dir):
+                    low = fn.lower()
+                    if not low.endswith((".jpg", ".jpeg", ".png")) or "_full" in low:
+                        continue
+                    if fn.startswith(f"{time_pfx}_plate_"):
+                        has_sibling = True
+                        break
+            except Exception:
+                has_sibling = True
+            if not has_sibling:
+                try:
+                    os.remove(full_path)
+                    removed.append(full_path)
+                except Exception:
+                    pass
+
+        return {"ok": True, "removed_files": removed}
+
+    def delete_plate_completely(self, plate_text: str, plate_events: list, delete_files: bool = True) -> dict:
+        if not getattr(self, "allow_disk_write", True):
+            return {"ok": False, "error": tr("mod.plates.err.operator_write_disabled", "Operator mode: disk writes are disabled.")}
+        deleted_files = 0
+        if delete_files:
+            for ev in (plate_events or []):
+                r = self.delete_crop_event(ev)
+                if r and r.get("ok"):
+                    deleted_files += len(r.get("removed_files") or [])
+        rec_deleted = self.delete_db_record(plate_text)
+        return {"ok": True, "record_deleted": rec_deleted, "deleted_files": deleted_files}
+
+
+class PlateDBAccessor(_BasePlateDB):
+    """Аксесор бази номерів із прив'язаним спільним ThreadSafePlateOCR."""
+
+
+class FallbackPlateDB(_BasePlateDB):
+    """Полегшений доступ до бази номерів для GUI (коли жодна камера не активна)."""
+
+
 class PlateEngine:
     """Рушій фіксації та розпізнавання номерних знаків (підтримує спільні моделі та per-camera ізоляцію)."""
     def __init__(
@@ -801,10 +1537,12 @@ class PlateEngine:
         ocr=None,
         output_dir: str = None,
         providers=None,
+        plate_db=None,
     ):
         self.base_dir = base_dir
         self.config = dict(config or {})
         self.on_saved_callback = on_saved_callback
+        self.plate_db = plate_db
 
         self.plates_dir = output_dir or os.path.join(self.base_dir, "plates")
         self.allow_disk_write = True
@@ -1045,6 +1783,9 @@ class PlateEngine:
         if conf_pct < self.min_percent_to_save:
             return
 
+        if self.plate_db is not None and self.plate_db.is_ignored(text):
+            return
+
         now = time.time()
         self.recently_saved_plates = {
             p: t for p, t in self.recently_saved_plates.items()
@@ -1060,12 +1801,14 @@ class PlateEngine:
         now_dt = datetime.now()
         day_folder = now_dt.strftime("%Y-%m-%d")
         time_prefix = now_dt.strftime("%H-%M-%S") + f"-{int(now_dt.microsecond / 1000):03d}"
+        time_display = now_dt.strftime("%H:%M:%S")
 
         os.makedirs(self.plates_dir, exist_ok=True)
         day_dir = os.path.join(self.plates_dir, day_folder)
         os.makedirs(day_dir, exist_ok=True)
 
-        base_name = f"{time_prefix}_plate_{text}_{conf_pct}%"
+        safe_plate = sanitize_filename_part(text, fallback="PLATE")
+        base_name = f"{time_prefix}_plate_{safe_plate}_{conf_pct}%"
         plate_filename = f"{base_name}.jpg"
         full_filename = f"{time_prefix}_full.jpg"
         debug_filename = f"{base_name}_debug.txt"
@@ -1074,9 +1817,7 @@ class PlateEngine:
         full_path = os.path.join(day_dir, full_filename)
         debug_path = os.path.join(day_dir, debug_filename)
 
-        async_write_image(plate_path, best_plate_img)
-        async_write_image(full_path, best_frame)
-
+        debug_content = None
         if self.save_debug:
             track_dur = round(now - track.first_seen, 2)
             counter = Counter(track.text_history)
@@ -1101,18 +1842,41 @@ class PlateEngine:
                     f"Sharp: {rec['sharpness']} | Score: {rec['score']} | Box: {rec['bbox']}\n"
                 )
 
-            async_write_text(debug_path, debug_content)
+        plate_copy = best_plate_img.copy() if best_plate_img is not None else None
+        full_copy = best_frame
+        cb = self.on_saved_callback
+
+        def _persist_plate():
+            try:
+                _imwrite_bgr(plate_path, plate_copy)
+                if full_copy is not None:
+                    _imwrite_bgr(full_path, full_copy)
+                if debug_content is not None:
+                    with open(debug_path, "w", encoding="utf-8") as df:
+                        df.write(debug_content)
+            except Exception as e:
+                print(f"[PlateEngine Save Error]: {e}")
+            if cb:
+                try:
+                    cb(day_folder, time_display, text, plate_path)
+                except Exception:
+                    pass
 
         print(f"[BEST-SHOT НОМЕР] {text} ({conf_pct}%), різкість: {track.best_sharpness:.1f}, кадрів: {track.frames_tracked}")
-
-        if self.on_saved_callback:
-            time_display = now_dt.strftime("%H:%M:%S")
-            self.on_saved_callback(day_folder, time_display, text, plate_path)
+        submit_io(_persist_plate)
 
 
 # ------------------------------------------------------------------
 #  Контракт незалежного модуля для ModuleRegistry
 # ------------------------------------------------------------------
+def _resolve_db_path(base_dir: str, app_context: dict = None) -> str:
+    ctx = app_context or {}
+    dbp = ctx.get("plates_db_path")
+    if dbp:
+        return os.path.abspath(dbp)
+    return os.path.join(os.path.abspath(base_dir), "archive", "plates_db", "plates.json")
+
+
 def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, app_context: dict = None):
     det_path = os.path.join(base_dir, "models", "best.onnx")
     if not os.path.exists(det_path):
@@ -1122,19 +1886,73 @@ def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, ap
     if not os.path.exists(ocr_path) or not os.path.exists(cfg_path):
         raise FileNotFoundError("CCT OCR files are missing in models/")
 
+    db_path = _resolve_db_path(base_dir, app_context)
+    allow_write = _parse_allow_disk_write(app_context)
     det = ONNXDetector(det_path, providers=providers, intra_op_threads=ai_threads)
     ocr = ThreadSafePlateOCR(ocr_path, cfg_path, providers=providers)
+    db = PlateDBAccessor(db_path, base_dir=base_dir, ocr=ocr, allow_disk_write=allow_write)
     return {
         "detector": det,
         "ocr": ocr,
+        "db": db,
+        "db_path": db_path,
         "providers": list(getattr(det, "active_providers", providers or ["CPUExecutionProvider"])),
     }
+
+
+def _on_app_context_changed(shared_resources, app_context, base_dir: str, providers: list, ai_threads: int):
+    if not isinstance(shared_resources, dict):
+        return shared_resources
+    new_db = _resolve_db_path(base_dir, app_context)
+    allow_write = _parse_allow_disk_write(app_context)
+    cur_db = shared_resources.get("db_path") or ""
+    if os.path.abspath(new_db) != os.path.abspath(cur_db):
+        shared_resources["db"] = PlateDBAccessor(
+            new_db,
+            base_dir=base_dir,
+            ocr=shared_resources.get("ocr"),
+            allow_disk_write=allow_write,
+        )
+        shared_resources["db_path"] = new_db
+    else:
+        db = shared_resources.get("db")
+        if db is not None and hasattr(db, "set_allow_disk_write"):
+            db.set_allow_disk_write(allow_write)
+    return shared_resources
+
+
+_FALLBACK_PLATE_DB_LOCK = threading.Lock()
+_FALLBACK_PLATE_DB_CACHE = {}
+
+
+def _get_db_accessor(app_context: dict = None, shared_resources=None):
+    allow_write = _parse_allow_disk_write(app_context)
+    if isinstance(shared_resources, dict) and shared_resources.get("db") is not None:
+        db = shared_resources["db"]
+        if hasattr(db, "set_allow_disk_write"):
+            db.set_allow_disk_write(allow_write)
+        return db
+    base_dir = (app_context or {}).get("base_dir", "")
+    db_path = _resolve_db_path(base_dir, app_context)
+    cache_key = (os.path.abspath(db_path), os.path.abspath(base_dir) if base_dir else "")
+    with _FALLBACK_PLATE_DB_LOCK:
+        inst = _FALLBACK_PLATE_DB_CACHE.get(cache_key)
+        if inst is None:
+            ocr_ref = shared_resources.get("ocr") if isinstance(shared_resources, dict) else None
+            inst = FallbackPlateDB(db_path, base_dir=base_dir, ocr=ocr_ref, allow_disk_write=allow_write)
+            _FALLBACK_PLATE_DB_CACHE[cache_key] = inst
+        elif hasattr(inst, "set_allow_disk_write"):
+            inst.set_allow_disk_write(allow_write)
+        return inst
 
 
 def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_saved_callback=None, source=None, app_context=None):
     det = shared_resources.get("detector") if isinstance(shared_resources, dict) else None
     ocr = shared_resources.get("ocr") if isinstance(shared_resources, dict) else None
+    db = shared_resources.get("db") if isinstance(shared_resources, dict) else None
     cfg_copy = _merge_runtime_write_cfg(flat_cfg, app_context)
+    if db is not None and hasattr(db, "set_allow_disk_write"):
+        db.set_allow_disk_write(_parse_allow_disk_write(cfg_copy))
     return PlateEngine(
         base_dir=base_dir,
         config=cfg_copy,
@@ -1142,6 +1960,7 @@ def _create_engine(base_dir, flat_cfg, output_dir, shared_resources=None, on_sav
         detector=det,
         ocr=ocr,
         output_dir=output_dir,
+        plate_db=db,
     )
 
 
@@ -1153,7 +1972,11 @@ def _update_engine_config(engine, flat_cfg, source=None, shared_resources=None, 
             engine.detector = shared_resources["detector"]
         if shared_resources.get("ocr") is not None:
             engine.ocr = shared_resources["ocr"]
+        if shared_resources.get("db") is not None:
+            engine.plate_db = shared_resources["db"]
     cfg_copy = _merge_runtime_write_cfg(flat_cfg, app_context)
+    if getattr(engine, "plate_db", None) is not None and hasattr(engine.plate_db, "set_allow_disk_write"):
+        engine.plate_db.set_allow_disk_write(_parse_allow_disk_write(cfg_copy))
     engine.update_config(cfg_copy)
 
 
@@ -1300,8 +2123,11 @@ def _draw_overlays(frame, state_data: dict, mod_cfg: dict, now: float):
 def _parse_archive_record(fpath: str, base_name: str, root_dir: str, rel_dir: str):
     fname = os.path.basename(fpath)
     lower = fname.lower()
-    if "_full" in lower or lower.endswith("_debug.txt"):
+    if "_full" in lower or lower.endswith(("_debug.txt", ".json")):
         return None
+    parsed = _parse_plate_filename(fname)
+    if parsed:
+        return {"time": parsed["time_display"], "name": parsed["plate"]}
     if "_plate_" in base_name:
         parts = base_name.split("_plate_")
         time_disp = ":".join(parts[0].split("-")[:3])
@@ -1323,7 +2149,7 @@ MODULE_SPEC = {
     "short_badge": "LPR",
     "description": "Detection, perspective rectification, and OCR recognition of vehicle license plates.",
     "on_help": "Enable detection, OCR recognition, and archiving of vehicle license plates for this camera.",
-    "provides": ["anpr"],
+    "provides": ["anpr", "plate_db"],
     "library_deps": ["opencv-python", "onnxruntime", "fast-alpr", "fast-plate-ocr"],
     "settings_schema": [
         {
@@ -1431,7 +2257,8 @@ MODULE_SPEC = {
     "get_status_summary": get_status_summary,
     "ensure_resources": ensure_resources,
     "create_shared_resources": _create_shared_resources,
-    "on_app_context_changed": lambda res, ctx, *a, **kw: res,
+    "on_app_context_changed": _on_app_context_changed,
+    "get_db_accessor": _get_db_accessor,
     "create_engine": _create_engine,
     "update_engine_config": _update_engine_config,
     "process_and_pack": _process_and_pack,

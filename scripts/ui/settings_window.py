@@ -1026,6 +1026,7 @@ class SettingsWindow:
             self.draft["windows"] = {
                 "grid": {"left": 40, "top": 30, "width": 1280, "height": 760, "maximized": False},
                 "people": {"left": 120, "top": 70, "width": 1180, "height": 760, "maximized": False},
+                "plates": {"left": 140, "top": 80, "width": 1180, "height": 760, "maximized": False},
                 "settings": {"left": 100, "top": 60, "width": 1080, "height": 740, "maximized": False},
             }
             for idx, cam in enumerate(self.draft.get("cameras") or []):

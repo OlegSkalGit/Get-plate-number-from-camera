@@ -1283,6 +1283,15 @@ class CameraManager:
         except Exception:
             pass
 
+        fn_plates = getattr(self.cfg_mgr, "get_plates_db_path", None)
+        if callable(fn_plates):
+            plates_db_path = fn_plates(create=allow_write)
+        else:
+            plates_db_dir = os.path.join(os.path.abspath(self.cfg_mgr.get_archive_root()), "plates_db")
+            if allow_write:
+                os.makedirs(plates_db_dir, exist_ok=True)
+            plates_db_path = os.path.join(plates_db_dir, "plates.json")
+
         self.inference_pool.configure(
             ai_backend=hw_cfg_eff.get("ai_backend", "cpu"),
             ai_threads=int(hw_cfg_eff.get("ai_threads", 2)),
@@ -1290,6 +1299,7 @@ class CameraManager:
                 "operation_mode": op_mode,
                 "allow_disk_write": allow_write,
                 "faces_db_path": self.cfg_mgr.get_faces_db_path(create=allow_write),
+                "plates_db_path": plates_db_path,
             },
         )
 

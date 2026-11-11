@@ -200,6 +200,7 @@ class ConfigManager:
                 "grid": {"left": 40, "top": 30, "width": 1280, "height": 760, "maximized": False},
                 "settings": {"left": 100, "top": 60, "width": 1080, "height": 740, "maximized": False},
                 "people": {"left": 120, "top": 70, "width": 1180, "height": 760, "maximized": False},
+                "plates": {"left": 140, "top": 80, "width": 1180, "height": 760, "maximized": False},
             },
             "grid": {
                 "mode": "auto",
@@ -522,6 +523,18 @@ class ConfigManager:
         if should_create:
             os.makedirs(db_dir, exist_ok=True)
         return os.path.join(db_dir, "faces.txt")
+
+    def get_plates_db_path(self, create: bool = None) -> str:
+        with self._lock:
+            root = self.data.get("general", {}).get("archive_root") or os.path.join(self.base_dir, "archive")
+            if create is None:
+                should_create = not self._is_operator_mode_locked()
+            else:
+                should_create = bool(create)
+        db_dir = os.path.join(os.path.abspath(root), "plates_db")
+        if should_create:
+            os.makedirs(db_dir, exist_ok=True)
+        return os.path.join(db_dir, "plates.json")
 
     def get_camera_archive_dir(self, cam_uuid: str) -> str:
         return os.path.join(self.get_archive_root(), "cameras", str(cam_uuid))
