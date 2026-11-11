@@ -23,6 +23,12 @@ build/
 # Project specific ignores
 _VIDEO_/
 **/_VIDEO_/
+archive/
+**/archive/
+data/
+**/data/
+setup/
+config.json
 plates/
 **/plates/
 faces/
