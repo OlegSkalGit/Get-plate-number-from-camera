@@ -188,7 +188,7 @@ class CameraUnit:
         self.lock = threading.Lock()
         self.running = False
         self.detail_subscribers = 0
-        self._visible_to_grid = True
+        self._visible_to_grid = False
 
         self._latest_main_bgr = None
         self._latest_main_seq = 0
@@ -216,6 +216,7 @@ class CameraUnit:
         self._motion_frames_done = 0
         self._last_full_ai_ts = 0.0
         self._last_ai_sig = None
+        self._last_ai_object_ts = 0.0
 
         # Динамічні двигуни модулів: mod_id -> engine instance
         self._engines_lock = threading.Lock()
@@ -326,7 +327,9 @@ class CameraUnit:
                 m_cfg = mods.get(mid) or {}
                 default_on = bool(spec.get("default_enabled", True))
                 is_on = bool(m_cfg.get("on", default_on))
-                blocked_by_operator = (spec.get("kind") == "recorder" or bool(spec.get("writes_to_disk"))) and (not eff_allow_write)
+                blocked_by_operator = (
+                    spec.get("kind") in ("recorder", "ai") or bool(spec.get("writes_to_disk"))
+                ) and (not eff_allow_write)
 
                 if not is_on or blocked_by_operator:
                     if mid in self.engines:
@@ -543,6 +546,7 @@ class CameraUnit:
             self._motion_frames_done = 0
             self._last_full_ai_ts = 0.0
             self._last_ai_sig = None
+            self._last_ai_object_ts = 0.0
 
     def add_detail_subscriber(self):
         with self.lock:
@@ -668,20 +672,20 @@ class CameraUnit:
             time.sleep(min(0.2, max(0.01, end_ts - time.time())))
 
     def _needs_main_decode(self, has_dedicated_sub: bool, main_src) -> bool:
-        mods = self.cam_cfg.get("modules") or {}
-        if not has_dedicated_sub:
-            return True
         with self.lock:
             if self.detail_subscribers > 0:
                 return True
-
-        for ent in self.registry.list_modules(kind="ai"):
-            mc = mods.get(ent["id"]) or {}
-            if mc.get("on", False) and is_date_range_active(mc.get("date_from", ""), mc.get("date_to", "")):
+            if (not has_dedicated_sub) and self._visible_to_grid:
                 return True
 
         if not self._effective_allow_disk_write():
             return False
+
+        mods = self.cam_cfg.get("modules") or {}
+        for ent in self.registry.list_modules(kind="ai"):
+            mc = mods.get(ent["id"]) or {}
+            if mc.get("on", False) and is_date_range_active(mc.get("date_from", ""), mc.get("date_to", "")):
+                return True
 
         for ent in self.registry.list_modules(kind="recorder"):
             mid = ent["id"]
@@ -697,6 +701,8 @@ class CameraUnit:
         return False
 
     def _any_ai_active_now(self) -> bool:
+        if not self._effective_allow_disk_write():
+            return False
         mods = self.cam_cfg.get("modules") or {}
         for ent in self.registry.list_modules(kind="ai"):
             mc = mods.get(ent["id"]) or {}
@@ -737,12 +743,38 @@ class CameraUnit:
 
         try:
             while self.running:
+                with self.lock:
+                    vis_now = self._visible_to_grid
+                if not vis_now:
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                    with self.lock:
+                        self._latest_grid_rgb = None
+                        self._sub_status = "standby"
+                        self._sub_fps = 0.0
+                    self._sleep_interruptible(0.25)
+                    continue
+
                 if cap is None or not cap.isOpened():
                     dec_mode = str(self.hardware_cfg.get("video_decode_mode", "cpu"))
                     dec_threads = max(1, int(self.hardware_cfg.get("video_decode_threads") or self.hardware_cfg.get("_decode_threads") or 2))
                     with self.lock:
                         self._sub_status = "connecting"
                     cap, _ = open_video_capture(sub_src, decode_mode=dec_mode, decode_threads=dec_threads)
+                    with self.lock:
+                        still_vis = self._visible_to_grid
+                    if not still_vis:
+                        if cap is not None:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = None
+                        continue
                     if cap is None or not cap.isOpened():
                         with self.lock:
                             self._sub_status = "offline"
@@ -899,7 +931,11 @@ class CameraUnit:
                     with self.lock:
                         self._main_status = "offline" if cv2 is None else "standby"
                         self._main_fps = 0.0
-                    time.sleep(0.25)
+                        if not has_dedicated_sub:
+                            self._latest_grid_rgb = None
+                            self._sub_status = "offline" if cv2 is None else "standby"
+                            self._sub_fps = 0.0
+                    self._sleep_interruptible(0.25)
                     continue
 
                 if cap is None or not cap.isOpened():
@@ -908,6 +944,14 @@ class CameraUnit:
                     with self.lock:
                         self._main_status = "connecting"
                     cap, _ = open_video_capture(main_src, decode_mode=dec_mode, decode_threads=dec_threads)
+                    if not self._needs_main_decode(has_dedicated_sub, main_src):
+                        if cap is not None:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = None
+                        continue
                     if cap is None or not cap.isOpened():
                         with self.lock:
                             self._main_status = "offline"
@@ -944,8 +988,8 @@ class CameraUnit:
                     last_grid_ts = self._grid_last_push_ts
                     ai_due = ai_active_now and (not self._ai_busy) and (self._pending_ai_frame is None) and ((t0 - self._last_ai_submit_ts) >= (1.0 / ai_fps_limit))
 
-                want_grid = (not has_dedicated_sub) and (
-                    (not has_grid_img) or (vis_grid and (t0 - last_grid_ts) >= (1.0 / grid_fps))
+                want_grid = (not has_dedicated_sub) and vis_grid and (
+                    (not has_grid_img) or (t0 - last_grid_ts) >= (1.0 / grid_fps)
                 )
                 want_rec = False
                 if active_rec_feed:
@@ -1015,19 +1059,23 @@ class CameraUnit:
 
                 if want_decode and frame is not None:
                     # 1. Запис чистого основного кадру усіма активними recorder-модулями (frame read-only ref)
+                    ai_obj_present = self.is_ai_object_present(hold_sec=3.0)
                     for rec_eng, push_fn in active_rec_feed:
                         try:
-                            push_fn(rec_eng, frame, allowed=True, frame_ts=t_cap)
+                            push_fn(rec_eng, frame, allowed=True, frame_ts=t_cap, ai_object_present=ai_obj_present)
                         except TypeError:
                             try:
-                                push_fn(rec_eng, frame, allowed=True)
-                            except Exception:
-                                pass
+                                push_fn(rec_eng, frame, allowed=True, frame_ts=t_cap)
+                            except TypeError:
+                                try:
+                                    push_fn(rec_eng, frame, allowed=True)
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
-                    # 2. Якщо sub_source відсутній — оновлюємо плитку сітки
-                    if not has_dedicated_sub:
+                    # 2. Якщо sub_source відсутній — оновлюємо плитку сітки лише коли вона видима
+                    if not has_dedicated_sub and vis_grid:
                         self._push_to_grid_cache(frame, force=not has_grid_img)
 
                     # 3. Буфер для незалежного вікна повного перегляду
@@ -1243,12 +1291,30 @@ class CameraUnit:
                     print(f"[AI Module Error '{mid}' @ {self.cam_cfg.get('name')}]: {me}")
                     new_states[mid] = dict(prev_st or {})
 
+            any_obj = False
+            for st in new_states.values():
+                if isinstance(st, dict) and st.get("boxes"):
+                    any_obj = True
+                    break
+            if any_obj:
+                self._last_ai_object_ts = time.time()
+
             with self._overlay_lock:
                 self._overlay_state = new_states
         except Exception as e:
             print(f"[AI Camera Error {self.cam_cfg.get('name')}]: {e}")
         finally:
             self.clear_ai_busy()
+
+    def is_ai_object_present(self, hold_sec: float = 3.0) -> bool:
+        """Return True while any active AI module sees an object or within hold_sec after last detection."""
+        with self._overlay_lock:
+            for st in self._overlay_state.values():
+                if isinstance(st, dict) and st.get("boxes"):
+                    self._last_ai_object_ts = time.time()
+                    return True
+        last_ts = float(getattr(self, "_last_ai_object_ts", 0.0) or 0.0)
+        return last_ts > 0.0 and (time.time() - last_ts) <= float(hold_sec)
 
 
 def _sort_ai_entries_for_cascade(ai_entries: list) -> list:

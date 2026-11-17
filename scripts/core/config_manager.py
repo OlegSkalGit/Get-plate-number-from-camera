@@ -5,6 +5,7 @@ import uuid
 import shutil
 import threading
 import configparser
+from typing import Optional
 
 from scripts.core.i18n import tr, normalize_language_code, DEFAULT_LANGUAGE
 from scripts.core.security import (
@@ -49,6 +50,7 @@ def make_camera_entry(
         "enabled": bool(enabled),
         "main_source": str(main_source or "").strip(),
         "sub_source": str(sub_source or "").strip(),
+        "monitor_id": "",
         "group_id": str(group_id or "").strip(),
         "tree_order": 0,
         "window": {
@@ -67,6 +69,161 @@ def make_camera_entry(
         },
         "modules": mods,
     }
+
+
+DEFAULT_MONITOR_GRID = {
+    "mode": "auto",
+    "rows": 2,
+    "cols": 2,
+    "border_color": "#00e5ff",
+    "active_border_color": "#00ff88",
+    "offline_border_color": "#ff4444",
+    "border_width": 2,
+    "tile_gap": 4,
+    "show_labels": True,
+    "show_status": True,
+    "show_fps": True,
+}
+
+
+def make_monitor_entry(
+    name: str = "Monitor 1",
+    mon_id: Optional[str] = None,
+    open_state: bool = True,
+    tree_order: int = 0,
+    window: Optional[dict] = None,
+    grid: Optional[dict] = None,
+) -> dict:
+    """Create a monitor configuration dictionary with default window geometry and grid settings."""
+    win = {
+        "left": 80,
+        "top": 60,
+        "width": 1280,
+        "height": 760,
+        "maximized": False,
+    }
+    if isinstance(window, dict):
+        win = _deep_merge(win, window)
+    grid_cfg = copy.deepcopy(DEFAULT_MONITOR_GRID)
+    if isinstance(grid, dict):
+        grid_cfg = _deep_merge(grid_cfg, grid)
+    return {
+        "id": str(mon_id or uuid.uuid4()),
+        "name": str(name or "Monitor 1").strip() or "Monitor 1",
+        "open": bool(open_state),
+        "tree_order": int(tree_order or 0),
+        "window": win,
+        "grid": grid_cfg,
+    }
+
+
+def ensure_monitor_hierarchy(cfg: dict) -> dict:
+    """Ensure at least 1 monitor exists and every group/camera belongs to a valid monitor."""
+    if not isinstance(cfg, dict):
+        return cfg
+
+    fallback_grid = cfg.get("grid") if isinstance(cfg.get("grid"), dict) else {}
+    raw_mons = cfg.get("camera_monitors")
+    norm_mons = []
+    seen_mids = set()
+    if isinstance(raw_mons, list):
+        for idx, m in enumerate(raw_mons):
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "").strip()
+            if not mid or mid in seen_mids:
+                mid = str(uuid.uuid4())
+            seen_mids.add(mid)
+            try:
+                t_ord = int(m.get("tree_order", idx) if m.get("tree_order") is not None else idx)
+            except Exception:
+                t_ord = idx
+            raw_m_grid = m.get("grid") if isinstance(m.get("grid"), dict) else fallback_grid
+            norm_mons.append(
+                make_monitor_entry(
+                    name=str(m.get("name") or f"Monitor {len(norm_mons) + 1}").strip() or f"Monitor {len(norm_mons) + 1}",
+                    mon_id=mid,
+                    open_state=m.get("open", True),
+                    tree_order=t_ord,
+                    window=m.get("window"),
+                    grid=raw_m_grid,
+                )
+            )
+    if not norm_mons:
+        norm_mons = [make_monitor_entry(name="Monitor 1", tree_order=0, grid=fallback_grid)]
+    cfg["camera_monitors"] = norm_mons
+
+    valid_mids = {m["id"] for m in norm_mons}
+    default_mid = norm_mons[0]["id"]
+
+    raw_groups = cfg.get("camera_groups")
+    norm_groups = []
+    seen_gids = set()
+    if isinstance(raw_groups, list):
+        for idx, g in enumerate(raw_groups):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get("id") or "").strip()
+            if not gid or gid in seen_gids:
+                continue
+            seen_gids.add(gid)
+            try:
+                t_ord = int(g.get("tree_order", idx) if g.get("tree_order") is not None else idx)
+            except Exception:
+                t_ord = idx
+            mid = str(g.get("monitor_id") or "").strip()
+            if mid not in valid_mids:
+                mid = ""
+            norm_groups.append(
+                {
+                    "id": gid,
+                    "name": str(g.get("name") or f"Branch {len(norm_groups) + 1}").strip() or f"Branch {len(norm_groups) + 1}",
+                    "parent_id": str(g.get("parent_id") or "").strip(),
+                    "monitor_id": mid,
+                    "open": bool(g.get("open", True)),
+                    "tree_order": t_ord,
+                }
+            )
+    group_map = {g["id"]: g for g in norm_groups}
+    for g in norm_groups:
+        if g["parent_id"] not in group_map or g["parent_id"] == g["id"]:
+            g["parent_id"] = ""
+
+    # Resolve monitor_id for groups via parent chain, falling back to default_mid
+    def _resolve_group_monitor(gid: str, visited: Optional[set] = None) -> str:
+        if visited is None:
+            visited = set()
+        if gid in visited or gid not in group_map:
+            return default_mid
+        visited.add(gid)
+        grp = group_map[gid]
+        if grp["monitor_id"] in valid_mids:
+            return grp["monitor_id"]
+        pid = grp.get("parent_id", "")
+        if pid and pid in group_map:
+            resolved = _resolve_group_monitor(pid, visited)
+            grp["monitor_id"] = resolved
+            return resolved
+        grp["monitor_id"] = default_mid
+        return default_mid
+
+    for g in norm_groups:
+        g["monitor_id"] = _resolve_group_monitor(g["id"])
+    cfg["camera_groups"] = norm_groups
+
+    for c in cfg.get("cameras") or []:
+        if not isinstance(c, dict):
+            continue
+        gid = str(c.get("group_id") or "").strip()
+        if gid and gid in group_map:
+            c["group_id"] = gid
+            c["monitor_id"] = group_map[gid]["monitor_id"]
+        else:
+            c["group_id"] = ""
+            mid = str(c.get("monitor_id") or "").strip()
+            c["monitor_id"] = mid if mid in valid_mids else default_mid
+
+    return cfg
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -97,7 +254,7 @@ SETTINGS_HELP = {
     "general.operation_mode": (
         "System Operation Mode\n"
         "• server (Server Mode) — all options, archive, video recording, saving plate/face/people snapshots, face DB updates, and auto-cleanup are enabled.\n"
-        "• operator (Operator Mode) — full live viewing and on-screen AI analysis (plates, recognizing already known faces, people/vehicles) WITHOUT any disk writes (recording, screenshots, auto-registering faces, cleanup, and window position auto-save are disabled)."
+        "• operator (Operator Mode, requires an access password) — full live viewing and on-screen AI analysis (plates, recognizing already known faces, people/vehicles) WITHOUT any disk writes (recording, screenshots, auto-registering faces, cleanup, and window position auto-save are disabled). In Operator Mode, the main window top bar shows the Settings button (plus page buttons when multiple pages exist); secondary monitor grids show the top bar only when multiple pages exist (page buttons only); in single-camera detail view, the top bar and detection frames are hidden."
     ),
     "general.archive_root": (
         "Archive Root Folder\n"
@@ -262,6 +419,8 @@ class ConfigManager:
                 "use_opencv_opencl": False,
             },
             "default_camera_modules": copy.deepcopy(reg_mods),
+            "camera_monitors": [],
+            "camera_groups": [],
             "cameras": [],
         }
 
@@ -408,9 +567,9 @@ class ConfigManager:
         gen = cfg.setdefault("general", {})
         raw_lang = normalize_language_code(gen.get("language")) or DEFAULT_LANGUAGE
         gen["language"] = raw_lang
-        raw_mode = str(gen.get("operation_mode", "server") or "server").strip().lower()
-        gen["operation_mode"] = "operator" if raw_mode == "operator" else "server"
         gen["auth"] = normalize_auth_cfg(gen.get("auth"))
+        raw_mode = str(gen.get("operation_mode", "server") or "server").strip().lower()
+        gen["operation_mode"] = "operator" if (raw_mode == "operator" and bool(gen["auth"].get("enabled", False))) else "server"
         if not gen.get("archive_root"):
             gen["archive_root"] = defaults["general"]["archive_root"]
 
@@ -442,6 +601,7 @@ class ConfigManager:
             )
             base_cam["window"] = _deep_merge(base_cam["window"], c.get("window") or {})
             base_cam["roi_window"] = _deep_merge(base_cam["roi_window"], c.get("roi_window") or {})
+            base_cam["monitor_id"] = str(c.get("monitor_id") or "").strip()
             base_cam["group_id"] = str(c.get("group_id") or "").strip()
             try:
                 base_cam["tree_order"] = int(c.get("tree_order", 0) or 0)
@@ -452,6 +612,7 @@ class ConfigManager:
         if not norm_cams:
             norm_cams = [make_camera_entry(name="Camera 1", main_source="0", sub_source="", modules=reg_mods)]
         cfg["cameras"] = norm_cams
+        ensure_monitor_hierarchy(cfg)
         return cfg
 
     def sync_with_registry(self, registry=None) -> bool:
@@ -496,6 +657,7 @@ class ConfigManager:
         self._is_locked = False
         cfg = self._make_defaults()
         cfg = self._migrate_from_ini(cfg)
+        ensure_monitor_hierarchy(cfg)
         self._save_dict_atomic(cfg)
         return cfg
 
@@ -679,10 +841,12 @@ class ConfigManager:
             old_auth = copy.deepcopy(self._auth_cfg)
             old_key = self._enc_key
             old_data_auth = copy.deepcopy((self.data.get("general") or {}).get("auth"))
+            old_op_mode = str((self.data.get("general") or {}).get("operation_mode", "server") or "server")
             try:
                 self._auth_cfg = {"enabled": False}
                 self._enc_key = None
                 self.data.setdefault("general", {})["auth"] = {"enabled": False}
+                self.data["general"]["operation_mode"] = "server"
                 self._save_dict_atomic(self.data)
                 self._version += 1
             except Exception:
@@ -690,6 +854,7 @@ class ConfigManager:
                 self._enc_key = old_key
                 if old_data_auth is not None:
                     self.data.setdefault("general", {})["auth"] = old_data_auth
+                self.data.setdefault("general", {})["operation_mode"] = old_op_mode
                 raise
             self._sync_camera_meta_files_locked()
             return True
@@ -806,6 +971,24 @@ class ConfigManager:
             self.data.setdefault("windows", {})[win_key] = copy.deepcopy(geom)
             self._version += 1
             self._save_dict_atomic(self.data)
+
+    def get_monitor_window_geometry(self, mon_id: str) -> dict:
+        with self._lock:
+            for m in self.data.get("camera_monitors", []):
+                if isinstance(m, dict) and str(m.get("id")) == str(mon_id):
+                    return copy.deepcopy(m.get("window", {}))
+        return {}
+
+    def set_monitor_window_geometry(self, mon_id: str, geom: dict):
+        with self._lock:
+            if self._is_locked or self._is_operator_mode_locked():
+                return
+            for m in self.data.get("camera_monitors", []):
+                if isinstance(m, dict) and str(m.get("id")) == str(mon_id):
+                    m["window"] = copy.deepcopy(geom)
+                    self._version += 1
+                    self._save_dict_atomic(self.data)
+                    return
 
     def get_camera_window_geometry(self, cam_uuid: str, kind: str = "window") -> dict:
         with self._lock:

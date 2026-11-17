@@ -62,13 +62,13 @@ if not exist ".venv\Scripts\python.exe" (
 
 REM 3. Перевірка та встановлення бібліотек комп'ютерного зору (типово CPU ONNX Runtime)
 echo Перевірка необхідних модулів...
-".venv\Scripts\python.exe" -c "import cv2, numpy, PIL, onnxruntime, yaml, fast_alpr, fast_plate_ocr, imageio_ffmpeg, psutil" >nul 2>nul
+".venv\Scripts\python.exe" -c "import cv2, numpy, PIL, onnxruntime, yaml, fast_alpr, fast_plate_ocr, imageio_ffmpeg, psutil, av" >nul 2>nul
 if %ERRORLEVEL% neq 0 (
     echo Встановлюємо або дозавантажуємо необхідні бібліотеки ^(типово CPU^)...
-    echo ^(Завантаження OpenCV, ONNX Runtime, FFmpeg та psutil може зайняти 1-2 хвилини^)
+    echo ^(Завантаження OpenCV, ONNX Runtime, PyAV, FFmpeg та psutil може зайняти 1-2 хвилини^)
     echo.
     ".venv\Scripts\python.exe" -m pip install --upgrade pip
-    ".venv\Scripts\python.exe" -m pip install opencv-python numpy pillow onnxruntime pyyaml fast-alpr fast-plate-ocr imageio-ffmpeg psutil
+    ".venv\Scripts\python.exe" -m pip install opencv-python numpy pillow onnxruntime pyyaml fast-alpr fast-plate-ocr imageio-ffmpeg psutil av
     if !ERRORLEVEL! neq 0 (
         echo.
         echo ===============================================================================================
@@ -82,41 +82,15 @@ if %ERRORLEVEL% neq 0 (
     echo [OK] Усі базові бібліотеки присутні.
 )
 
-REM 4. Опційний вибір графічного прискорення ONNX Runtime (типово залишається CPU)
+REM 4. Автопідготовка прискорення ONNX Runtime (у окремих папках ort_backends\ без перевстановлення)
 echo.
 echo --------------------------------------------------------
 echo   Прискорення нейромереж (ONNX Runtime)
 echo --------------------------------------------------------
-".venv\Scripts\python.exe" -c "import onnxruntime as ort; print('Поточні провайдери:', ', '.join(ort.get_available_providers()))" 2>nul
-echo.
-echo   [1] CPU (onnxruntime) - за замовчуванням, максимальна сумісність
-echo   [2] DirectML GPU (onnxruntime-directml) - прискорення на GPU Windows DX12 (NVIDIA / AMD / Intel)
-echo   [3] NVIDIA CUDA GPU (onnxruntime-gpu) - максимальна швидкість на відеокартах NVIDIA
-echo.
-choice /c 123 /n /t 8 /d 1 /m "Оберіть варіант [1/2/3] (через 8 сек автовибір 1 - поточна/CPU): "
-set "ORT_CHOICE=!ERRORLEVEL!"
-
-if "!ORT_CHOICE!"=="2" (
-    echo Перемикання ONNX Runtime на DirectML GPU...
-    ".venv\Scripts\python.exe" -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml >nul 2>nul
-    ".venv\Scripts\python.exe" -m pip install onnxruntime-directml
-    if !ERRORLEVEL! neq 0 (
-        echo [УВАГА] Не вдалося встановити onnxruntime-directml, повертаємо базовий onnxruntime ^(CPU^)...
-        ".venv\Scripts\python.exe" -m pip install onnxruntime
-    )
-) else if "!ORT_CHOICE!"=="3" (
-    echo Перемикання ONNX Runtime на NVIDIA CUDA...
-    ".venv\Scripts\python.exe" -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml >nul 2>nul
-    ".venv\Scripts\python.exe" -m pip install onnxruntime-gpu
-    if !ERRORLEVEL! neq 0 (
-        echo [УВАГА] Не вдалося встановити onnxruntime-gpu, повертаємо базовий onnxruntime ^(CPU^)...
-        ".venv\Scripts\python.exe" -m pip install onnxruntime
-    ) else (
-        echo Перевірка наявності бібліотек CUDA / cuDNN та завантаження відсутніх у папку cuda\...
-        ".venv\Scripts\python.exe" -m scripts.core.hardware_info --ensure-cuda .
-    )
-) else (
-    echo Залишаємо поточний варіант ONNX Runtime ^(перемикання також доступне у Налаштування - Залізо та графіка^).
+echo Автоматична перевірка GPU та підготовка оптимального бекенду в ort_backends\...
+".venv\Scripts\python.exe" -m scripts.core.hardware_info --ensure-optimal-ort .
+if !ERRORLEVEL! neq 0 (
+    echo [УВАГА] Використано базовий CPU-режим ONNX Runtime ^(перемикання також доступне у Налаштування - Залізо та графіка^).
 )
 
 echo.

@@ -30,6 +30,8 @@ data/
 setup/
 cuda/
 **/cuda/
+ort_backends/
+**/ort_backends/
 config.json
 plates/
 **/plates/

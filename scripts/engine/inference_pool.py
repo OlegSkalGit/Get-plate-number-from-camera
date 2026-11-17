@@ -3,11 +3,20 @@ import gc
 import copy
 import threading
 
-from scripts.core.hardware_info import prepare_cuda_dll_environment, check_cuda_libraries_status
+from scripts.core.hardware_info import (
+    prepare_cuda_dll_environment,
+    prepare_ort_backend_environment,
+    check_cuda_libraries_status,
+)
 
 
 def resolve_ort_providers(ai_backend: str, base_dir: str = None) -> list:
     backend = str(ai_backend or "cpu").strip().lower()
+    if base_dir:
+        try:
+            prepare_ort_backend_environment(base_dir, ai_backend=backend)
+        except Exception:
+            pass
     if base_dir and backend in ("cuda", "auto"):
         try:
             prepare_cuda_dll_environment(base_dir, preload=False)

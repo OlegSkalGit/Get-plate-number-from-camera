@@ -20,6 +20,7 @@ from scripts.core.io_pool import flush_io
 from scripts.core.hardware_info import (
     HardwareMonitor,
     prepare_cuda_dll_environment,
+    prepare_ort_backend_environment,
     check_cuda_libraries_status,
     download_cuda_libraries,
     is_onnxruntime_gpu_installed,
@@ -54,6 +55,76 @@ EVT_CONFIGURE = "<Configure>"
 EVT_ADMIN_EXIT_UP = "<Control-Alt-Shift-KeyPress-Q>"
 EVT_ADMIN_EXIT_LOW = "<Control-Alt-Shift-KeyPress-q>"
 
+
+def _is_win_modifiers_ctrl_alt_shift() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        ctrl = (u32.GetAsyncKeyState(0x11) & 0x8000) != 0
+        alt = (u32.GetAsyncKeyState(0x12) & 0x8000) != 0
+        shift = (u32.GetAsyncKeyState(0x10) & 0x8000) != 0
+        return bool(ctrl and alt and shift)
+    except Exception:
+        return False
+
+
+def _is_win_foreground_admin_exit_pressed() -> bool:
+    """Резервна перевірка Ctrl+Alt+Shift+Q через Win32 API для активного вікна нашого процесу."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        hwnd = u32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) != int(os.getpid()):
+            return False
+        q_down = (u32.GetAsyncKeyState(0x51) & 0x8000) != 0
+        if not q_down:
+            return False
+        return _is_win_modifiers_ctrl_alt_shift()
+    except Exception:
+        return False
+
+
+def is_admin_exit_keypress(event) -> bool:
+    """Перевіряє Ctrl+Alt+Shift+Q незалежно від розкладки клавіатури, мови та регістру/CapsLock."""
+    if event is None:
+        return False
+    try:
+        state = int(getattr(event, "state", 0) or 0)
+    except Exception:
+        state = 0
+
+    tk_ctrl = bool(state & 0x0004)
+    tk_shift = bool(state & 0x0001)
+    tk_alt = bool(state & (0x0008 | 0x0010 | 0x20000))
+    mods_ok = (tk_ctrl and tk_shift and tk_alt) or _is_win_modifiers_ctrl_alt_shift()
+    if not mods_ok:
+        return False
+
+    try:
+        kc = int(getattr(event, "keycode", 0) or 0)
+    except Exception:
+        kc = 0
+    ks = str(getattr(event, "keysym", "") or "").strip().lower()
+    ch = str(getattr(event, "char", "") or "")
+
+    # На Windows VK_Q == 81 для будь-якої мови та регістру; на X11/macOS перевіряємо також keysym і char
+    if sys.platform == "win32" and kc == 81:
+        return True
+    if ks in ("q", "cyrillic_shorti", "hebrew_qoph", "arabic_dad"):
+        return True
+    if ch in ("q", "Q", "й", "Й", "\x11"):
+        return True
+    return False
+
 LOCKDOWN_KEYS = [
     "<Alt-F4>",
     "<Alt-KeyPress-F4>",
@@ -65,7 +136,912 @@ LOCKDOWN_KEYS = [
 ]
 
 
-class MainGridWindow:
+class GridWindowBase:
+    """Shared tile layout, border highlight, and frame-rendering logic for Monitor grid windows."""
+
+    def _grid_win_widget(self):
+        return getattr(self, "win", None) or getattr(self, "root", None)
+
+    def _clear_tiles(self):
+        for slot in self._tiles.values():
+            for key in ("canvas", "hl_top", "hl_bottom", "hl_left", "hl_right"):
+                w = slot.get(key)
+                if w is not None:
+                    try:
+                        w.destroy()
+                    except Exception:
+                        pass
+        self._tiles.clear()
+        for es in self._empty_slots:
+            try:
+                es.destroy()
+            except Exception:
+                pass
+        self._empty_slots.clear()
+        if self._grid_surface is not None:
+            try:
+                self._grid_surface.destroy()
+            except Exception:
+                pass
+            self._grid_surface = None
+        self._last_grid_dims_key = None
+
+    def _apply_tile_highlight(self, t: dict, state: str, bcol: str):
+        cx, cy, cw, ch = t["cell_rect"]
+        bw = t["bw"]
+        strips = (
+            ("hl_top", cx - bw, cy - bw, cw + 2 * bw, bw),
+            ("hl_bottom", cx - bw, cy + ch, cw + 2 * bw, bw),
+            ("hl_left", cx - bw, cy, bw, ch),
+            ("hl_right", cx + cw, cy, bw, ch),
+        )
+        if state == "normal":
+            for key, *_ in strips:
+                try:
+                    t[key].place_forget()
+                except Exception:
+                    pass
+        else:
+            for key, sx, sy, sw, sh in strips:
+                try:
+                    t[key].configure(bg=bcol)
+                    t[key].place(x=sx, y=sy, width=sw, height=sh)
+                except Exception:
+                    pass
+
+    def _restack_grid_highlights(self):
+        for target_state in ("offline", "active"):
+            for t in self._tiles.values():
+                if t.get("last_hl_state") == target_state:
+                    for key in ("hl_top", "hl_bottom", "hl_left", "hl_right"):
+                        try:
+                            t[key].lift()
+                        except Exception:
+                            pass
+        if self._panel_visible:
+            try:
+                self.ctrl_frame.lift()
+            except Exception:
+                pass
+
+    def _get_grid_cfg(self) -> dict:
+        return (self._fast_cfg().get("grid") or {})
+
+    def _is_operator_mode(self) -> bool:
+        try:
+            gen = self._fast_cfg().get("general") or {}
+            return str(gen.get("operation_mode", "server")).strip().lower() == "operator"
+        except Exception:
+            return False
+
+    def _can_show_top_bar(self) -> bool:
+        if self._is_operator_mode():
+            if getattr(self, "btn_settings", None) is not None:
+                return True
+            return int(getattr(self, "_total_pages", 1) or 1) > 1
+        return True
+
+    def _sync_top_bar_for_mode(self):
+        is_op = self._is_operator_mode()
+        has_pages = int(getattr(self, "_total_pages", 1) or 1) > 1
+        has_settings = getattr(self, "btn_settings", None) is not None
+        lb = getattr(self, "_left_box", None)
+        rb = getattr(self, "_right_box", None)
+        op_hidden_left = getattr(self, "_op_hidden_left", None)
+
+        if is_op:
+            if has_settings and op_hidden_left:
+                for w in op_hidden_left:
+                    if w is not None and w.winfo_manager():
+                        w.pack_forget()
+                if lb is not None and not lb.winfo_manager():
+                    if self.page_box.winfo_manager():
+                        lb.pack(side=tk.LEFT, before=self.page_box)
+                    else:
+                        lb.pack(side=tk.LEFT)
+                if not self.btn_settings.winfo_manager():
+                    self.btn_settings.pack(side=tk.LEFT, padx=(0, 8))
+            else:
+                if lb is not None and lb.winfo_manager():
+                    lb.pack_forget()
+
+            if rb is not None and rb.winfo_manager():
+                rb.pack_forget()
+
+            if has_pages:
+                if not self.page_box.winfo_manager():
+                    self.page_box.pack(side=tk.LEFT, padx=14 if has_settings else 6)
+            else:
+                if self.page_box.winfo_manager():
+                    self.page_box.pack_forget()
+                if (not has_settings) and (getattr(self, "_panel_visible", False) or self.ctrl_frame.winfo_manager()):
+                    try:
+                        self.ctrl_frame.place_forget()
+                    except Exception:
+                        pass
+                    self._panel_visible = False
+        else:
+            if rb is not None and not rb.winfo_manager():
+                rb.pack(side=tk.RIGHT)
+            if has_settings and op_hidden_left:
+                if lb is not None and not lb.winfo_manager():
+                    if self.page_box.winfo_manager():
+                        lb.pack(side=tk.LEFT, before=self.page_box)
+                    elif rb is not None and rb.winfo_manager():
+                        lb.pack(side=tk.LEFT, before=rb)
+                    else:
+                        lb.pack(side=tk.LEFT)
+                # Ensure exact original left_box child order
+                lbl_brand, lbl_cam, lbl_mode, btn_ppl, btn_plt = op_hidden_left
+                if not lbl_brand.winfo_manager():
+                    lbl_brand.pack(side=tk.LEFT, padx=(0, 10), before=self.btn_settings)
+                if not lbl_cam.winfo_manager():
+                    lbl_cam.pack(side=tk.LEFT, padx=(0, 8), before=self.btn_settings)
+                if not lbl_mode.winfo_manager():
+                    lbl_mode.pack(side=tk.LEFT, padx=(0, 10), before=self.btn_settings)
+                if not btn_ppl.winfo_manager():
+                    btn_ppl.pack(side=tk.LEFT, padx=(0, 8))
+                if not btn_plt.winfo_manager():
+                    btn_plt.pack(side=tk.LEFT, padx=(0, 8))
+            elif lb is not None and not lb.winfo_manager():
+                if self.page_box.winfo_manager():
+                    lb.pack(side=tk.LEFT, before=self.page_box)
+                elif rb is not None and rb.winfo_manager():
+                    lb.pack(side=tk.LEFT, before=rb)
+                else:
+                    lb.pack(side=tk.LEFT)
+
+            if has_pages:
+                if not self.page_box.winfo_manager():
+                    if rb is not None and rb.winfo_manager():
+                        self.page_box.pack(side=tk.LEFT, padx=14, before=rb)
+                    else:
+                        self.page_box.pack(side=tk.LEFT, padx=14)
+            elif self.page_box.winfo_manager():
+                self.page_box.pack_forget()
+
+    def _update_tile_borders(self):
+        grid_cfg = self._get_grid_cfg()
+        col_normal = grid_cfg.get("border_color", "#00e5ff")
+        col_active = grid_cfg.get("active_border_color", "#00ff88")
+        col_offline = grid_cfg.get("offline_border_color", "#ff4444")
+
+        if self._grid_surface is not None and self._grid_surface.winfo_exists():
+            try:
+                if str(self._grid_surface.cget("bg")) != col_normal:
+                    self._grid_surface.configure(bg=col_normal)
+            except Exception:
+                pass
+
+        changed = False
+        for uid, t in self._tiles.items():
+            unit = self.camera_manager.get_unit(uid)
+            if uid in self.detail_windows:
+                hl_state, bcol = "active", col_active
+            elif unit is not None:
+                snap = unit.get_grid_snapshot() or {}
+                if snap.get("sub_status") in ("offline", "reconnecting") and snap.get("main_status") != "active":
+                    hl_state, bcol = "offline", col_offline
+                else:
+                    hl_state, bcol = "normal", col_normal
+            else:
+                hl_state, bcol = "offline", col_offline
+
+            bkey = (hl_state, bcol, t.get("bw", 2))
+            if bkey != t["last_border"]:
+                t["last_border"] = bkey
+                t["last_hl_state"] = hl_state
+                self._apply_tile_highlight(t, hl_state, bcol)
+                changed = True
+
+        if changed:
+            self._restack_grid_highlights()
+
+    def _relayout_grid_with_units(self, units: list, force: bool = False):
+        self._relayout_after_id = None
+        if self._is_closing or getattr(self, "_in_relayout", False):
+            return
+        self._in_relayout = True
+        try:
+            self._relayout_grid_with_units_inner(units, force=force)
+        finally:
+            self._in_relayout = False
+
+    def _relayout_grid_with_units_inner(self, units: list, force: bool = False):
+        w_obj = self._grid_win_widget()
+        if w_obj is None:
+            return
+        area_w = self.grid_area.winfo_width()
+        area_h = self.grid_area.winfo_height()
+
+        snap = self._fast_cfg()
+        grid_cfg = self._get_grid_cfg()
+        total_cams = len(units)
+        self._last_total_cams = total_cams
+        self.lbl_cam_count.configure(text=tr("ui.main.cam_count", "Cameras: {n}", n=total_cams))
+
+        mode = str(grid_cfg.get("mode", "auto")).lower()
+        if mode == "manual":
+            rows = max(1, min(8, int(grid_cfg.get("rows", 2))))
+            cols = max(1, min(8, int(grid_cfg.get("cols", 2))))
+            per_page = rows * cols
+            self._total_pages = max(1, (total_cams + per_page - 1) // per_page) if total_cams > 0 else 1
+            if self._current_page >= self._total_pages:
+                self._current_page = max(0, self._total_pages - 1)
+            start_i = self._current_page * per_page
+            visible_units = units[start_i:start_i + per_page]
+        else:
+            eff_w = area_w if area_w >= 80 else max(640, w_obj.winfo_width())
+            eff_h = area_h if area_h >= 80 else max(400, w_obj.winfo_height())
+            rows, cols = compute_auto_grid(max(1, total_cams), eff_w, eff_h)
+            self._total_pages = 1
+            self._current_page = 0
+            visible_units = units
+
+        self._visible_grid_uuids = {u.uuid for u in visible_units}
+        self._notify_visible_changed()
+
+        if self._total_pages > 1:
+            self.lbl_page.configure(
+                text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages)
+            )
+        self._sync_top_bar_for_mode()
+
+        if area_w < 80 or area_h < 80:
+            return
+
+        bw = max(1, min(10, int(grid_cfg.get("border_width", 2))))
+        gap = max(0, min(20, int(grid_cfg.get("tile_gap", 4))))
+        col_normal = grid_cfg.get("border_color", "#00e5ff")
+
+        layout_key = (
+            area_w, area_h, rows, cols, bw, gap,
+            tuple(u.uuid for u in visible_units),
+            bool(grid_cfg.get("show_labels", True)),
+            bool(grid_cfg.get("show_status", True)),
+            bool(grid_cfg.get("show_fps", True)),
+            col_normal,
+            grid_cfg.get("active_border_color", "#00ff88"),
+            grid_cfg.get("offline_border_color", "#ff4444"),
+        )
+        if not force and layout_key == self._last_layout_key and (bool(self._tiles) or not visible_units):
+            return
+        self._last_layout_key = layout_key
+
+        if not visible_units:
+            self._clear_tiles()
+            empty_txt = tr(
+                "ui.main.empty_cams",
+                "No enabled cameras.\nOpen ⚙ Settings above to add or enable cameras.",
+            )
+            if not hasattr(self, "_empty_lbl") or not self._empty_lbl.winfo_exists():
+                self._empty_lbl = tk.Label(
+                    self.grid_area,
+                    text=empty_txt,
+                    fg="#9ba3b8", bg="#0b0c10", font=("Segoe UI", 13)
+                )
+            else:
+                self._empty_lbl.configure(text=empty_txt)
+            self._empty_lbl.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+            return
+        elif hasattr(self, "_empty_lbl") and self._empty_lbl.winfo_exists():
+            self._empty_lbl.place_forget()
+
+        outer_pad = gap
+        avail_w = max(cols * 32, area_w - 2 * outer_pad - bw * (cols + 1))
+        avail_h = max(rows * 24, area_h - 2 * outer_pad - bw * (rows + 1))
+        base_w, rem_w = divmod(avail_w, cols)
+        base_h, rem_h = divmod(avail_h, rows)
+        col_widths = [base_w + (1 if c < rem_w else 0) for c in range(cols)]
+        row_heights = [base_h + (1 if r < rem_h else 0) for r in range(rows)]
+
+        col_xs = []
+        x_cur = bw
+        for c in range(cols):
+            col_xs.append(x_cur)
+            x_cur += col_widths[c] + bw
+
+        row_ys = []
+        y_cur = bw
+        for r in range(rows):
+            row_ys.append(y_cur)
+            y_cur += row_heights[r] + bw
+
+        total_grid_w = x_cur
+        total_grid_h = y_cur
+        origin_x = max(0, (area_w - total_grid_w) // 2)
+        origin_y = max(0, (area_h - total_grid_h) // 2)
+
+        needed_uids = tuple(u.uuid for u in visible_units)
+        grid_dims_key = (rows, cols, needed_uids)
+        if grid_dims_key != self._last_grid_dims_key or self._grid_surface is None or not self._grid_surface.winfo_exists():
+            self._clear_tiles()
+            self._last_grid_dims_key = grid_dims_key
+            self._grid_surface = tk.Frame(self.grid_area, bg=col_normal, highlightthickness=0, bd=0)
+
+            for u in visible_units:
+                canvas = tk.Canvas(self._grid_surface, bg="#08090d", highlightthickness=0, bd=0, cursor="hand2")
+                img_id = canvas.create_image(1, 1, anchor=tk.CENTER, tags="vid_img")
+                ph_id = canvas.create_text(
+                    1, 1, text=tr("ui.main.tile.connecting", "Connecting..."),
+                    fill="#ffcc00", font=("Segoe UI", 10, "bold"), tags="placeholder"
+                )
+
+                lbl_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, state=tk.HIDDEN, tags="ov_lbl")
+                lbl_txt_id = canvas.create_text(10, 10, text="", fill="#ffffff", font=("Segoe UI", 9, "bold"), anchor=tk.NW, state=tk.HIDDEN, tags="ov_lbl")
+
+                st_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, state=tk.HIDDEN, tags="ov_st")
+                st_txt_id = canvas.create_text(10, 10, text="", fill="#75e08b", font=("Segoe UI", 8, "bold"), anchor=tk.NE, state=tk.HIDDEN, tags="ov_st")
+
+                warn_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#351418", outline="#ff5555", width=1, state=tk.HIDDEN, tags="ov_warn")
+                warn_txt_id = canvas.create_text(10, 10, text="", fill="#ff9999", font=("Segoe UI", 8, "bold"), anchor=tk.SW, state=tk.HIDDEN, tags="ov_warn")
+
+                canvas.bind("<Button-1>", lambda e, uid=u.uuid: self.open_camera_detail(uid))
+
+                hl_top = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+                hl_bottom = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+                hl_left = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+                hl_right = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
+
+                self._tiles[u.uuid] = {
+                    "canvas": canvas,
+                    "hl_top": hl_top,
+                    "hl_bottom": hl_bottom,
+                    "hl_left": hl_left,
+                    "hl_right": hl_right,
+                    "img_id": img_id,
+                    "ph_id": ph_id,
+                    "lbl_bg_id": lbl_bg_id,
+                    "lbl_txt_id": lbl_txt_id,
+                    "st_bg_id": st_bg_id,
+                    "st_txt_id": st_txt_id,
+                    "warn_bg_id": warn_bg_id,
+                    "warn_txt_id": warn_txt_id,
+                    "photo_tk": None,
+                    "last_seq": -1,
+                    "inner_w": 0,
+                    "inner_h": 0,
+                    "cell_rect": (bw, bw, 32, 24),
+                    "bw": bw,
+                    "last_border": "",
+                    "last_hl_state": "",
+                    "last_lbl_text": None,
+                    "last_st_key": None,
+                    "last_warn_text": None,
+                }
+
+            total_slots = rows * cols
+            for _ in range(total_slots - len(visible_units)):
+                es = tk.Frame(self._grid_surface, bg="#08090d", highlightthickness=0, bd=0)
+                self._empty_slots.append(es)
+        else:
+            try:
+                if str(self._grid_surface.cget("bg")) != col_normal:
+                    self._grid_surface.configure(bg=col_normal)
+            except Exception:
+                pass
+
+        self._grid_surface.place(x=origin_x, y=origin_y, width=total_grid_w, height=total_grid_h)
+
+        for slot_i, u in enumerate(visible_units):
+            r = slot_i // cols
+            c = slot_i % cols
+            cx = col_xs[c]
+            cy = row_ys[r]
+            cw = col_widths[c]
+            ch = row_heights[r]
+            t = self._tiles[u.uuid]
+
+            cv = t["canvas"]
+            cv.place(x=cx, y=cy, width=cw, height=ch)
+            t["inner_w"] = cw
+            t["inner_h"] = ch
+            t["cell_rect"] = (cx, cy, cw, ch)
+            t["bw"] = bw
+            t["last_border"] = ""
+            t["last_lbl_text"] = None
+            t["last_st_key"] = None
+            t["last_warn_text"] = None
+
+            cv.coords(t["img_id"], cw // 2, ch // 2)
+            cv.coords(t["ph_id"], cw // 2, ch // 2)
+
+            u.set_grid_target_size(cw, ch)
+
+        for empty_idx, es in enumerate(self._empty_slots):
+            slot_i = len(visible_units) + empty_idx
+            r = slot_i // cols
+            c = slot_i % cols
+            es.place(x=col_xs[c], y=row_ys[r], width=col_widths[c], height=row_heights[r])
+
+        self._update_tile_borders()
+        if self._panel_visible:
+            self.ctrl_frame.lift()
+
+    def _render_tiles_with_units(self, units: list):
+        if self._is_closing:
+            return 83
+
+        w_obj = self._grid_win_widget()
+        if w_obj is None:
+            return 250
+        try:
+            st = str(w_obj.state()).lower()
+            if st == "iconic":
+                if not self._window_minimized:
+                    self._window_minimized = True
+                    self._notify_visible_changed()
+                return 250
+            elif self._window_minimized and st in ("normal", "zoomed"):
+                self._window_minimized = False
+                self._notify_visible_changed()
+        except Exception:
+            pass
+        if self._window_minimized:
+            return 250
+
+        if not self._tiles and units:
+            self._relayout_grid(force=False)
+
+        snap = self._fast_cfg()
+        grid_cfg = self._get_grid_cfg()
+        hw_cfg = snap.get("hardware") or {}
+        grid_fps = max(2.0, min(30.0, float(hw_cfg.get("display_grid_fps", 12.0))))
+        interval_ms = max(25, int(round(1000.0 / grid_fps)))
+
+        show_labels = bool(grid_cfg.get("show_labels", True))
+        show_status = bool(grid_cfg.get("show_status", True))
+        show_fps = bool(grid_cfg.get("show_fps", True))
+        col_normal = grid_cfg.get("border_color", "#00e5ff")
+        col_active = grid_cfg.get("active_border_color", "#00ff88")
+        col_offline = grid_cfg.get("offline_border_color", "#ff4444")
+
+        ai_entries = self.registry.list_modules(kind="ai")
+        border_changed = False
+
+        for uid, t in list(self._tiles.items()):
+            unit = self.camera_manager.get_unit(uid)
+            if unit is None:
+                continue
+            gs = unit.get_grid_snapshot()
+            cv = t["canvas"]
+            iw = max(32, t["inner_w"])
+            ih = max(24, t["inner_h"])
+
+            if uid in self.detail_windows:
+                hl_state, bcol = "active", col_active
+            elif gs.get("sub_status") in ("offline", "reconnecting") and gs.get("main_status") != "active":
+                hl_state, bcol = "offline", col_offline
+            else:
+                hl_state, bcol = "normal", col_normal
+            bkey = (hl_state, bcol, t.get("bw", 2))
+            if bkey != t["last_border"]:
+                t["last_border"] = bkey
+                t["last_hl_state"] = hl_state
+                self._apply_tile_highlight(t, hl_state, bcol)
+                border_changed = True
+
+            is_cam_enabled = bool(gs.get("enabled", True))
+            rgb = gs.get("rgb") if is_cam_enabled else None
+            seq = int(gs.get("seq", 0))
+            layer_dirty = False
+            if rgb is not None:
+                if seq != t["last_seq"] or t["photo_tk"] is None:
+                    t["last_seq"] = seq
+                    t["last_ph_key"] = None
+                    try:
+                        tk_img = ImageTk.PhotoImage(Image.fromarray(rgb))
+                        t["photo_tk"] = tk_img
+                        cv.itemconfigure(t["img_id"], image=tk_img, state=tk.NORMAL)
+                        cv.coords(t["img_id"], iw // 2, ih // 2)
+                        cv.itemconfigure(t["ph_id"], state=tk.HIDDEN)
+                        layer_dirty = True
+                    except Exception:
+                        pass
+            else:
+                if not is_cam_enabled:
+                    sub_s = "stopped"
+                    p_txt, p_col = tr("ui.main.tile.stopped", "Stopped"), "#9ba3b8"
+                else:
+                    st_map = {
+                        "offline": (tr("ui.main.tile.offline", "No signal (offline)"), "#ff6666"),
+                        "reconnecting": (tr("ui.main.tile.reconnecting", "Reconnecting sub-stream..."), "#ffcc00"),
+                        "connecting": (tr("ui.main.tile.connecting_sub", "Connecting sub-stream..."), "#ffcc00"),
+                        "fallback_main": (tr("ui.main.tile.waiting_main", "Waiting for main stream..."), "#ffcc00"),
+                    }
+                    sub_s = gs.get("sub_status", "")
+                    p_txt, p_col = st_map.get(
+                        sub_s,
+                        (tr("ui.main.tile.starting", "Starting..."), "#9ba3b8"),
+                    )
+                ph_key = (sub_s, p_txt, p_col, iw, ih)
+                if t.get("last_ph_key") != ph_key:
+                    t["last_ph_key"] = ph_key
+                    cv.itemconfigure(t["img_id"], state=tk.HIDDEN)
+                    cv.itemconfigure(t["ph_id"], text=p_txt, fill=p_col, state=tk.NORMAL)
+                    cv.coords(t["ph_id"], iw // 2, ih // 2)
+                    layer_dirty = True
+
+            if show_labels:
+                cam_nm = str(gs.get("name") or "").strip() or tr("camera.default_single", "Camera")
+                name_txt = f"📹 {cam_nm}"
+                if uid in self.detail_windows:
+                    name_txt += "  " + tr("ui.main.tile.open_tag", "[OPEN]")
+                if t["last_lbl_text"] != name_txt:
+                    t["last_lbl_text"] = name_txt
+                    cv.itemconfigure(t["lbl_txt_id"], text=name_txt, state=tk.NORMAL)
+                    cv.coords(t["lbl_txt_id"], 10, 8)
+                    bbox = cv.bbox(t["lbl_txt_id"])
+                    if bbox:
+                        cv.coords(t["lbl_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
+                        cv.itemconfigure(t["lbl_bg_id"], state=tk.NORMAL)
+                    layer_dirty = True
+            else:
+                if t["last_lbl_text"] != "__HIDDEN__":
+                    t["last_lbl_text"] = "__HIDDEN__"
+                    cv.itemconfigure(t["lbl_txt_id"], text="", state=tk.HIDDEN)
+                    cv.itemconfigure(t["lbl_bg_id"], state=tk.HIDDEN)
+
+            if show_status or show_fps:
+                parts = []
+                rec_on = bool(gs.get("recording"))
+                op_mode = str(gs.get("operation_mode") or "server")
+                if show_status:
+                    if rec_on:
+                        enc = gs.get("encoder") or "rec"
+                        parts.append(f"● REC ({enc})")
+                    elif op_mode == "operator":
+                        parts.append(tr("ui.main.tile.no_rec_badge", "👤 NO RECORDING"))
+                    m_on = gs.get("modules_on") or {}
+                    m_tags = []
+                    for ent in ai_entries:
+                        mid = ent["id"]
+                        if m_on.get(mid):
+                            raw_badge = ent["spec"].get("short_badge")
+                            if raw_badge != "":
+                                default_badge = raw_badge if raw_badge is not None else mid[:2].upper()
+                                badge = tr(f"mod.{mid}.short_badge", str(default_badge))
+                                if badge:
+                                    m_tags.append(str(badge))
+                    if m_tags:
+                        parts.append(" ".join(m_tags))
+                if show_fps and gs.get("sub_status") == "active":
+                    parts.append(f"{float(gs.get('fps', 0.0)):.1f} FPS")
+
+                st_txt = "  |  ".join(parts)
+                st_col = "#75e08b" if rec_on else ("#ffcc00" if op_mode == "operator" else "#9ee8ff")
+                st_key = (st_txt, st_col, iw)
+                if st_txt:
+                    if t["last_st_key"] != st_key:
+                        t["last_st_key"] = st_key
+                        cv.itemconfigure(t["st_txt_id"], text=st_txt, fill=st_col, state=tk.NORMAL)
+                        cv.coords(t["st_txt_id"], iw - 10, 8)
+                        bbox = cv.bbox(t["st_txt_id"])
+                        if bbox:
+                            cv.coords(t["st_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
+                            cv.itemconfigure(t["st_bg_id"], state=tk.NORMAL)
+                        layer_dirty = True
+                else:
+                    if t["last_st_key"] != ("__HIDDEN__",):
+                        t["last_st_key"] = ("__HIDDEN__",)
+                        cv.itemconfigure(t["st_txt_id"], text="", state=tk.HIDDEN)
+                        cv.itemconfigure(t["st_bg_id"], state=tk.HIDDEN)
+            else:
+                if t["last_st_key"] != ("__HIDDEN__",):
+                    t["last_st_key"] = ("__HIDDEN__",)
+                    cv.itemconfigure(t["st_txt_id"], text="", state=tk.HIDDEN)
+                    cv.itemconfigure(t["st_bg_id"], state=tk.HIDDEN)
+
+            warn_txt = ""
+            if rgb is not None and gs.get("sub_status") in ("offline", "reconnecting"):
+                warn_txt = tr("ui.main.tile.stream_lost", "⚠ Stream lost (reconnecting...)")
+            if t["last_warn_text"] != (warn_txt, ih):
+                t["last_warn_text"] = (warn_txt, ih)
+                if warn_txt:
+                    cv.itemconfigure(t["warn_txt_id"], text=warn_txt, state=tk.NORMAL)
+                    cv.coords(t["warn_txt_id"], 10, ih - 8)
+                    bbox = cv.bbox(t["warn_txt_id"])
+                    if bbox:
+                        cv.coords(t["warn_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
+                        cv.itemconfigure(t["warn_bg_id"], state=tk.NORMAL)
+                    layer_dirty = True
+                else:
+                    cv.itemconfigure(t["warn_txt_id"], text="", state=tk.HIDDEN)
+                    cv.itemconfigure(t["warn_bg_id"], state=tk.HIDDEN)
+
+            if layer_dirty:
+                cv.tag_raise("ov_lbl")
+                cv.tag_raise("ov_st")
+                cv.tag_raise("ov_warn")
+
+        if border_changed:
+            self._restack_grid_highlights()
+
+        return interval_ms
+
+
+class SecondaryMonitorWindow(GridWindowBase):
+    """Independent camera grid window for 2nd+ Monitors."""
+
+    def __init__(self, parent_grid, monitor_id: str, monitor_name: str):
+        self.parent_grid = parent_grid
+        self.monitor_id = str(monitor_id)
+        self.monitor_name = str(monitor_name or "Monitor")
+        self.camera_manager = parent_grid.camera_manager
+        self.registry = parent_grid.registry
+        self.detail_windows = parent_grid.detail_windows
+        self._is_closing = False
+
+        self.win = tk.Toplevel(parent_grid.root)
+        self.win.configure(bg="#0b0c10")
+        self.win.title(f"{self.monitor_name} — {tr('ui.main.window_title', 'ANPR Multi-Cam NVR — Camera Grid')}")
+
+        self._current_page = 0
+        self._total_pages = 1
+        self._tiles = {}
+        self._grid_surface = None
+        self._empty_slots = []
+        self._last_grid_dims_key = None
+        self._last_layout_key = None
+        self._relayout_after_id = None
+        self._hide_bar_after_id = None
+        self._panel_visible = True
+        self._last_total_cams = 0
+        self._window_minimized = False
+        self._visible_grid_uuids = set()
+
+        self.grid_area = tk.Frame(self.win, bg="#0b0c10")
+        self.grid_area.pack(fill=tk.BOTH, expand=True)
+
+        self.ctrl_frame = tk.Frame(
+            self.win, bg="#171923", padx=12, pady=7,
+            highlightthickness=1, highlightbackground="#292d3e"
+        )
+        left_box = tk.Frame(self.ctrl_frame, bg="#171923")
+        left_box.pack(side=tk.LEFT)
+        self._left_box = left_box
+
+        self.lbl_brand = tk.Label(
+            left_box, text=f"🖥 {self.monitor_name}", fg="#ffffff", bg="#171923",
+            font=("Segoe UI", 11, "bold")
+        )
+        self.lbl_brand.pack(side=tk.LEFT, padx=(0, 12))
+
+        self.lbl_cam_count = tk.Label(
+            left_box, text=tr("ui.main.cam_count", "Cameras: {n}", n=0), fg="#9ba3b8", bg="#171923",
+            font=("Segoe UI", 9)
+        )
+        self.lbl_cam_count.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.page_box = tk.Frame(self.ctrl_frame, bg="#171923")
+        self.btn_prev_page = tk.Button(
+            self.page_box, text="◀", command=lambda: self._change_page(-1),
+            bg="#2b2f40", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+            width=3, pady=2, cursor="hand2"
+        )
+        self.btn_prev_page.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.lbl_page = tk.Label(
+            self.page_box, text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=1, total=1), fg="#d5dae8", bg="#171923",
+            font=("Segoe UI", 9, "bold"), padx=6
+        )
+        self.lbl_page.pack(side=tk.LEFT)
+
+        self.btn_next_page = tk.Button(
+            self.page_box, text="▶", command=lambda: self._change_page(1),
+            bg="#2b2f40", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+            width=3, pady=2, cursor="hand2"
+        )
+        self.btn_next_page.pack(side=tk.LEFT, padx=(4, 0))
+
+        self._top_drag_widgets = (self.ctrl_frame, left_box, self.lbl_brand, self.lbl_cam_count, self.page_box, self.lbl_page)
+        self._sync_top_bar_for_mode()
+        if self._can_show_top_bar():
+            self._show_top_bar()
+        else:
+            self._panel_visible = False
+
+        self._borderless_ctl = apply_borderless_window_style(self.win)
+        if self._borderless_ctl is not None:
+            self._borderless_ctl.bind_drag_widgets(
+                self._top_drag_widgets,
+                on_interaction=self._on_top_bar_interact,
+            )
+
+        self.geom_tracker = WindowGeometryTracker(
+            self.win,
+            get_geom_cb=lambda mid=self.monitor_id: self.parent_grid.cfg_mgr.get_monitor_window_geometry(mid),
+            set_geom_cb=lambda g, mid=self.monitor_id: self.parent_grid.cfg_mgr.set_monitor_window_geometry(mid, g),
+            min_w=480,
+            min_h=320,
+            default_geom={"left": 120, "top": 80, "width": 1160, "height": 700, "maximized": False},
+        )
+
+        self.win.bind(EVT_MOTION, self._on_mouse_motion, add="+")
+        self.win.bind(EVT_CONFIGURE, self._on_configure, add="+")
+        self.win.bind("<Unmap>", self._on_unmap, add="+")
+        self.win.bind("<Map>", self._on_map, add="+")
+        self.win.protocol("WM_DELETE_WINDOW", self._on_user_close)
+        self._schedule_hide_bar(5000)
+
+    def _fast_cfg(self) -> dict:
+        return self.parent_grid._fast_cfg()
+
+    def _get_grid_cfg(self) -> dict:
+        snap = self._fast_cfg()
+        for m in (snap.get("camera_monitors") or []):
+            if isinstance(m, dict) and str(m.get("id")) == self.monitor_id:
+                if isinstance(m.get("grid"), dict):
+                    return m["grid"]
+                break
+        return super()._get_grid_cfg()
+
+    def open_camera_detail(self, cam_uuid: str):
+        self.parent_grid.open_camera_detail(cam_uuid)
+
+    def _notify_visible_changed(self):
+        self.parent_grid._sync_visible_grid_uuids()
+
+    def get_visible_uuids(self) -> set:
+        if self._is_closing or self._window_minimized:
+            return set()
+        return set(self._visible_grid_uuids)
+
+    def set_monitor_name(self, name: str):
+        self.monitor_name = str(name or "Monitor")
+        try:
+            self.lbl_brand.configure(text=f"🖥 {self.monitor_name}")
+            self.win.title(f"{self.monitor_name} — {tr('ui.main.window_title', 'ANPR Multi-Cam NVR — Camera Grid')}")
+        except Exception:
+            pass
+
+    def apply_language(self):
+        self.set_monitor_name(self.monitor_name)
+        self.lbl_cam_count.configure(text=tr("ui.main.cam_count", "Cameras: {n}", n=self._last_total_cams))
+        self.lbl_page.configure(text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages))
+        self._last_layout_key = None
+        self._relayout_grid(force=True)
+
+    def _show_top_bar(self):
+        if self._is_closing or not self._can_show_top_bar():
+            return
+        self._sync_top_bar_for_mode()
+        if not self._panel_visible or not self.ctrl_frame.winfo_manager():
+            self.ctrl_frame.place(x=0, y=0, relwidth=1.0)
+            self.ctrl_frame.lift()
+            self._panel_visible = True
+
+    def _hide_top_bar(self):
+        self._hide_bar_after_id = None
+        if self._is_closing:
+            return
+        try:
+            px, py = self.win.winfo_pointerxy()
+            rx = self.win.winfo_rootx()
+            ry = self.win.winfo_rooty()
+            rw = self.win.winfo_width()
+            if rx <= px <= rx + rw and ry <= py <= ry + 64:
+                self._schedule_hide_bar(2000)
+                return
+        except Exception:
+            pass
+        if self._panel_visible:
+            self.ctrl_frame.place_forget()
+            self._panel_visible = False
+
+    def _schedule_hide_bar(self, delay_ms: int = 3200):
+        if self._hide_bar_after_id is not None:
+            try:
+                self.win.after_cancel(self._hide_bar_after_id)
+            except Exception:
+                pass
+            self._hide_bar_after_id = None
+        if not self._is_closing:
+            self._hide_bar_after_id = self.win.after(delay_ms, self._hide_top_bar)
+
+    def _on_top_bar_interact(self):
+        self._show_top_bar()
+        if self._can_show_top_bar():
+            self._schedule_hide_bar(3800)
+
+    def _on_mouse_motion(self, event=None):
+        if self._is_closing or not self._can_show_top_bar():
+            return
+        try:
+            py = self.win.winfo_pointery() - self.win.winfo_rooty()
+        except Exception:
+            return
+        if py <= 54:
+            self._show_top_bar()
+            self._schedule_hide_bar(3200)
+        elif self._panel_visible and self._hide_bar_after_id is None:
+            self._schedule_hide_bar(2500)
+
+    def _on_unmap(self, event=None):
+        if self._is_closing or (event is not None and event.widget is not self.win):
+            return
+        try:
+            if str(self.win.state()).lower() not in ("iconic", "withdrawn"):
+                return
+        except Exception:
+            pass
+        if not self._window_minimized:
+            self._window_minimized = True
+            self._notify_visible_changed()
+
+    def _on_map(self, event=None):
+        if self._is_closing or (event is not None and event.widget is not self.win):
+            return
+        if self._window_minimized:
+            self._window_minimized = False
+            self._notify_visible_changed()
+            try:
+                self.render_tiles_once()
+            except Exception:
+                pass
+
+    def _on_configure(self, event=None):
+        if self._is_closing:
+            return
+        if event is not None and event.widget not in (self.win, self.grid_area):
+            return
+        if self._relayout_after_id is not None:
+            try:
+                self.win.after_cancel(self._relayout_after_id)
+            except Exception:
+                pass
+        self._relayout_after_id = self.win.after(50, lambda: self._relayout_grid(force=False))
+
+    def _change_page(self, delta: int):
+        new_p = max(0, min(max(0, self._total_pages - 1), self._current_page + delta))
+        if new_p != self._current_page:
+            self._current_page = new_p
+            self._relayout_grid(force=True)
+
+    def _relayout_grid(self, force: bool = False):
+        units = self.parent_grid._get_units_for_monitor(self.monitor_id)
+        self._relayout_grid_with_units(units, force=force)
+
+    def render_tiles_once(self):
+        units = self.parent_grid._get_units_for_monitor(self.monitor_id)
+        return self._render_tiles_with_units(units)
+
+    def _on_user_close(self):
+        try:
+            snap = self._fast_cfg()
+            if bool((snap.get("general") or {}).get("kiosk_mode", False)):
+                return
+        except Exception:
+            pass
+        try:
+            self.win.iconify()
+        except Exception:
+            pass
+
+    def close(self):
+        if self._is_closing:
+            return
+        self._is_closing = True
+        for attr in ("_relayout_after_id", "_hide_bar_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                try:
+                    self.win.after_cancel(aid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        try:
+            self.geom_tracker.close()
+        except Exception:
+            pass
+        self._clear_tiles()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+class MainGridWindow(GridWindowBase):
     """
     Головне вікно системи: адаптивна або ручна сітка перегляду стиснутих потоків (sub_source)
     усіх камер. Лівий клік по плитці відкриває незалежне вікно повного перегляду (main_source + архів)
@@ -89,6 +1065,7 @@ class MainGridWindow:
 
         # 1. Автоматичне виявлення незалежних модулів (scripts/modules/), конфіг і локалізація
         try:
+            prepare_ort_backend_environment(self.base_dir)
             prepare_cuda_dll_environment(self.base_dir, preload=False)
         except Exception:
             pass
@@ -139,6 +1116,7 @@ class MainGridWindow:
         self.people_win = None
         self.plates_win = None
         self.detail_windows = {}  # cam_uuid -> CameraDetailWindow
+        self.monitor_windows = {}  # monitor_id -> SecondaryMonitorWindow
 
         # Стан сітки та пагінації
         self._current_page = 0
@@ -177,6 +1155,7 @@ class MainGridWindow:
         self._apply_kiosk_mode(bool(gen_cfg.get("kiosk_mode", False)))
         self.root.bind_all(EVT_ADMIN_EXIT_UP, self._admin_exit)
         self.root.bind_all(EVT_ADMIN_EXIT_LOW, self._admin_exit)
+        self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
 
         self._build_ui()
 
@@ -224,6 +1203,7 @@ class MainGridWindow:
 
         left_box = tk.Frame(self.ctrl_frame, bg="#171923")
         left_box.pack(side=tk.LEFT)
+        self._left_box = left_box
 
         lbl_brand = tk.Label(
             left_box, text="📹 ANPR Multi-Cam NVR", fg="#ffffff", bg="#171923",
@@ -264,6 +1244,7 @@ class MainGridWindow:
             relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=4, cursor="hand2"
         )
         self.btn_plates.pack(side=tk.LEFT, padx=(0, 8))
+        self._op_hidden_left = (lbl_brand, self.lbl_cam_count, self.lbl_mode_badge, self.btn_people, self.btn_plates)
 
         # Блок пагінації (видимий лише коли в ручній сітці > 1 сторінки)
         self.page_box = tk.Frame(self.ctrl_frame, bg="#171923")
@@ -290,6 +1271,7 @@ class MainGridWindow:
         # Правий блок: телеметрія заліза + вихід
         right_box = tk.Frame(self.ctrl_frame, bg="#171923")
         right_box.pack(side=tk.RIGHT)
+        self._right_box = right_box
 
         self.lbl_hw_badge = tk.Label(
             right_box, text=tr("ui.main.hw_badge_init", "CPU: --% | RAM: -- | AI: CPU"),
@@ -318,7 +1300,11 @@ class MainGridWindow:
             self.lbl_hw_badge,
         )
 
-        self._show_top_bar()
+        self._sync_top_bar_for_mode()
+        if self._can_show_top_bar():
+            self._show_top_bar()
+        else:
+            self._panel_visible = False
 
     def _drain_ui_queue(self):
         if self._is_closing:
@@ -343,8 +1329,10 @@ class MainGridWindow:
         self._start_after_id = None
         if self._is_closing:
             return
-        self.camera_manager.start_all()
+        self.camera_manager.sync_from_config()
+        self._sync_monitor_windows()
         self._relayout_grid(force=True)
+        self.camera_manager.start_all()
         self._render_grid_tick()
         self._refresh_hw_badge_tick()
         self._module_poll_after_id = self.root.after(3000, self._poll_modules_tick)
@@ -663,6 +1651,13 @@ class MainGridWindow:
             parent=self.root,
         )
 
+    def _on_global_keypress(self, event=None):
+        if self._is_closing:
+            return
+        if is_admin_exit_keypress(event):
+            self._admin_exit(event)
+            return "break"
+
     def _admin_exit(self, event=None):
         self.on_close()
 
@@ -742,12 +1737,20 @@ class MainGridWindow:
             except Exception:
                 pass
 
+        for mwin in list(self.monitor_windows.values()):
+            try:
+                if mwin.win.winfo_exists():
+                    mwin.apply_language()
+            except Exception:
+                pass
+
         return eff_code
 
     def _show_top_bar(self):
-        if self._is_closing:
+        if self._is_closing or not self._can_show_top_bar():
             return
-        if not self._panel_visible or not self.ctrl_frame.winfo_ismapped():
+        self._sync_top_bar_for_mode()
+        if not self._panel_visible or not self.ctrl_frame.winfo_manager():
             self.ctrl_frame.place(x=0, y=0, relwidth=1.0)
             self.ctrl_frame.lift()
             self._panel_visible = True
@@ -782,10 +1785,11 @@ class MainGridWindow:
         if self._is_closing:
             return
         self._show_top_bar()
-        self._schedule_hide_bar(5000)
+        if self._can_show_top_bar():
+            self._schedule_hide_bar(5000)
 
     def _on_mouse_motion(self, event=None):
-        if self._is_closing:
+        if self._is_closing or not self._can_show_top_bar():
             return
         try:
             ry = self.root.winfo_rooty()
@@ -1103,6 +2107,7 @@ class MainGridWindow:
                 pass
 
         self._last_layout_key = None
+        self._sync_monitor_windows()
         self._relayout_grid(force=True)
         self._render_tiles_once()
         self._maybe_ensure_cuda_async()
@@ -1133,12 +2138,21 @@ class MainGridWindow:
             on_close_cb=self._on_detail_closed,
         )
         self.detail_windows[cam_uuid] = dwin
+        self._update_all_tile_borders()
+
+    def _update_all_tile_borders(self):
         self._update_tile_borders()
+        for mwin in list(self.monitor_windows.values()):
+            try:
+                if mwin.win.winfo_exists() and not mwin._is_closing:
+                    mwin._update_tile_borders()
+            except Exception:
+                pass
 
     def _on_detail_closed(self, cam_uuid: str):
         self.detail_windows.pop(cam_uuid, None)
         if not self._is_closing:
-            self._update_tile_borders()
+            self._update_all_tile_borders()
 
     def _on_camera_saved_cb(self, cam_uuid, mod_name, day_str, time_str, label, fpath):
         if self._is_closing:
@@ -1178,10 +2192,102 @@ class MainGridWindow:
             return self.cfg_mgr.get_ui_fast_config()
         return self.cfg_mgr.get_snapshot()
 
-    def _sync_visible_grid_uuids(self, vis_set: set):
-        if hasattr(self.camera_manager, "set_visible_grid_uuids"):
+    def _get_monitors(self) -> list:
+        snap = self._fast_cfg()
+        mons = sorted(
+            [m for m in (snap.get("camera_monitors") or []) if isinstance(m, dict) and m.get("id")],
+            key=lambda m: int(m.get("tree_order", 0) or 0),
+        )
+        return mons
+
+    def _get_grid_cfg(self) -> dict:
+        mons = self._get_monitors()
+        if mons and isinstance(mons[0].get("grid"), dict):
+            return mons[0]["grid"]
+        return super()._get_grid_cfg()
+
+    def _get_units_for_monitor(self, monitor_id: str) -> list:
+        snap = self._fast_cfg()
+        mons = self._get_monitors()
+        default_mid = str(mons[0]["id"]) if mons else ""
+        valid_mids = {str(m["id"]) for m in mons}
+        cam_mid_map = {}
+        for c in (snap.get("cameras") or []):
+            if not isinstance(c, dict):
+                continue
+            uid = str(c.get("uuid") or "")
+            mid = str(c.get("monitor_id") or "")
+            if mid not in valid_mids:
+                mid = default_mid
+            cam_mid_map[uid] = mid
+        units = self.camera_manager.get_ordered_units()
+        if not mons:
+            return units
+        target = str(monitor_id or default_mid)
+        return [u for u in units if cam_mid_map.get(u.uuid, default_mid) == target]
+
+    def _get_primary_monitor_units(self) -> list:
+        mons = self._get_monitors()
+        if not mons:
+            return self.camera_manager.get_ordered_units()
+        return self._get_units_for_monitor(str(mons[0]["id"]))
+
+    def _sync_monitor_windows(self):
+        if self._is_closing:
+            return
+        mons = self._get_monitors()
+        secondary = mons[1:] if len(mons) > 1 else []
+        want_ids = {str(m["id"]): m for m in secondary}
+
+        for mid in list(self.monitor_windows.keys()):
+            if mid not in want_ids:
+                mwin = self.monitor_windows.pop(mid)
+                try:
+                    mwin.close()
+                except Exception:
+                    pass
+
+        for mid, mon in want_ids.items():
+            mname = str(mon.get("name") or "Monitor")
+            existing = self.monitor_windows.get(mid)
+            if existing is not None:
+                try:
+                    if existing.win.winfo_exists() and not existing._is_closing:
+                        existing.set_monitor_name(mname)
+                        existing._last_layout_key = None
+                        existing._relayout_grid(force=True)
+                        existing.render_tiles_once()
+                        continue
+                except Exception:
+                    pass
+                self.monitor_windows.pop(mid, None)
+
+            mwin = SecondaryMonitorWindow(self, mid, mname)
+            self.monitor_windows[mid] = mwin
             try:
-                self.camera_manager.set_visible_grid_uuids(vis_set)
+                mwin._relayout_grid(force=True)
+                mwin.render_tiles_once()
+            except Exception:
+                pass
+
+        self._sync_visible_grid_uuids()
+
+    def _notify_visible_changed(self):
+        self._sync_visible_grid_uuids()
+
+    def _sync_visible_grid_uuids(self, _unused=None):
+        if hasattr(self.camera_manager, "set_visible_grid_uuids"):
+            all_vis = set()
+            if not self._window_minimized:
+                all_vis.update(self._visible_grid_uuids)
+            for mwin in list(self.monitor_windows.values()):
+                try:
+                    if mwin.win.winfo_exists() and not getattr(mwin, "_window_minimized", False):
+                        all_vis.update(mwin.get_visible_uuids())
+                except Exception:
+                    pass
+            try:
+                self.camera_manager.set_visible_grid_uuids(all_vis)
             except Exception:
                 pass
 
@@ -1227,529 +2333,32 @@ class MainGridWindow:
             self._current_page = new_p
             self._relayout_grid(force=True)
 
-    def _clear_tiles(self):
-        for slot in self._tiles.values():
-            for key in ("canvas", "hl_top", "hl_bottom", "hl_left", "hl_right"):
-                w = slot.get(key)
-                if w is not None:
-                    try:
-                        w.destroy()
-                    except Exception:
-                        pass
-        self._tiles.clear()
-        for es in self._empty_slots:
-            try:
-                es.destroy()
-            except Exception:
-                pass
-        self._empty_slots.clear()
-        if self._grid_surface is not None:
-            try:
-                self._grid_surface.destroy()
-            except Exception:
-                pass
-            self._grid_surface = None
-        self._last_grid_dims_key = None
-
-    def _apply_tile_highlight(self, t: dict, state: str, bcol: str):
-        cx, cy, cw, ch = t["cell_rect"]
-        bw = t["bw"]
-        strips = (
-            ("hl_top", cx - bw, cy - bw, cw + 2 * bw, bw),
-            ("hl_bottom", cx - bw, cy + ch, cw + 2 * bw, bw),
-            ("hl_left", cx - bw, cy, bw, ch),
-            ("hl_right", cx + cw, cy, bw, ch),
-        )
-        if state == "normal":
-            for key, *_ in strips:
-                try:
-                    t[key].place_forget()
-                except Exception:
-                    pass
-        else:
-            for key, sx, sy, sw, sh in strips:
-                try:
-                    t[key].configure(bg=bcol)
-                    t[key].place(x=sx, y=sy, width=sw, height=sh)
-                except Exception:
-                    pass
-
-    def _restack_grid_highlights(self):
-        for target_state in ("offline", "active"):
-            for t in self._tiles.values():
-                if t.get("last_hl_state") == target_state:
-                    for key in ("hl_top", "hl_bottom", "hl_left", "hl_right"):
-                        try:
-                            t[key].lift()
-                        except Exception:
-                            pass
-        if self._panel_visible:
-            try:
-                self.ctrl_frame.lift()
-            except Exception:
-                pass
-
     def _relayout_grid(self, force: bool = False):
-        self._relayout_after_id = None
-        if self._is_closing:
-            return
-
-        self.root.update_idletasks()
-        area_w = self.grid_area.winfo_width()
-        area_h = self.grid_area.winfo_height()
-        if area_w < 80 or area_h < 80:
-            return
-
-        snap = self._fast_cfg()
-        grid_cfg = snap.get("grid") or {}
-        units = self.camera_manager.get_ordered_units()
-        total_cams = len(units)
-        self._last_total_cams = total_cams
-        self.lbl_cam_count.configure(text=tr("ui.main.cam_count", "Cameras: {n}", n=total_cams))
-
-        mode = str(grid_cfg.get("mode", "auto")).lower()
-        if mode == "manual":
-            rows = max(1, min(8, int(grid_cfg.get("rows", 2))))
-            cols = max(1, min(8, int(grid_cfg.get("cols", 2))))
-            per_page = rows * cols
-            self._total_pages = max(1, (total_cams + per_page - 1) // per_page) if total_cams > 0 else 1
-            if self._current_page >= self._total_pages:
-                self._current_page = max(0, self._total_pages - 1)
-            start_i = self._current_page * per_page
-            visible_units = units[start_i:start_i + per_page]
-        else:
-            rows, cols = compute_auto_grid(max(1, total_cams), area_w, area_h)
-            self._total_pages = 1
-            self._current_page = 0
-            visible_units = units
-
-        self._visible_grid_uuids = {u.uuid for u in visible_units}
-        if not self._window_minimized:
-            self._sync_visible_grid_uuids(self._visible_grid_uuids)
-
-        if self._total_pages > 1:
-            self.lbl_page.configure(
-                text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages)
-            )
-            if not self.page_box.winfo_ismapped():
-                self.page_box.pack(side=tk.LEFT, padx=14)
-        elif self.page_box.winfo_ismapped():
-            self.page_box.pack_forget()
-
-        bw = max(1, min(10, int(grid_cfg.get("border_width", 2))))
-        gap = max(0, min(20, int(grid_cfg.get("tile_gap", 4))))
-        col_normal = grid_cfg.get("border_color", "#00e5ff")
-
-        layout_key = (
-            area_w, area_h, rows, cols, bw, gap,
-            tuple(u.uuid for u in visible_units),
-            bool(grid_cfg.get("show_labels", True)),
-            bool(grid_cfg.get("show_status", True)),
-            bool(grid_cfg.get("show_fps", True)),
-            col_normal,
-            grid_cfg.get("active_border_color", "#00ff88"),
-            grid_cfg.get("offline_border_color", "#ff4444"),
-        )
-        if not force and layout_key == self._last_layout_key:
-            return
-        self._last_layout_key = layout_key
-
-        if not visible_units:
-            self._clear_tiles()
-            empty_txt = tr(
-                "ui.main.empty_cams",
-                "No enabled cameras.\nOpen ⚙ Settings above to add or enable cameras.",
-            )
-            if not hasattr(self, "_empty_lbl") or not self._empty_lbl.winfo_exists():
-                self._empty_lbl = tk.Label(
-                    self.grid_area,
-                    text=empty_txt,
-                    fg="#9ba3b8", bg="#0b0c10", font=("Segoe UI", 13)
-                )
-            else:
-                self._empty_lbl.configure(text=empty_txt)
-            self._empty_lbl.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-            return
-        elif hasattr(self, "_empty_lbl") and self._empty_lbl.winfo_exists():
-            self._empty_lbl.place_forget()
-
-        outer_pad = gap
-        avail_w = max(cols * 32, area_w - 2 * outer_pad - bw * (cols + 1))
-        avail_h = max(rows * 24, area_h - 2 * outer_pad - bw * (rows + 1))
-        base_w, rem_w = divmod(avail_w, cols)
-        base_h, rem_h = divmod(avail_h, rows)
-        col_widths = [base_w + (1 if c < rem_w else 0) for c in range(cols)]
-        row_heights = [base_h + (1 if r < rem_h else 0) for r in range(rows)]
-
-        col_xs = []
-        x_cur = bw
-        for c in range(cols):
-            col_xs.append(x_cur)
-            x_cur += col_widths[c] + bw
-
-        row_ys = []
-        y_cur = bw
-        for r in range(rows):
-            row_ys.append(y_cur)
-            y_cur += row_heights[r] + bw
-
-        total_grid_w = x_cur
-        total_grid_h = y_cur
-        origin_x = max(0, (area_w - total_grid_w) // 2)
-        origin_y = max(0, (area_h - total_grid_h) // 2)
-
-        needed_uids = tuple(u.uuid for u in visible_units)
-        grid_dims_key = (rows, cols, needed_uids)
-        if grid_dims_key != self._last_grid_dims_key or self._grid_surface is None or not self._grid_surface.winfo_exists():
-            self._clear_tiles()
-            self._last_grid_dims_key = grid_dims_key
-            self._grid_surface = tk.Frame(self.grid_area, bg=col_normal, highlightthickness=0, bd=0)
-
-            for u in visible_units:
-                canvas = tk.Canvas(self._grid_surface, bg="#08090d", highlightthickness=0, bd=0, cursor="hand2")
-                img_id = canvas.create_image(1, 1, anchor=tk.CENTER, tags="vid_img")
-                ph_id = canvas.create_text(
-                    1, 1, text=tr("ui.main.tile.connecting", "Connecting..."),
-                    fill="#ffcc00", font=("Segoe UI", 10, "bold"), tags="placeholder"
-                )
-
-                lbl_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, state=tk.HIDDEN, tags="ov_lbl")
-                lbl_txt_id = canvas.create_text(10, 10, text="", fill="#ffffff", font=("Segoe UI", 9, "bold"), anchor=tk.NW, state=tk.HIDDEN, tags="ov_lbl")
-
-                st_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#10131e", outline="#282d3f", width=1, state=tk.HIDDEN, tags="ov_st")
-                st_txt_id = canvas.create_text(10, 10, text="", fill="#75e08b", font=("Segoe UI", 8, "bold"), anchor=tk.NE, state=tk.HIDDEN, tags="ov_st")
-
-                warn_bg_id = canvas.create_rectangle(0, 0, 0, 0, fill="#351418", outline="#ff5555", width=1, state=tk.HIDDEN, tags="ov_warn")
-                warn_txt_id = canvas.create_text(10, 10, text="", fill="#ff9999", font=("Segoe UI", 8, "bold"), anchor=tk.SW, state=tk.HIDDEN, tags="ov_warn")
-
-                canvas.bind("<Button-1>", lambda e, uid=u.uuid: self.open_camera_detail(uid))
-
-                hl_top = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
-                hl_bottom = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
-                hl_left = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
-                hl_right = tk.Frame(self._grid_surface, bg=col_normal, highlightthickness=0, bd=0)
-
-                self._tiles[u.uuid] = {
-                    "canvas": canvas,
-                    "hl_top": hl_top,
-                    "hl_bottom": hl_bottom,
-                    "hl_left": hl_left,
-                    "hl_right": hl_right,
-                    "img_id": img_id,
-                    "ph_id": ph_id,
-                    "lbl_bg_id": lbl_bg_id,
-                    "lbl_txt_id": lbl_txt_id,
-                    "st_bg_id": st_bg_id,
-                    "st_txt_id": st_txt_id,
-                    "warn_bg_id": warn_bg_id,
-                    "warn_txt_id": warn_txt_id,
-                    "photo_tk": None,
-                    "last_seq": -1,
-                    "inner_w": 0,
-                    "inner_h": 0,
-                    "cell_rect": (bw, bw, 32, 24),
-                    "bw": bw,
-                    "last_border": "",
-                    "last_hl_state": "",
-                    "last_lbl_text": None,
-                    "last_st_key": None,
-                    "last_warn_text": None,
-                }
-
-            total_slots = rows * cols
-            for _ in range(total_slots - len(visible_units)):
-                es = tk.Frame(self._grid_surface, bg="#08090d", highlightthickness=0, bd=0)
-                self._empty_slots.append(es)
-        else:
-            try:
-                if str(self._grid_surface.cget("bg")) != col_normal:
-                    self._grid_surface.configure(bg=col_normal)
-            except Exception:
-                pass
-
-        self._grid_surface.place(x=origin_x, y=origin_y, width=total_grid_w, height=total_grid_h)
-
-        for slot_i, u in enumerate(visible_units):
-            r = slot_i // cols
-            c = slot_i % cols
-            cx = col_xs[c]
-            cy = row_ys[r]
-            cw = col_widths[c]
-            ch = row_heights[r]
-            t = self._tiles[u.uuid]
-
-            cv = t["canvas"]
-            cv.place(x=cx, y=cy, width=cw, height=ch)
-            t["inner_w"] = cw
-            t["inner_h"] = ch
-            t["cell_rect"] = (cx, cy, cw, ch)
-            t["bw"] = bw
-            t["last_border"] = ""
-            t["last_lbl_text"] = None
-            t["last_st_key"] = None
-            t["last_warn_text"] = None
-
-            cv.coords(t["img_id"], cw // 2, ch // 2)
-            cv.coords(t["ph_id"], cw // 2, ch // 2)
-
-            u.set_grid_target_size(cw, ch)
-
-        for empty_idx, es in enumerate(self._empty_slots):
-            slot_i = len(visible_units) + empty_idx
-            r = slot_i // cols
-            c = slot_i % cols
-            es.place(x=col_xs[c], y=row_ys[r], width=col_widths[c], height=row_heights[r])
-
-        self._update_tile_borders()
-        if self._panel_visible:
-            self.ctrl_frame.lift()
-
-    def _update_tile_borders(self):
-        grid_cfg = (self._fast_cfg().get("grid") or {})
-        col_normal = grid_cfg.get("border_color", "#00e5ff")
-        col_active = grid_cfg.get("active_border_color", "#00ff88")
-        col_offline = grid_cfg.get("offline_border_color", "#ff4444")
-
-        if self._grid_surface is not None and self._grid_surface.winfo_exists():
-            try:
-                if str(self._grid_surface.cget("bg")) != col_normal:
-                    self._grid_surface.configure(bg=col_normal)
-            except Exception:
-                pass
-
-        changed = False
-        for uid, t in self._tiles.items():
-            unit = self.camera_manager.get_unit(uid)
-            if uid in self.detail_windows:
-                hl_state, bcol = "active", col_active
-            elif unit is not None:
-                snap = unit.get_grid_snapshot() or {}
-                if snap.get("sub_status") in ("offline", "reconnecting") and snap.get("main_status") != "active":
-                    hl_state, bcol = "offline", col_offline
-                else:
-                    hl_state, bcol = "normal", col_normal
-            else:
-                hl_state, bcol = "offline", col_offline
-
-            bkey = (hl_state, bcol, t.get("bw", 2))
-            if bkey != t["last_border"]:
-                t["last_border"] = bkey
-                t["last_hl_state"] = hl_state
-                self._apply_tile_highlight(t, hl_state, bcol)
-                changed = True
-
-        if changed:
-            self._restack_grid_highlights()
+        units = self._get_primary_monitor_units()
+        self._relayout_grid_with_units(units, force=force)
 
     def _render_tiles_once(self):
-        if self._is_closing:
-            return 83
-
-        try:
-            st = str(self.root.state()).lower()
-            if st == "iconic":
-                if not self._window_minimized:
-                    self._window_minimized = True
-                    self._sync_visible_grid_uuids(set())
-                return 250
-            elif self._window_minimized and st in ("normal", "zoomed"):
-                self._window_minimized = False
-                self._sync_visible_grid_uuids(self._visible_grid_uuids)
-        except Exception:
-            pass
-        if self._window_minimized:
-            return 250
-
-        if not self._tiles and self.camera_manager.get_ordered_units():
-            self._relayout_grid(force=False)
-
-        snap = self._fast_cfg()
-        grid_cfg = snap.get("grid") or {}
-        hw_cfg = snap.get("hardware") or {}
-        grid_fps = max(2.0, min(30.0, float(hw_cfg.get("display_grid_fps", 12.0))))
-        interval_ms = max(25, int(round(1000.0 / grid_fps)))
-
-        show_labels = bool(grid_cfg.get("show_labels", True))
-        show_status = bool(grid_cfg.get("show_status", True))
-        show_fps = bool(grid_cfg.get("show_fps", True))
-        col_normal = grid_cfg.get("border_color", "#00e5ff")
-        col_active = grid_cfg.get("active_border_color", "#00ff88")
-        col_offline = grid_cfg.get("offline_border_color", "#ff4444")
-
-        ai_entries = self.registry.list_modules(kind="ai")
-        border_changed = False
-
-        for uid, t in list(self._tiles.items()):
-            unit = self.camera_manager.get_unit(uid)
-            if unit is None:
-                continue
-            gs = unit.get_grid_snapshot()
-            cv = t["canvas"]
-            iw = max(32, t["inner_w"])
-            ih = max(24, t["inner_h"])
-
-            # 1. Колір лінії сітки для комірки (без дублювання рамок)
-            if uid in self.detail_windows:
-                hl_state, bcol = "active", col_active
-            elif gs.get("sub_status") in ("offline", "reconnecting") and gs.get("main_status") != "active":
-                hl_state, bcol = "offline", col_offline
-            else:
-                hl_state, bcol = "normal", col_normal
-            bkey = (hl_state, bcol, t.get("bw", 2))
-            if bkey != t["last_border"]:
-                t["last_border"] = bkey
-                t["last_hl_state"] = hl_state
-                self._apply_tile_highlight(t, hl_state, bcol)
-                border_changed = True
-
-            # 2. Кадр субпотоку
-            is_cam_enabled = bool(gs.get("enabled", True))
-            rgb = gs.get("rgb") if is_cam_enabled else None
-            seq = int(gs.get("seq", 0))
-            layer_dirty = False
-            if rgb is not None:
-                if seq != t["last_seq"] or t["photo_tk"] is None:
-                    t["last_seq"] = seq
-                    t["last_ph_key"] = None
-                    try:
-                        tk_img = ImageTk.PhotoImage(Image.fromarray(rgb))
-                        t["photo_tk"] = tk_img
-                        cv.itemconfigure(t["img_id"], image=tk_img, state=tk.NORMAL)
-                        cv.coords(t["img_id"], iw // 2, ih // 2)
-                        cv.itemconfigure(t["ph_id"], state=tk.HIDDEN)
-                        layer_dirty = True
-                    except Exception:
-                        pass
-            else:
-                if not is_cam_enabled:
-                    sub_s = "stopped"
-                    p_txt, p_col = tr("ui.main.tile.stopped", "Stopped"), "#9ba3b8"
-                else:
-                    st_map = {
-                        "offline": (tr("ui.main.tile.offline", "No signal (offline)"), "#ff6666"),
-                        "reconnecting": (tr("ui.main.tile.reconnecting", "Reconnecting sub-stream..."), "#ffcc00"),
-                        "connecting": (tr("ui.main.tile.connecting_sub", "Connecting sub-stream..."), "#ffcc00"),
-                        "fallback_main": (tr("ui.main.tile.waiting_main", "Waiting for main stream..."), "#ffcc00"),
-                    }
-                    sub_s = gs.get("sub_status", "")
-                    p_txt, p_col = st_map.get(
-                        sub_s,
-                        (tr("ui.main.tile.starting", "Starting..."), "#9ba3b8"),
-                    )
-                ph_key = (sub_s, p_txt, p_col, iw, ih)
-                if t.get("last_ph_key") != ph_key:
-                    t["last_ph_key"] = ph_key
-                    cv.itemconfigure(t["img_id"], state=tk.HIDDEN)
-                    cv.itemconfigure(t["ph_id"], text=p_txt, fill=p_col, state=tk.NORMAL)
-                    cv.coords(t["ph_id"], iw // 2, ih // 2)
-                    layer_dirty = True
-
-            # 3. Оверлей назви камери (верхній лівий кут)
-            if show_labels:
-                cam_nm = str(gs.get("name") or "").strip() or tr("camera.default_single", "Camera")
-                name_txt = f"📹 {cam_nm}"
-                if uid in self.detail_windows:
-                    name_txt += "  " + tr("ui.main.tile.open_tag", "[OPEN]")
-                if t["last_lbl_text"] != name_txt:
-                    t["last_lbl_text"] = name_txt
-                    cv.itemconfigure(t["lbl_txt_id"], text=name_txt, state=tk.NORMAL)
-                    cv.coords(t["lbl_txt_id"], 10, 8)
-                    bbox = cv.bbox(t["lbl_txt_id"])
-                    if bbox:
-                        cv.coords(t["lbl_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
-                        cv.itemconfigure(t["lbl_bg_id"], state=tk.NORMAL)
-                    layer_dirty = True
-            else:
-                if t["last_lbl_text"] != "__HIDDEN__":
-                    t["last_lbl_text"] = "__HIDDEN__"
-                    cv.itemconfigure(t["lbl_txt_id"], text="", state=tk.HIDDEN)
-                    cv.itemconfigure(t["lbl_bg_id"], state=tk.HIDDEN)
-
-            # 4. Оверлей статусу запису, динамічних AI-модулів і FPS (верхній правий кут)
-            if show_status or show_fps:
-                parts = []
-                rec_on = bool(gs.get("recording"))
-                op_mode = str(gs.get("operation_mode") or "server")
-                if show_status:
-                    if rec_on:
-                        enc = gs.get("encoder") or "rec"
-                        parts.append(f"● REC ({enc})")
-                    elif op_mode == "operator":
-                        parts.append(tr("ui.main.tile.no_rec_badge", "👤 NO RECORDING"))
-                    m_on = gs.get("modules_on") or {}
-                    m_tags = []
-                    for ent in ai_entries:
-                        mid = ent["id"]
-                        if m_on.get(mid):
-                            raw_badge = ent["spec"].get("short_badge")
-                            if raw_badge != "":
-                                default_badge = raw_badge if raw_badge is not None else mid[:2].upper()
-                                badge = tr(f"mod.{mid}.short_badge", str(default_badge))
-                                if badge:
-                                    m_tags.append(str(badge))
-                    if m_tags:
-                        parts.append(" ".join(m_tags))
-                if show_fps and gs.get("sub_status") == "active":
-                    parts.append(f"{float(gs.get('fps', 0.0)):.1f} FPS")
-
-                st_txt = "  |  ".join(parts)
-                st_col = "#75e08b" if rec_on else ("#ffcc00" if op_mode == "operator" else "#9ee8ff")
-                st_key = (st_txt, st_col, iw)
-                if st_txt:
-                    if t["last_st_key"] != st_key:
-                        t["last_st_key"] = st_key
-                        cv.itemconfigure(t["st_txt_id"], text=st_txt, fill=st_col, state=tk.NORMAL)
-                        cv.coords(t["st_txt_id"], iw - 10, 8)
-                        bbox = cv.bbox(t["st_txt_id"])
-                        if bbox:
-                            cv.coords(t["st_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
-                            cv.itemconfigure(t["st_bg_id"], state=tk.NORMAL)
-                        layer_dirty = True
-                else:
-                    if t["last_st_key"] != ("__HIDDEN__",):
-                        t["last_st_key"] = ("__HIDDEN__",)
-                        cv.itemconfigure(t["st_txt_id"], text="", state=tk.HIDDEN)
-                        cv.itemconfigure(t["st_bg_id"], state=tk.HIDDEN)
-            else:
-                if t["last_st_key"] != ("__HIDDEN__",):
-                    t["last_st_key"] = ("__HIDDEN__",)
-                    cv.itemconfigure(t["st_txt_id"], text="", state=tk.HIDDEN)
-                    cv.itemconfigure(t["st_bg_id"], state=tk.HIDDEN)
-
-            # 5. Нижній бейдж при втраті зв'язку (коли останній кадр ще висить)
-            warn_txt = ""
-            if rgb is not None and gs.get("sub_status") in ("offline", "reconnecting"):
-                warn_txt = tr("ui.main.tile.stream_lost", "⚠ Stream lost (reconnecting...)")
-            if t["last_warn_text"] != (warn_txt, ih):
-                t["last_warn_text"] = (warn_txt, ih)
-                if warn_txt:
-                    cv.itemconfigure(t["warn_txt_id"], text=warn_txt, state=tk.NORMAL)
-                    cv.coords(t["warn_txt_id"], 10, ih - 8)
-                    bbox = cv.bbox(t["warn_txt_id"])
-                    if bbox:
-                        cv.coords(t["warn_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
-                        cv.itemconfigure(t["warn_bg_id"], state=tk.NORMAL)
-                    layer_dirty = True
-                else:
-                    cv.itemconfigure(t["warn_txt_id"], text="", state=tk.HIDDEN)
-                    cv.itemconfigure(t["warn_bg_id"], state=tk.HIDDEN)
-
-            if layer_dirty:
-                cv.tag_raise("ov_lbl")
-                cv.tag_raise("ov_st")
-                cv.tag_raise("ov_warn")
-
-        if border_changed:
-            self._restack_grid_highlights()
-
-        return interval_ms
+        units = self._get_primary_monitor_units()
+        return self._render_tiles_with_units(units)
 
     def _render_grid_tick(self):
         if self._is_closing:
             return
+        if _is_win_foreground_admin_exit_pressed():
+            self._admin_exit()
+            return
+        t0 = time.perf_counter()
         interval_ms = self._render_tiles_once()
+        for mwin in list(self.monitor_windows.values()):
+            try:
+                if mwin.win.winfo_exists() and not mwin._is_closing:
+                    mwin.render_tiles_once()
+            except Exception:
+                pass
+        dt_ms = int((time.perf_counter() - t0) * 1000.0)
+        delay_ms = max(25, int(interval_ms) - dt_ms)
         if not self._is_closing:
-            self._render_after_id = self.root.after(interval_ms, self._render_grid_tick)
+            self._render_after_id = self.root.after(delay_ms, self._render_grid_tick)
 
     # ------------------------------------------------------------------
     # Телеметрія апаратних ресурсів у фоні (без блокування UI)
@@ -1879,6 +2488,13 @@ class MainGridWindow:
             except Exception:
                 pass
         self.detail_windows.clear()
+
+        for mwin in list(self.monitor_windows.values()):
+            try:
+                mwin.close()
+            except Exception:
+                pass
+        self.monitor_windows.clear()
 
         try:
             self.geom_tracker.close()
@@ -2197,6 +2813,7 @@ def main(base_dir: str = None):
         except Exception:
             pass
     try:
+        prepare_ort_backend_environment(target_dir)
         prepare_cuda_dll_environment(target_dir, preload=False)
     except Exception:
         pass

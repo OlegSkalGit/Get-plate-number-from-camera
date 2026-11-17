@@ -23,6 +23,11 @@ try:
 except ImportError:
     imageio_ffmpeg = None
 
+try:
+    import av
+except ImportError:
+    av = None
+
 ALLOWED_X264_PRESETS = (
     "ultrafast",
     "superfast",
@@ -178,10 +183,10 @@ def get_codec_choices() -> list:
 
 
 def refresh_capabilities():
-    """Перечитує cv2 / imageio_ffmpeg після встановлення або оновлення бібліотек."""
-    global cv2, imageio_ffmpeg
+    """Перечитує cv2 / imageio_ffmpeg / av після встановлення або оновлення бібліотек."""
+    global cv2, imageio_ffmpeg, av
     importlib.invalidate_caches()
-    for mod_name in ("cv2", "imageio_ffmpeg"):
+    for mod_name in ("cv2", "imageio_ffmpeg", "av"):
         try:
             if mod_name in sys.modules:
                 mod = importlib.reload(sys.modules[mod_name])
@@ -189,15 +194,17 @@ def refresh_capabilities():
                 mod = importlib.import_module(mod_name)
             if mod_name == "cv2":
                 cv2 = mod
-            else:
+            elif mod_name == "imageio_ffmpeg":
                 imageio_ffmpeg = mod
+            else:
+                av = mod
         except Exception:
             pass
     probe_available_ffmpeg_encoders(force=True)
 
 
 def is_ready(base_dir: str = "") -> bool:
-    return bool(_get_ffmpeg_exe()) and (cv2 is not None)
+    return (bool(_get_ffmpeg_exe()) or av is not None) and (cv2 is not None)
 
 
 def get_status_summary(base_dir: str = "") -> str:
@@ -338,6 +345,8 @@ class VideoEngine:
         self._active_seg_meta = None
         self._hw_fallback_triggered = False
         self._copy_restart_requested = False
+        self._ai_object_present = False
+        self._pyav_recording = False
 
         self._reload_params()
 
@@ -346,6 +355,9 @@ class VideoEngine:
         self.allow_disk_write = _parse_allow_disk_write(self.config)
         self.duration_min = max(0.05, float(self.config.get("video_duration_min", self.config.get("duration_min", 5.0))))
         self.segment_duration_sec = self.duration_min * 60.0
+        self.record_only_with_objects = bool(
+            self.config.get("video_record_only_with_objects", self.config.get("record_only_with_objects", False))
+        )
         self.fps = max(1.0, min(60.0, float(self.config.get("video_fps", self.config.get("fps", 15.0)))))
         raw_codec = str(self.config.get("video_codec", self.config.get("codec", "libx264")) or "libx264").strip().lower()
         self.codec = raw_codec if raw_codec in ALLOWED_VIDEO_CODECS else "libx264"
@@ -366,7 +378,7 @@ class VideoEngine:
         """Чи працює зараз прямий запис потоку без декодування/перекодування."""
         return (
             self.codec == "copy"
-            and self.ffmpeg_exe is not None
+            and (av is not None or self.ffmpeg_exe is not None)
             and _is_network_stream(self.source)
             and not self._hw_fallback_triggered
         )
@@ -379,7 +391,7 @@ class VideoEngine:
         with self.lock:
             if not self.is_running or not self.recording_allowed or not self.allow_disk_write:
                 return False
-            return (self.ffmpeg_proc is not None) or (self.cv_writer is not None)
+            return (self.ffmpeg_proc is not None) or (self.cv_writer is not None) or bool(self._pyav_recording)
 
     def update_config(self, config: dict, source=None):
         with self.lock:
@@ -387,6 +399,7 @@ class VideoEngine:
                 self.codec, self.preset, self.crf, self.fps,
                 self.segment_duration_sec, self.keyframe_sec,
                 self.max_bitrate_kbps, self.max_height, self.source, self.allow_disk_write,
+                self.record_only_with_objects,
             )
             self.config = dict(config or {})
             if source is not None:
@@ -398,6 +411,7 @@ class VideoEngine:
                 self.codec, self.preset, self.crf, self.fps,
                 self.segment_duration_sec, self.keyframe_sec,
                 self.max_bitrate_kbps, self.max_height, self.source, self.allow_disk_write,
+                self.record_only_with_objects,
             )
             if old_sig != new_sig and self.is_running:
                 self._copy_restart_requested = True
@@ -460,7 +474,7 @@ class VideoEngine:
             if allow_write:
                 self.start()
 
-    def push_frame(self, clean_frame: np.ndarray, allowed: bool = True, frame_ts: float = None):
+    def push_frame(self, clean_frame: np.ndarray, allowed: bool = True, frame_ts: float = None, ai_object_present: bool = None):
         """Передача чистого кадру (без рамок детекції) у буфер запису."""
         if clean_frame is None:
             return
@@ -468,6 +482,8 @@ class VideoEngine:
         with self.lock:
             eff_allowed = bool(allowed) and bool(self.allow_disk_write)
             self.recording_allowed = eff_allowed
+            if ai_object_present is not None:
+                self._ai_object_present = bool(ai_object_present)
             if eff_allowed and not self.is_direct_copy_active():
                 self.latest_frame = clean_frame
                 self.latest_frame_ts = ts_val
@@ -588,6 +604,170 @@ class VideoEngine:
             except Exception:
                 pass
 
+    def _direct_copy_pyav_session(self, src_url: str, seg_sec: float) -> bool:
+        """
+        Прямий ремуксинг RTSP/HTTP -> фрагментований MP4 у поточному процесі через PyAV (~10–25 МБ RAM
+        замість запуску окремого процесу ffmpeg.exe на кожну камеру). Повертає False, якщо потрібно
+        відкотитися на зовнішній ffmpeg.
+        """
+        if av is None:
+            return False
+
+        in_opts = {
+            "probesize": "327680",
+            "analyzeduration": "500000",
+            "fflags": "nobuffer+discardcorrupt",
+        }
+        if src_url.lower().startswith(("rtsp://", "rtsps://")):
+            in_opts["rtsp_transport"] = "tcp"
+
+        in_container = None
+        out_container = None
+        seg_path = None
+        seg_open_ts = 0.0
+        seg_day = ""
+        prev_close = None
+        wrote_any = False
+
+        try:
+            try:
+                in_container = av.open(src_url, options=in_opts, timeout=8.0)
+            except Exception as conn_err:
+                print(f"[VideoEngine PyAV Reconnect]: {conn_err}")
+                time.sleep(1.5)
+                return True
+
+            in_vstream = next((s for s in in_container.streams if s.type == "video"), None)
+            if in_vstream is None:
+                return False
+
+            def _open_new_seg():
+                nonlocal out_container, seg_path, seg_open_ts, seg_day
+                dt_now = datetime.now()
+                seg_day = dt_now.strftime("%Y-%m-%d")
+                seg_name = dt_now.strftime("%Y-%m-%d_%H-%M-%S.mp4")
+                candidate = os.path.join(self._staging_dir, seg_name)
+                if os.path.exists(candidate):
+                    candidate = os.path.join(self._staging_dir, dt_now.strftime("%Y-%m-%d_%H-%M-%S") + f"_{int((time.time() % 1) * 1000):03d}.mp4")
+                seg_path = candidate
+                oc = av.open(
+                    seg_path,
+                    mode="w",
+                    format="mp4",
+                    options={"movflags": "+frag_keyframe+empty_moov+default_base_moof"},
+                )
+                os_tr = oc.add_stream_from_template(in_vstream)
+                os_tr.time_base = in_vstream.time_base
+                out_container = oc
+                seg_open_ts = time.time()
+                return os_tr
+
+            def _close_cur_seg(async_finalize: bool = True):
+                nonlocal out_container, seg_path, prev_close
+                if out_container is None:
+                    return
+                cur_oc = out_container
+                cur_path = seg_path
+                out_container = None
+                seg_path = None
+                try:
+                    cur_oc.close()
+                except Exception:
+                    pass
+                if cur_path and os.path.isfile(cur_path):
+                    close_now = time.time()
+                    self._finalize_copied_segment(cur_path, close_ts=close_now, prev_close_ts=prev_close)
+                    prev_close = close_now
+
+            out_stream = None
+            base_dts = None
+            last_dts = -1
+            wait_kf_since = time.time()
+
+            with self.lock:
+                self._pyav_recording = True
+                self._active_encoder_label = "copy"
+            print(f"[ВІДЕОЗАПИС COPY/PyAV СТАРТ] {src_url} (сегмент {self.duration_min:g} хв)")
+
+            for packet in in_container.demux(in_vstream):
+                with self.lock:
+                    r_now = self.is_running
+                    a_now = self.recording_allowed
+                    w_now = self.allow_disk_write
+                    only_obj_now = self.record_only_with_objects
+                    obj_present_now = self._ai_object_present
+                    rst_now = self._copy_restart_requested
+                    codec_now = self.codec
+                    seg_sec_now = max(3.0, float(self.segment_duration_sec))
+
+                if (not r_now) or (not a_now) or (not w_now) or (only_obj_now and not obj_present_now) or rst_now or (codec_now != "copy"):
+                    break
+
+                if packet.dts is None and packet.pts is None:
+                    continue
+
+                now_t = time.time()
+                today_s = datetime.now().strftime("%Y-%m-%d")
+                if out_container is None:
+                    out_stream = _open_new_seg()
+                    base_dts = None
+                    last_dts = -1
+                else:
+                    need_split = (
+                        ((now_t - seg_open_ts) >= seg_sec_now and packet.is_keyframe)
+                        or ((now_t - seg_open_ts) >= (seg_sec_now + 5.0))
+                        or (today_s != seg_day)
+                    )
+                    if need_split:
+                        _close_cur_seg()
+                        out_stream = _open_new_seg()
+                        base_dts = None
+                        last_dts = -1
+
+                raw_dts = packet.dts if packet.dts is not None else packet.pts
+                raw_pts = packet.pts if packet.pts is not None else raw_dts
+                if base_dts is None:
+                    base_dts = raw_dts
+                rel_dts = max(0, int(raw_dts - base_dts))
+                if rel_dts <= last_dts:
+                    rel_dts = last_dts + 1
+                rel_pts = max(rel_dts, int(raw_pts - base_dts))
+                last_dts = rel_dts
+
+                packet.dts = rel_dts
+                packet.pts = rel_pts
+                packet.stream = out_stream
+                out_container.mux(packet)
+                wrote_any = True
+
+            _close_cur_seg()
+            return True
+        except Exception as e:
+            if not wrote_any:
+                print(f"[VideoEngine PyAV Copy Fallback -> ffmpeg]: {e}")
+                return False
+            print(f"[VideoEngine PyAV Copy Stream Ended]: {e}")
+            return True
+        finally:
+            try:
+                if out_container is not None:
+                    out_container.close()
+            except Exception:
+                pass
+            if seg_path and os.path.isfile(seg_path):
+                try:
+                    self._finalize_copied_segment(seg_path, close_ts=time.time(), prev_close_ts=prev_close)
+                except Exception:
+                    pass
+            try:
+                if in_container is not None:
+                    in_container.close()
+            except Exception:
+                pass
+            with self.lock:
+                self._pyav_recording = False
+                self._active_encoder_label = ""
+
     def _direct_copy_loop(self):
         with self.lock:
             allow_write_init = self.allow_disk_write
@@ -596,6 +776,7 @@ class VideoEngine:
         os.makedirs(self._staging_dir, exist_ok=True)
         self._flush_staging_files()
         creationflags = _creation_flags()
+        pyav_disabled = False
 
         try:
             while True:
@@ -603,25 +784,48 @@ class VideoEngine:
                     running = self.is_running
                     allowed = self.recording_allowed
                     allow_write = self.allow_disk_write
+                    only_obj = self.record_only_with_objects
+                    obj_present = self._ai_object_present
                     src_url = str(self.source or "").strip()
                     seg_sec = max(3.0, float(self.segment_duration_sec))
                     self._copy_restart_requested = False
 
                 if not running or not allow_write:
                     break
-                if not allowed or not _is_network_stream(src_url) or self.codec != "copy" or not self.ffmpeg_exe:
+                if not allowed or (only_obj and not obj_present) or not _is_network_stream(src_url) or self.codec != "copy" or (av is None and not self.ffmpeg_exe):
                     if self.codec != "copy":
                         break
                     time.sleep(0.25)
                     continue
 
+                if av is not None and not pyav_disabled:
+                    ok_pyav = self._direct_copy_pyav_session(src_url, seg_sec)
+                    self._flush_staging_files()
+                    if ok_pyav:
+                        with self.lock:
+                            still_run = self.is_running
+                            still_copy = (self.codec == "copy")
+                        if not still_run or not still_copy:
+                            break
+                        time.sleep(0.5)
+                        continue
+                    pyav_disabled = True
+                    if not self.ffmpeg_exe:
+                        time.sleep(1.0)
+                        continue
+
                 out_pattern = os.path.join(self._staging_dir, "%Y-%m-%d_%H-%M-%S.mp4")
-                cmd = [self.ffmpeg_exe, "-y"]
+                cmd = [
+                    self.ffmpeg_exe, "-y",
+                    "-probesize", "327680",
+                    "-analyzeduration", "500000",
+                    "-fflags", "+nobuffer+discardcorrupt",
+                ]
                 if src_url.lower().startswith(("rtsp://", "rtsps://")):
                     cmd.extend(["-rtsp_transport", "tcp"])
                 cmd.extend([
                     "-i", src_url,
-                    "-an",
+                    "-an", "-sn", "-dn",
                     "-c:v", "copy",
                     "-f", "segment",
                     "-segment_time", f"{seg_sec:.2f}",
@@ -682,9 +886,11 @@ class VideoEngine:
                         r_now = self.is_running
                         a_now = self.recording_allowed
                         w_now = self.allow_disk_write
+                        only_obj_now = self.record_only_with_objects
+                        obj_present_now = self._ai_object_present
                         rst_now = self._copy_restart_requested
                         codec_now = self.codec
-                    if (not r_now) or (not a_now) or (not w_now) or rst_now or (codec_now != "copy"):
+                    if (not r_now) or (not a_now) or (not w_now) or (only_obj_now and not obj_present_now) or rst_now or (codec_now != "copy"):
                         try:
                             if proc.stdin:
                                 proc.stdin.write("q\n")
@@ -1044,7 +1250,12 @@ class VideoEngine:
                     return
 
                 now_wall = time.time()
-                if not allowed or frame is None or (now_wall - frame_ts) > 3.0:
+                if (
+                    not allowed
+                    or (self.record_only_with_objects and not self._ai_object_present)
+                    or frame is None
+                    or (now_wall - frame_ts) > 3.0
+                ):
                     if self.ffmpeg_proc is not None or self.cv_writer is not None:
                         self._close_segment_async(block=False, meta_info=dict(seg_meta_cur) if seg_meta_cur else None)
                     seg_meta_cur = None
@@ -1451,7 +1662,22 @@ MODULE_SPEC = {
             "max": 180.0,
             "step": 1.0,
             "label": "Segment Duration (min):",
-            "help": "Duration of a single video segment file in minutes (default 5 min; 1 or 10 supported).",
+            "help": "Maximum duration of a single video segment file in minutes (default 5 min; 1 or 10 supported).",
+        },
+        {
+            "key": "record_only_with_objects",
+            "type": "bool",
+            "default": False,
+            "label": "Record only while AI object is in frame (up to segment duration)",
+            "help": (
+                "Record a video fragment only while at least one active AI module detects an object in the frame, "
+                "stopping automatically after the object leaves (3s hold) and never exceeding the configured Segment Duration.\n\n"
+                "Objects currently detected by AI:\n"
+                "• People & Vehicles module (YOLO11n): Person; and when vehicle detection is enabled: "
+                "Bicycle, Car, Motorcycle, Airplane, Bus, Train, Truck, Boat.\n"
+                "• License Plates module: vehicle license plates.\n"
+                "• Faces module: human faces (known and unknown)."
+            ),
         },
         {
             "key": "preset",
@@ -1572,7 +1798,7 @@ MODULE_SPEC = {
     "stop_engine": lambda eng, wait=True: eng.stop(wait=wait) if eng is not None else None,
     "restart_if_mode_changed": lambda eng: eng.restart_if_mode_changed() if eng is not None else None,
     "set_allowed": lambda eng, allowed: eng.set_allowed(allowed) if eng is not None else None,
-    "push_frame": lambda eng, frame, allowed=True, frame_ts=None: eng.push_frame(frame, allowed=allowed, frame_ts=frame_ts) if eng is not None else None,
+    "push_frame": lambda eng, frame, allowed=True, frame_ts=None, ai_object_present=None: eng.push_frame(frame, allowed=allowed, frame_ts=frame_ts, ai_object_present=ai_object_present) if eng is not None else None,
     "needs_decoded_frames": lambda eng, cfg, src: not (eng is not None and eng.is_direct_copy_active()),
     "is_recording": lambda eng: bool(eng is not None and eng.is_currently_recording()),
     "get_active_encoder_label": lambda eng: eng.get_active_encoder_label() if eng is not None else "",

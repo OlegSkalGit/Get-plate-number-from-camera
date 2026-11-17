@@ -70,6 +70,7 @@ echo Початок збірки...
     --collect-all fast_alpr ^
     --collect-all fast_plate_ocr ^
     --collect-all imageio_ffmpeg ^
+    --collect-all av ^
     --hidden-import cv2 ^
     --hidden-import numpy ^
     --hidden-import PIL ^

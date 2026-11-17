@@ -754,6 +754,11 @@ class ScrollableFrame(tk.Frame):
         self.canvas.bind(EVT_LEAVE, self._on_leave)
         self.inner.bind(EVT_ENTER, self._on_enter)
         self.inner.bind(EVT_LEAVE, self._on_leave)
+        self.bind("<Map>", self._ensure_wheel_hook, add="+")
+        try:
+            self.after_idle(self._ensure_wheel_hook)
+        except Exception:
+            pass
 
     def _on_inner_configure(self, event=None):
         if self._suspend_scrollregion:
@@ -812,9 +817,10 @@ class ScrollableFrame(tk.Frame):
         except Exception:
             pass
 
-    def _on_enter(self, event=None):
-        self._wheel_bound = True
+    def _ensure_wheel_hook(self, event=None):
         try:
+            if not self.winfo_exists():
+                return
             top = self.winfo_toplevel()
             if self._wheel_hook_toplevel is not top:
                 self._wheel_hook_toplevel = top
@@ -824,27 +830,48 @@ class ScrollableFrame(tk.Frame):
         except Exception:
             pass
 
+    def _on_enter(self, event=None):
+        self._wheel_bound = True
+        self._ensure_wheel_hook()
+
     def _on_leave(self, event=None):
         self._wheel_bound = False
 
     def _on_mousewheel(self, event):
-        if not self._wheel_bound:
-            return
         try:
+            if not self.winfo_exists() or not self.canvas.winfo_exists():
+                return
+            if not self.canvas.winfo_ismapped():
+                return
             px, py = self.winfo_pointerxy()
             rx = self.canvas.winfo_rootx()
             ry = self.canvas.winfo_rooty()
             rw = self.canvas.winfo_width()
             rh = self.canvas.winfo_height()
-            if not (rx <= px <= rx + rw and ry <= py <= ry + rh):
+            if rw <= 1 or rh <= 1 or not (rx <= px <= rx + rw and ry <= py <= ry + rh):
                 self._wheel_bound = False
                 return
             hovered = self.winfo_containing(px, py)
-            if hovered is not None and isinstance(hovered, ttk.Treeview):
+            if hovered is None:
                 return
+            canvas_path = str(self.canvas)
+            hov_path = str(hovered)
+            if hov_path != canvas_path and not hov_path.startswith(canvas_path + "."):
+                return
+            if isinstance(hovered, ttk.Treeview):
+                return
+            if isinstance(hovered, (tk.Text, tk.Listbox)):
+                try:
+                    yv = hovered.yview()
+                    if yv and (float(yv[0]) > 0.0 or float(yv[1]) < 1.0):
+                        return
+                except Exception:
+                    pass
             bbox = self.canvas.bbox("all")
             if not bbox or (bbox[3] - bbox[1]) <= rh:
                 return
+            if not self._suspend_scrollregion:
+                self.canvas.configure(scrollregion=bbox)
             if getattr(event, "num", None) == 4:
                 delta = -1
             elif getattr(event, "num", None) == 5:

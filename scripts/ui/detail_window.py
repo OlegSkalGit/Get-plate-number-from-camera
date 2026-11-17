@@ -193,7 +193,11 @@ class CameraDetailWindow:
         self.win.bind(EVT_BTN5, self._route_mousewheel)
 
         self._sync_module_buttons()
-        self._schedule_hide(5000)
+        if self._is_operator_mode():
+            self._cancel_hide_timer()
+            self._hide_panel()
+        else:
+            self._schedule_hide(5000)
         self._render_tick()
 
     # ------------------------------------------------------------------
@@ -276,6 +280,9 @@ class CameraDetailWindow:
             self.win.title(tr("ui.detail.window_title", "{name} — Detail View", name=name))
             self.cam_title_lbl.configure(text=f"📹 {name}")
             self._sync_module_buttons()
+            if self._is_operator_mode():
+                self._cancel_hide_timer()
+                self._hide_panel()
             if self.sidebar_visible and self.sidebar_mode:
                 arch = self._get_archive_spec(self.sidebar_mode)
                 self.side_header_lbl.configure(
@@ -350,6 +357,9 @@ class CameraDetailWindow:
                 self.sidebar_mode = self._pick_default_sidebar_mode()
 
             self._sync_module_buttons()
+            if self._is_operator_mode():
+                self._cancel_hide_timer()
+                self._hide_panel()
             if self.sidebar_visible and self.sidebar_mode:
                 arch = self._get_archive_spec(self.sidebar_mode)
                 self.side_header_lbl.configure(
@@ -780,9 +790,24 @@ class CameraDetailWindow:
             self._wheel_zone = None
 
     def _route_mousewheel(self, event):
-        if self._wheel_zone == "tree":
+        zone = self._wheel_zone
+        if zone is None:
+            try:
+                px, py = self.win.winfo_pointerxy()
+                hov = self.win.winfo_containing(px, py)
+                if hov is not None:
+                    hs = str(hov)
+                    tp = str(self.tree_frame)
+                    pp = str(self.preview_container)
+                    if hov == self.tree_frame or hs.startswith(tp + "."):
+                        zone = "tree"
+                    elif hov == self.preview_container or hs.startswith(pp + "."):
+                        zone = "preview"
+            except Exception:
+                pass
+        if zone == "tree":
             return self._on_tree_mousewheel(event)
-        if self._wheel_zone == "preview":
+        if zone == "preview":
             return self._on_preview_mousewheel(event)
 
     def _on_tree_mousewheel(self, event):
@@ -831,20 +856,22 @@ class CameraDetailWindow:
             self._hide_timer = None
 
     def _show_panel(self):
+        if self._is_operator_mode():
+            return
         if not self.panel_visible:
             self.ctrl_frame.pack(fill=tk.X, side=tk.TOP, before=self.main_body)
             self.panel_visible = True
 
     def _hide_panel(self):
         self._hide_timer = None
-        if self.sidebar_visible:
+        if self.sidebar_visible and not self._is_operator_mode():
             return
         if self.panel_visible:
             self.ctrl_frame.pack_forget()
             self.panel_visible = False
 
     def _on_mouse_motion(self, event):
-        if self._is_closing:
+        if self._is_closing or self._is_operator_mode():
             return
         try:
             top_y = self.win.winfo_rooty()
@@ -997,7 +1024,7 @@ class CameraDetailWindow:
         mods = (self.cam_cfg or {}).get("modules") or {}
 
         draw_tasks = []
-        if cv2 is not None and self.registry is not None:
+        if cv2 is not None and self.registry is not None and not self._is_operator_mode():
             for ent in self.registry.list_modules(kind="ai"):
                 mid = ent["id"]
                 spec = ent["spec"]

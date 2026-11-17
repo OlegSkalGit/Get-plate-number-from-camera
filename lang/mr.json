@@ -1269,6 +1269,23 @@
     "ui.settings.cams.del_group_prompt": "Branch '{name}' contains {n} camera(s). What should be done with them?",
     "ui.settings.cams.del_group_move_parent": "Move to parent branch",
     "ui.settings.cams.del_group_move_root": "Move to root list",
-    "ui.settings.cams.del_group_delete_cams": "Delete cameras"
+    "ui.settings.cams.del_group_delete_cams": "Delete cameras",
+    "ui.settings.cams.monitor_default": "Monitor {num}",
+    "ui.settings.cams.monitor_new_title": "New Monitor",
+    "ui.settings.cams.monitor_new_prompt": "Enter monitor name:",
+    "ui.settings.cams.monitor_ren_title": "Rename Monitor",
+    "ui.settings.cams.monitor_ren_prompt": "New monitor name:",
+    "ui.settings.cams.min_one_monitor_warn": "At least 1 monitor must remain in the system.",
+    "ui.settings.cams.btn_new_monitor": "🖥 New monitor",
+    "ui.settings.cams.btn_ren_monitor": "✏ Rename monitor",
+    "ui.settings.cams.btn_del_monitor": "🗑 Delete monitor",
+    "ui.settings.cams.btn_start_monitor": "▶ Start all in monitor",
+    "ui.settings.cams.btn_stop_monitor": "⏹ Stop all in monitor",
+    "ui.settings.cams.del_monitor_prompt": "Monitor '{name}' contains {n} camera(s). What should be done with them?",
+    "ui.settings.cams.del_monitor_move": "Move to '{target}'",
+    "ui.settings.cams.btn_move_monitor_root": "⬆ Move to monitor root",
+    "ui.settings.cam.apply_scope_monitor": "All in current monitor ({n})",
+    "mod.video.field.record_only_with_objects.label": "Record only while AI object is in frame (up to segment duration)",
+    "mod.video.field.record_only_with_objects.help": "Record a video fragment only while at least one active AI module detects an object in the frame, stopping automatically after the object leaves (3s hold) and never exceeding the configured Segment Duration.\n\nObjects currently detected by AI:\n• People & Vehicles module (YOLO11n): Person; and when vehicle detection is enabled: Bicycle, Car, Motorcycle, Airplane, Bus, Train, Truck, Boat.\n• License Plates module: vehicle license plates.\n• Faces module: human faces (known and unknown)."
   }
 }

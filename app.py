@@ -13,7 +13,8 @@ if BASE_DIR not in sys.path:
 os.chdir(BASE_DIR)
 
 try:
-    from scripts.core.hardware_info import prepare_cuda_dll_environment
+    from scripts.core.hardware_info import prepare_cuda_dll_environment, prepare_ort_backend_environment
+    prepare_ort_backend_environment(BASE_DIR)
     prepare_cuda_dll_environment(BASE_DIR, preload=False)
 except Exception:
     pass
