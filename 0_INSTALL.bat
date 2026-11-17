@@ -8,6 +8,32 @@ set "WORK_DIR=%~dp0TMP"
 set "REPO_ZIP=%WORK_DIR%\anpr_repo_main.zip"
 set "REPO_EXT=%WORK_DIR%\_extract"
 set "REPO_URL=https://github.com/OlegSkalGit/Get-plate-number-from-camera/archive/refs/heads/main.zip"
+set "SELF_URL=https://raw.githubusercontent.com/OlegSkalGit/Get-plate-number-from-camera/main/0_INSTALL.bat"
+set "SELF_TMP=%WORK_DIR%\0_INSTALL.bat"
+
+if /i not "%~1"=="--no-self-update" (
+    if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
+    echo Перевірка оновлення 0_INSTALL.bat...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " ^
+      "try { " ^
+      "  $u = '%SELF_URL%?t=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); " ^
+      "  $wc = New-Object System.Net.WebClient; " ^
+      "  $bytes = $wc.DownloadData($u); " ^
+      "  $txt = [Text.Encoding]::UTF8.GetString($bytes); " ^
+      "  if ($txt -match '@echo off') { " ^
+      "    $norm = ($txt -replace \"`r`n\", \"`n\") -replace \"`n\", \"`r`n\"; " ^
+      "    [IO.File]::WriteAllText('%SELF_TMP%', $norm, (New-Object System.Text.UTF8Encoding($false))); " ^
+      "    $h1 = (Get-FileHash '%~f0' -Algorithm SHA256).Hash; " ^
+      "    $h2 = (Get-FileHash '%SELF_TMP%' -Algorithm SHA256).Hash; " ^
+      "    if ($h1 -ne $h2) { exit 42 } " ^
+      "  } " ^
+      "} catch { exit 0 }; exit 0"
+    if !errorlevel!==42 (
+        echo Знайдено нову версію 0_INSTALL.bat! Оновлення та перезапуск...
+        (copy /Y "%SELF_TMP%" "%~f0" > nul) && ("%~f0" --no-self-update & exit /b 0)
+    )
+)
 
 if exist "%~dp0ANPR_Monitor\ANPR_Monitor.exe" (
     echo.
@@ -19,7 +45,6 @@ if exist "%~dp0ANPR_Monitor\ANPR_Monitor.exe" (
     )
 )
 
-if exist "%WORK_DIR%\0_INSTALL.bat" copy /Y "%WORK_DIR%\0_INSTALL.bat" "%~dp00_INSTALL.bat" > nul
 if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
 mkdir "%WORK_DIR%"
 
