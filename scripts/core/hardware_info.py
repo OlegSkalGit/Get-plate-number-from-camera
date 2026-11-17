@@ -1934,19 +1934,34 @@ def download_cuda_libraries(
         extracted_dlls = []
 
         try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             total_comps = len(to_fetch)
-            for idx, comp in enumerate(to_fetch, start=1):
+            prog_lock = threading.Lock()
+            last_ui_rep = {"ts": 0.0}
+
+            def _report(msg: str, force: bool = False):
+                if not progress_cb:
+                    return
+                now_t = time.time()
+                with prog_lock:
+                    if not force and (now_t - last_ui_rep["ts"]) < 0.35:
+                        return
+                    last_ui_rep["ts"] = now_t
+                progress_cb(msg)
+
+            def _download_one(idx: int, comp: dict):
                 pkg_name = comp["pypi"]
-                if progress_cb:
-                    progress_cb(
-                        tr(
-                            "hw.cuda.dl.searching",
-                            "[{idx}/{total}] Searching PyPI for {pkg}...",
-                            idx=idx,
-                            total=total_comps,
-                            pkg=pkg_name,
-                        )
-                    )
+                _report(
+                    tr(
+                        "hw.cuda.dl.searching",
+                        "[{idx}/{total}] Searching PyPI for {pkg}...",
+                        idx=idx,
+                        total=total_comps,
+                        pkg=pkg_name,
+                    ),
+                    force=True,
+                )
                 winfo = _resolve_pypi_win_wheel(pkg_name, compat_prefix=comp["compat_prefix"])
                 whl_path = os.path.join(tmp_dir, winfo["filename"])
 
@@ -1954,7 +1969,6 @@ def download_cuda_libraries(
                 hasher = hashlib.sha256()
                 done_bytes = 0
                 tot_bytes = max(0, int(winfo.get("size") or 0))
-                last_rep = 0.0
 
                 with urllib.request.urlopen(req, timeout=60) as resp, open(whl_path, "wb") as out_f:
                     if tot_bytes <= 0:
@@ -1969,14 +1983,12 @@ def download_cuda_libraries(
                         out_f.write(chunk)
                         hasher.update(chunk)
                         done_bytes += len(chunk)
-                        now_t = time.time() if "time" in globals() else 0.0
-                        if progress_cb and (now_t - last_rep >= 0.2 or done_bytes == tot_bytes):
-                            last_rep = now_t
+                        if progress_cb:
                             mb_done = done_bytes / (1024.0 * 1024.0)
                             if tot_bytes > 0:
                                 pct = min(100, int(done_bytes * 100 / tot_bytes))
                                 mb_tot = tot_bytes / (1024.0 * 1024.0)
-                                progress_cb(
+                                _report(
                                     tr(
                                         "hw.cuda.dl.progress_pct",
                                         "[{idx}/{total}] {pkg} {ver}: {done:.1f} / {tot:.1f} MB ({pct}%)",
@@ -1987,10 +1999,11 @@ def download_cuda_libraries(
                                         done=mb_done,
                                         tot=mb_tot,
                                         pct=pct,
-                                    )
+                                    ),
+                                    force=(done_bytes == tot_bytes),
                                 )
                             else:
-                                progress_cb(
+                                _report(
                                     tr(
                                         "hw.cuda.dl.progress_mb",
                                         "[{idx}/{total}] {pkg} {ver}: {done:.1f} MB...",
@@ -2011,7 +2024,18 @@ def download_cuda_libraries(
                             filename=winfo["filename"],
                         )
                     )
+                return idx, comp, winfo, whl_path
 
+            downloaded_items = []
+            max_w = max(1, min(4, total_comps))
+            with ThreadPoolExecutor(max_workers=max_w) as pool:
+                futs = [pool.submit(_download_one, idx, comp) for idx, comp in enumerate(to_fetch, start=1)]
+                for fut in as_completed(futs):
+                    downloaded_items.append(fut.result())
+
+            downloaded_items.sort(key=lambda x: x[0])
+            for idx, comp, winfo, whl_path in downloaded_items:
+                pkg_name = comp["pypi"]
                 if progress_cb:
                     progress_cb(
                         tr(
