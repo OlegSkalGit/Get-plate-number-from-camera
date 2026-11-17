@@ -243,7 +243,7 @@ SETTINGS_HELP = {
     "general.language": (
         "Interface Language\n"
         "Selects the application language loaded from JSON files in the lang/ folder (<code>.json).\n"
-        "Default on first launch is English (en). Language changes apply across all open windows once saved."
+        "Default on first launch is Ukrainian (uk). Language changes apply across all open windows once saved."
     ),
     "general.password": (
         "Access Password & Link Encryption\n"

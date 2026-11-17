@@ -3,10 +3,17 @@ import re
 import sys
 import json
 import threading
+import unicodedata
 
-DEFAULT_LANGUAGE = "en"
+DEFAULT_LANGUAGE = "uk"
+FALLBACK_LANGUAGE = "en"
 
 _CODE_SUFFIX_RE = re.compile(r"\[([^\[\]]+)\]\s*$")
+
+
+def _alpha_sort_key(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in norm if not unicodedata.combining(ch)).casefold()
 
 
 def _default_base_dir() -> str:
@@ -145,20 +152,25 @@ class LanguageManager:
             self._label_to_code = {
                 ent["meta"]["label"]: code for code, ent in loaded.items()
             }
-            en_canon = self._resolve_code_locked(DEFAULT_LANGUAGE)
+            en_canon = self._resolve_code_locked(FALLBACK_LANGUAGE)
             self._en_strings = dict((loaded.get(en_canon) or {}).get("strings") or {})
 
             cur_canon = self._resolve_code_locked(self._current_code)
             if cur_canon:
                 self._current_code = cur_canon
                 self._active_strings = dict((loaded.get(cur_canon) or {}).get("strings") or {})
-            elif en_canon:
-                self._current_code = en_canon
-                self._active_strings = dict(self._en_strings)
             elif loaded:
-                first_code = sorted(loaded.keys())[0]
-                self._current_code = first_code
-                self._active_strings = dict(loaded[first_code]["strings"])
+                def_canon = self._resolve_code_locked(DEFAULT_LANGUAGE)
+                if def_canon:
+                    self._current_code = def_canon
+                    self._active_strings = dict((loaded.get(def_canon) or {}).get("strings") or {})
+                elif en_canon:
+                    self._current_code = en_canon
+                    self._active_strings = dict(self._en_strings)
+                else:
+                    first_code = sorted(loaded.keys())[0]
+                    self._current_code = first_code
+                    self._active_strings = dict(loaded[first_code]["strings"])
             else:
                 self._current_code = DEFAULT_LANGUAGE
                 self._active_strings = {}
@@ -233,7 +245,11 @@ class LanguageManager:
                 m = dict(ent["meta"])
                 m["path"] = ent["path"]
                 items.append(m)
-            items.sort(key=lambda m: (int(m.get("order", 999)), str(m.get("name", "")).lower(), str(m.get("code", "")).lower()))
+            items.sort(key=lambda m: (
+                _alpha_sort_key(m.get("label", "")),
+                _alpha_sort_key(m.get("name", "")),
+                str(m.get("code", "")).lower(),
+            ))
             return items
 
     def parse_language_code(self, label_or_code: str, fallback: str = DEFAULT_LANGUAGE) -> str:
