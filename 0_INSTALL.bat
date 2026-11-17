@@ -65,6 +65,12 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
     exit /b 1
 )
 
+echo.
+echo ========================================================
+echo   Завантаження моделей для модулів...
+echo ========================================================
+"%~dp0.venv\Scripts\python.exe" -c "from scripts.core.module_registry import ModuleRegistry; r = ModuleRegistry('.'); [print(e['id'], '->', e['spec']['ensure_resources']('.', download=True).get('message', 'OK')) for e in r.list_modules() if callable(e['spec'].get('ensure_resources'))]"
+
 if not exist "%~dp03_RUN.bat" (
     echo [ПОМИЛКА] Файл 3_RUN.bat не знайдено.
     pause
