@@ -125,4 +125,3 @@ echo ========================================================
 echo Файл програми: dist\ANPR_Monitor\ANPR_Monitor.exe
 echo Зовнішні модулі: dist\ANPR_Monitor\scripts\modules\
 echo.
-pause

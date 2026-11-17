@@ -90,14 +90,42 @@ for %%M in (best.onnx cct_xs_v2_global.onnx cct_xs_v2_global_plate_config.yaml s
 )
 "%~dp0.venv\Scripts\python.exe" -c "from scripts.core.module_registry import ModuleRegistry; r = ModuleRegistry('.'); [print(e['id'], '->', e['spec']['ensure_resources']('.', download=True).get('message', 'OK')) for e in r.list_modules() if callable(e['spec'].get('ensure_resources'))]"
 
-if not exist "%~dp03_RUN.bat" (
-    echo [ПОМИЛКА] Файл 3_RUN.bat не знайдено.
+if not exist "%~dp04_BUILD_exe.bat" (
+    echo [ПОМИЛКА] Файл 4_BUILD_exe.bat не знайдено.
     pause
     exit /b 1
 )
 
 echo.
 echo ========================================================
-echo   Запуск 3_RUN.bat...
+echo   Збірка EXE (4_BUILD_exe.bat)...
 echo ========================================================
-call "%~dp03_RUN.bat"
+call "%~dp04_BUILD_exe.bat"
+if not exist "%~dp0dist\ANPR_Monitor\ANPR_Monitor.exe" (
+    echo [ПОМИЛКА] Збірка ANPR_Monitor не знайдена у dist\ANPR_Monitor.
+    pause
+    exit /b 1
+)
+
+echo.
+echo ========================================================
+echo   Перенесення ANPR_Monitor та очищення тимчасових файлів...
+echo ========================================================
+if exist "%~dp0ANPR_Monitor" rmdir /s /q "%~dp0ANPR_Monitor"
+move "%~dp0dist\ANPR_Monitor" "%~dp0ANPR_Monitor" > nul
+if errorlevel 1 (
+    robocopy "%~dp0dist\ANPR_Monitor" "%~dp0ANPR_Monitor" /E /MOVE > nul
+)
+
+for /d %%D in ("%~dp0*") do (
+    if /i not "%%~nxD"=="ANPR_Monitor" rmdir /s /q "%%D"
+)
+for %%F in ("%~dp0*") do (
+    if /i not "%%~nxF"=="%~nx0" del /f /q "%%F"
+)
+
+echo.
+echo ========================================================
+echo   Готово! Програма знаходиться у папці ANPR_Monitor
+echo ========================================================
+pause
