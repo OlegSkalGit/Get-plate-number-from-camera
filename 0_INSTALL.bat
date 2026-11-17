@@ -9,6 +9,17 @@ set "REPO_ZIP=%WORK_DIR%\anpr_repo_main.zip"
 set "REPO_EXT=%WORK_DIR%\_extract"
 set "REPO_URL=https://github.com/OlegSkalGit/Get-plate-number-from-camera/archive/refs/heads/main.zip"
 
+if exist "%~dp0ANPR_Monitor\ANPR_Monitor.exe" (
+    echo.
+    echo Увага: папка ANPR_Monitor вже існує.
+    choice /C YN /N /M "Видалити її та завантажити оновлення? [Y - Так / N - Відхилити]: "
+    if errorlevel 2 (
+        echo Завантаження скасовано користувачем.
+        exit /b 0
+    )
+)
+
+if exist "%WORK_DIR%\0_INSTALL.bat" copy /Y "%WORK_DIR%\0_INSTALL.bat" "%~dp00_INSTALL.bat" > nul
 if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
 mkdir "%WORK_DIR%"
 
@@ -121,6 +132,7 @@ if errorlevel 1 (
     robocopy "%WORK_DIR%\dist\ANPR_Monitor" "%~dp0ANPR_Monitor" /E /MOVE > nul
 )
 
+if exist "%WORK_DIR%\0_INSTALL.bat" copy /Y "%WORK_DIR%\0_INSTALL.bat" "%~dp00_INSTALL.bat" > nul
 if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
 
 echo.
