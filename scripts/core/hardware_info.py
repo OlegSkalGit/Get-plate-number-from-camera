@@ -135,6 +135,14 @@ def _get_normalized_disk_dists_map() -> dict:
 def _find_disk_ort_package_dir() -> str:
     """Знаходить каталог активного пакета onnxruntime на диску (без звернення до sys.modules)."""
     if getattr(sys, "frozen", False):
+        meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        for base_p in (meipass, os.path.join(exe_dir, "_internal"), exe_dir):
+            if not base_p:
+                continue
+            cand = os.path.join(os.path.abspath(base_p), "onnxruntime")
+            if os.path.isdir(os.path.join(cand, "capi")):
+                return cand
         return ""
     try:
         importlib.invalidate_caches()
@@ -926,8 +934,6 @@ def has_nvidia_gpu() -> bool:
 
 def _cleanup_ort_swap_trash(site_dir: str = ""):
     """Видаляє старі тимчасові каталоги .ort_swap_trash_* після попереднього перемикання ONNX Runtime у Windows."""
-    if getattr(sys, "frozen", False):
-        return
     dirs_to_scan = []
     if site_dir and os.path.isdir(site_dir):
         dirs_to_scan.append(site_dir)
@@ -947,16 +953,130 @@ def _cleanup_ort_swap_trash(site_dir: str = ""):
 _cleanup_ort_swap_trash()
 
 
-def install_ort_package(package_name: str, progress_cb=None):
-    """Встановлює або перемикає пакет onnxruntime у .venv (включно з безпечною заміною завантажених у RAM DLL у Windows)."""
-    if getattr(sys, "frozen", False):
+def _install_ort_wheel_frozen(package_name: str, progress_cb=None):
+    """Перемикає пакет onnxruntime безпосередньо в --onedir EXE (папка _internal/onnxruntime/) без pip."""
+    ort_dir = _find_disk_ort_package_dir()
+    if not ort_dir or not os.path.isdir(ort_dir):
         return False, tr(
             "hw.ort.err_frozen",
             "Switching pip packages is unavailable inside a compiled EXE. Use 1_SETUP.bat.",
         )
+
+    site_dir = os.path.dirname(ort_dir)
+    _cleanup_ort_swap_trash(site_dir)
+
+    _cur_pkg, cur_ver, _cur_cuda = _read_disk_ort_package_info()
+    if not cur_ver and "onnxruntime" in sys.modules:
+        cur_ver = str(getattr(sys.modules["onnxruntime"], "__version__", "") or "")
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+    if progress_cb:
+        progress_cb(tr("hw.ort.progress_installing", "Installing {pkg}...", pkg=package_name))
+
+    try:
+        wheel_info = _resolve_pypi_win_wheel(
+            package_name,
+            py_tag=py_tag,
+            preferred_ver=cur_ver,
+            timeout_sec=15.0,
+        )
+    except Exception as e:
+        return False, tr("hw.ort.err_exception", "Exception during installation: {err}", err=e)
+
+    moved_pairs = []
+    trash_dir = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="ort_whl_") as dl_dir:
+            whl_path = os.path.join(dl_dir, wheel_info["filename"])
+            if progress_cb:
+                progress_cb(f"{wheel_info['filename']} ({wheel_info['version']})...")
+            req = urllib.request.Request(wheel_info["url"], headers={"User-Agent": "ANPR-MultiCam-NVR/2.0"})
+            with urllib.request.urlopen(req, timeout=180.0) as resp, open(whl_path, "wb") as out_f:
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+
+            exp_sha = str(wheel_info.get("sha256") or "").lower()
+            if exp_sha:
+                h = hashlib.sha256()
+                with open(whl_path, "rb") as rf:
+                    while True:
+                        b = rf.read(262144)
+                        if not b:
+                            break
+                        h.update(b)
+                if h.hexdigest().lower() != exp_sha:
+                    raise RuntimeError(f"SHA256 mismatch for {wheel_info['filename']}")
+
+            if sys.platform == "win32" and ("onnxruntime" in sys.modules):
+                trash_dir = os.path.join(site_dir, f".ort_swap_trash_{os.getpid()}_{int(time.time() * 1000)}")
+                for walk_root, _dirs, files in os.walk(ort_dir):
+                    for fn in files:
+                        if fn.lower().endswith((".dll", ".pyd")):
+                            src = os.path.join(walk_root, fn)
+                            rel = os.path.relpath(src, ort_dir)
+                            dst = os.path.join(trash_dir, rel)
+                            os.makedirs(os.path.dirname(dst), exist_ok=True)
+                            os.replace(src, dst)
+                            moved_pairs.append((src, dst))
+
+            try:
+                for name in os.listdir(site_dir):
+                    low = name.lower()
+                    if low.endswith(".dist-info") and low.startswith("onnxruntime"):
+                        shutil.rmtree(os.path.join(site_dir, name), ignore_errors=True)
+            except Exception:
+                pass
+
+            with zipfile.ZipFile(whl_path, "r") as zf:
+                for member in zf.infolist():
+                    if member.is_dir():
+                        continue
+                    norm_m = member.filename.replace("\\", "/").lstrip("/")
+                    if not (norm_m.startswith("onnxruntime/") or (norm_m.startswith("onnxruntime") and ".dist-info/" in norm_m)):
+                        continue
+                    dest_p = os.path.join(site_dir, *norm_m.split("/"))
+                    os.makedirs(os.path.dirname(dest_p), exist_ok=True)
+                    with zf.open(member, "r") as src_f, open(dest_p, "wb") as dst_f:
+                        shutil.copyfileobj(src_f, dst_f)
+
+        if trash_dir and os.path.isdir(trash_dir):
+            shutil.rmtree(trash_dir, ignore_errors=True)
+        importlib.invalidate_caches()
+
+        ort_loaded = "onnxruntime" in sys.modules
+        loaded_pkg = get_ort_loaded_package() if ort_loaded else ""
+        if ort_loaded and loaded_pkg and loaded_pkg != package_name:
+            return True, tr(
+                "hw.ort.installed_restart",
+                "Package '{pkg}' installed on disk. Since the onnxruntime C-extension is already loaded in memory, restart the application.",
+                pkg=package_name,
+            )
+        return True, tr(
+            "hw.ort.installed_ok",
+            "Package '{pkg}' installed successfully.",
+            pkg=package_name,
+        )
+    except Exception as e:
+        for src, dst in moved_pairs:
+            if os.path.exists(dst) and not os.path.exists(src):
+                try:
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    os.replace(dst, src)
+                except Exception:
+                    pass
+        return False, tr("hw.ort.err_exception", "Exception during installation: {err}", err=e)
+
+
+def install_ort_package(package_name: str, progress_cb=None):
+    """Встановлює або перемикає пакет onnxruntime у .venv або у --onedir EXE (включно з безпечною заміною завантажених у RAM DLL у Windows)."""
     allowed = {"onnxruntime", "onnxruntime-directml", "onnxruntime-gpu", "onnxruntime-openvino"}
     if package_name not in allowed:
         return False, tr("hw.ort.err_unknown_pkg", "Unknown package: {pkg}", pkg=package_name)
+    if getattr(sys, "frozen", False):
+        return _install_ort_wheel_frozen(package_name, progress_cb=progress_cb)
 
     # Зафіксуємо версію onnxruntime у RAM до того, як pip перезапише диск
     observe_loaded_libraries()
@@ -1693,8 +1813,14 @@ def prepare_cuda_dll_environment(base_dir: str, preload: bool = True) -> dict:
     }
 
 
-def _resolve_pypi_win_wheel(pkg_name: str, compat_prefix: str = "", timeout_sec: float = 12.0) -> dict:
-    """Повертає URL, версію та SHA256 найновішого win_amd64 .whl на PyPI для пакета."""
+def _resolve_pypi_win_wheel(
+    pkg_name: str,
+    compat_prefix: str = "",
+    py_tag: str = "",
+    preferred_ver: str = "",
+    timeout_sec: float = 12.0,
+) -> dict:
+    """Повертає URL, версію та SHA256 найновішого (або preferred_ver) win_amd64 .whl на PyPI для пакета."""
     url = f"https://pypi.org/pypi/{pkg_name}/json"
     data = _fetch_pypi_json(url, timeout_sec=timeout_sec)
     releases = data.get("releases") or {}
@@ -1704,15 +1830,25 @@ def _resolve_pypi_win_wheel(pkg_name: str, compat_prefix: str = "", timeout_sec:
             return True
         return str(ver_s).startswith(compat_prefix)
 
-    # Перебираємо версії від найновішої до найстарішої (бо остання реліз-версія інколи не має win_amd64 wheel)
+    def _matches_py(fname: str) -> bool:
+        if not py_tag:
+            return True
+        low = fname.lower()
+        if py_tag.lower() in low:
+            return True
+        return ("py3-none" in low) or ("cp" not in low)
+
     versions = sorted(releases.keys(), key=_parse_ver_tuple, reverse=True)
+    if preferred_ver and preferred_ver in versions:
+        versions = [preferred_ver] + [v for v in versions if v != preferred_ver]
+
     for ver in versions:
         if not _matches(ver):
             continue
         files = releases.get(ver) or []
         for fobj in files:
             fname = str(fobj.get("filename") or "")
-            if fname.endswith(".whl") and "win_amd64" in fname and not fobj.get("yanked", False):
+            if fname.endswith(".whl") and "win_amd64" in fname and _matches_py(fname) and not fobj.get("yanked", False):
                 return {
                     "package": pkg_name,
                     "version": ver,
@@ -1725,7 +1861,7 @@ def _resolve_pypi_win_wheel(pkg_name: str, compat_prefix: str = "", timeout_sec:
     # Фолбек: перевірити urls для останнього релізу якщо releases порожні
     for fobj in (data.get("urls") or []):
         fname = str(fobj.get("filename") or "")
-        if fname.endswith(".whl") and "win_amd64" in fname:
+        if fname.endswith(".whl") and "win_amd64" in fname and _matches_py(fname):
             return {
                 "package": pkg_name,
                 "version": str((data.get("info") or {}).get("version") or ""),
@@ -3242,8 +3378,9 @@ def run_full_autosetup(
     ort_switched = False
     active_ort_pkg = cur_ort
 
+    ort_locked_frozen = frozen and (not bool(_find_disk_ort_package_dir()))
     if cur_ort != target_ort:
-        if frozen and ort_install_fn is None:
+        if ort_locked_frozen and ort_install_fn is None:
             warnings.append(
                 tr(
                     "hw.setup.step2.warn_frozen",
@@ -3334,14 +3471,14 @@ def run_full_autosetup(
                     warnings.append(
                         tr("hw.setup.step3.warn_dl", "Failed to download CUDA DLLs: {msg}", msg=dl_res.get("message"))
                     )
-                    if not frozen and ort_install_fn is None and fallback_ort == "onnxruntime-directml":
+                    if not ort_locked_frozen and ort_install_fn is None and fallback_ort == "onnxruntime-directml":
                         _emit(3, total_steps, 56, tr("hw.setup.step3.fallback_dml", "Attempting switch to DirectML (no CUDA DLLs)..."))
                         ok_dml, msg_dml = install_ort_package("onnxruntime-directml", progress_cb=lambda t: _emit(3, total_steps, 57, t))
                         if ok_dml:
                             ort_switched = True
                             active_ort_pkg = "onnxruntime-directml"
                             _emit(3, total_steps, 58, f"✔ {msg_dml}")
-                    elif not frozen and ort_install_fn is not None and fallback_ort == "onnxruntime-directml":
+                    elif not ort_locked_frozen and ort_install_fn is not None and fallback_ort == "onnxruntime-directml":
                         ok_dml, msg_dml = ort_install_fn("onnxruntime-directml", progress_cb=lambda t: _emit(3, total_steps, 57, t))
                         if ok_dml:
                             ort_switched = True
@@ -3393,7 +3530,7 @@ def run_full_autosetup(
     active_cams = sum(1 for c in cams if c.get("enabled", True))
     cur_hw = copy.deepcopy(new_cfg.get("hardware") or {})
     eff_caps = copy.deepcopy(caps)
-    disk_ort = str(caps.get("ort_package") or "").strip().lower()
+    disk_ort = str(cur_ort_now or caps.get("ort_package") or "").strip().lower()
     has_nv_gpu = any(g.get("vendor") == "NVIDIA" for g in (live_metrics.get("gpus") or []))
     if disk_ort == "onnxruntime-gpu" and has_nv_gpu:
         eff_caps.setdefault("ai_backends", {}).setdefault("cuda", {})["supported"] = True
@@ -3597,6 +3734,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
     ort_loaded_pkg = str(caps.get("ort_loaded_package") or get_ort_loaded_package() or "")
     ort_restart_req = bool(caps.get("ort_restart_required"))
     frozen = bool(getattr(sys, "frozen", False))
+    ort_frozen = frozen and (not bool(_find_disk_ort_package_dir()))
 
     cuda_st = (
         caps.get("cuda_libraries")
@@ -3686,7 +3824,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
                 "label": tr("hw.mode.cuda.step_ort_need", "Requires 'onnxruntime-gpu' (currently '{pkg}')", pkg=ort_pkg),
                 "detail": (
                     tr("hw.mode.cuda.step_ort_need_det", "Switches only the ONNX Runtime package without reinstalling other modules.")
-                    if not frozen
+                    if not ort_frozen
                     else tr("hw.mode.ort_exe_det", "In the EXE build, install via 1_SETUP.bat.")
                 ),
             })
@@ -3735,7 +3873,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
                 "detail": tr("hw.mode.cuda.step_restart_det", "Files on disk are ready — simply restart the application."),
             })
 
-        can_inst_cuda = bool((need_gpu_ort and not frozen) or need_cuda_dl)
+        can_inst_cuda = bool((need_gpu_ort and not ort_frozen) or need_cuda_dl)
         if cuda_cap.get("supported"):
             c_state = "ready"
             c_badge = tr("hw.mode.badge.ready", "✔ Ready")
@@ -3863,7 +4001,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
             d_state = "needs_setup"
             d_badge = tr("hw.mode.badge.install", "⚙ Install")
             d_head = tr("hw.mode.dml.head_need_ort", "Switch ONNX Runtime package to 'onnxruntime-directml'.")
-            d_act = "" if frozen else tr("hw.mode.dml.act_install", "⬇ Install DirectML")
+            d_act = "" if ort_frozen else tr("hw.mode.dml.act_install", "⬇ Install DirectML")
         elif dml_needs_restart:
             d_state, d_badge, d_act = "restart_required", tr("hw.mode.badge.restart", "⚠ Restart"), ""
             d_head = tr("hw.mode.dml.head_restart", "onnxruntime-directml is already on disk — restart the app.")
@@ -3887,7 +4025,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
                 "need_ort_pkg": "onnxruntime-directml" if need_dml_ort else None,
                 "need_cuda_dlls": False,
                 "needs_restart": dml_needs_restart,
-                "can_install": bool(need_dml_ort and not frozen),
+                "can_install": bool(need_dml_ort and not ort_frozen),
                 "action_label": d_act,
             },
         }
@@ -3958,7 +4096,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
             o_head = tr("hw.mode.ov.head_ready", "Intel OpenVINO is ready.")
         elif need_ov_ort:
             o_state, o_badge = "needs_setup", tr("hw.mode.badge.install", "⚙ Install")
-            o_act = "" if frozen else tr("hw.mode.ov.act_install", "⬇ Install OpenVINO")
+            o_act = "" if ort_frozen else tr("hw.mode.ov.act_install", "⬇ Install OpenVINO")
             o_head = tr("hw.mode.ov.head_need_ort", "Requires package 'onnxruntime-openvino'.")
         elif ov_needs_restart:
             o_state, o_badge, o_act = "restart_required", tr("hw.mode.badge.restart", "⚠ Restart"), ""
@@ -3983,7 +4121,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
                 "need_ort_pkg": "onnxruntime-openvino" if need_ov_ort else None,
                 "need_cuda_dlls": False,
                 "needs_restart": ov_needs_restart,
-                "can_install": bool(need_ov_ort and not frozen),
+                "can_install": bool(need_ov_ort and not ort_frozen),
                 "action_label": o_act,
             },
         }
@@ -4025,7 +4163,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
         })
         cpu_state = "needs_setup"
         cpu_badge = tr("hw.mode.badge.install", "⚙ Install")
-        cpu_act = "" if frozen else tr("hw.mode.cpu.act_install", "⬇ Install onnxruntime")
+        cpu_act = "" if ort_frozen else tr("hw.mode.cpu.act_install", "⬇ Install onnxruntime")
         cpu_head = tr("hw.mode.cpu.head_missing", "Base onnxruntime package is missing.")
 
     modes["cpu"] = {
@@ -4044,7 +4182,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
             "need_ort_pkg": None if has_any_ort else "onnxruntime",
             "need_cuda_dlls": False,
             "needs_restart": False,
-            "can_install": bool((not has_any_ort) and (not frozen)),
+            "can_install": bool((not has_any_ort) and (not ort_frozen)),
             "action_label": cpu_act,
         },
     }
@@ -4376,7 +4514,7 @@ def assess_ai_modes(base_dir: str, caps: dict = None, live_metrics: dict = None)
         "ort_package": ort_pkg,
         "ort_loaded_package": ort_loaded_pkg,
         "ort_restart_required": ort_restart_req,
-        "frozen": frozen,
+        "frozen": ort_frozen,
         "modes": modes,
     }
 
