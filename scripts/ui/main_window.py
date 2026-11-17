@@ -349,6 +349,9 @@ class MainGridWindow:
         self._refresh_hw_badge_tick()
         self._module_poll_after_id = self.root.after(3000, self._poll_modules_tick)
         self._maybe_ensure_cuda_async()
+        if getattr(self.cfg_mgr, "is_first_run", False):
+            self.cfg_mgr.is_first_run = False
+            self.root.after(200, lambda: self.open_settings(initial_node="cameras_root"))
 
     def _set_cuda_note(self, text: str, color: str = "#ffcc00", clear_after_ms: int = 0):
         if self._is_closing:
@@ -799,7 +802,7 @@ class MainGridWindow:
     # ------------------------------------------------------------------
     # Керування незалежними вікнами (Налаштування + Детальний перегляд камер)
     # ------------------------------------------------------------------
-    def open_settings(self):
+    def open_settings(self, initial_node: str = None):
         if self._is_closing:
             return
         if self.settings_win is not None:
@@ -825,6 +828,11 @@ class MainGridWindow:
             on_refresh_modules_cb=self.refresh_modules_and_libraries,
             on_restart_app_cb=self.restart_application,
         )
+        if initial_node and hasattr(self.settings_win, "_select_nav_node"):
+            try:
+                self.settings_win._select_nav_node(initial_node)
+            except Exception:
+                pass
 
     def _prompt_settings_password(self) -> bool:
         """Запитує пароль доступу перед відкриттям налаштувань, якщо пароль задано."""

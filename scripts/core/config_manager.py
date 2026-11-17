@@ -198,6 +198,7 @@ class ConfigManager:
         self._auth_cfg = {"enabled": False}
         self._enc_key = None
         self._is_locked = False
+        self.is_first_run = (not os.path.exists(self.config_json_path)) and (not os.path.exists(self.legacy_ini_path))
         self.data = self._load_or_migrate()
 
     def _get_registry_default_modules(self) -> dict:
