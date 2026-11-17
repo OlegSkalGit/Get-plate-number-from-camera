@@ -206,6 +206,20 @@ class ConfigManager:
             return self.registry.build_all_default_camera_modules()
         return {}
 
+    def _detect_default_ai_backend(self) -> str:
+        try:
+            import onnxruntime as ort
+            provs = set(ort.get_available_providers() or [])
+            if "CUDAExecutionProvider" in provs:
+                return "cuda"
+            if "DmlExecutionProvider" in provs:
+                return "directml"
+            if "OpenVINOExecutionProvider" in provs:
+                return "openvino"
+        except Exception:
+            pass
+        return "cpu"
+
     def _make_defaults(self) -> dict:
         reg_mods = self._get_registry_default_modules()
         return {
@@ -238,7 +252,7 @@ class ConfigManager:
                 "show_fps": True,
             },
             "hardware": {
-                "ai_backend": "cpu",
+                "ai_backend": self._detect_default_ai_backend(),
                 "ai_threads": 2,
                 "ai_max_fps_per_cam": 8.0,
                 "video_decode_mode": "cpu",
