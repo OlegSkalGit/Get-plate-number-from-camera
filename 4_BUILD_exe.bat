@@ -55,6 +55,10 @@ if errorlevel 1 (
     ".venv\Scripts\python.exe" -m pip install pyinstaller
 )
 
+set "EXTRA_PYI_ARGS="
+".venv\Scripts\python.exe" -c "import openvino" >nul 2>nul
+if %ERRORLEVEL% equ 0 set "EXTRA_PYI_ARGS=--collect-all openvino"
+
 echo Початок збірки...
 ".venv\Scripts\python.exe" -m PyInstaller ^
     --name "ANPR_Monitor" ^
@@ -67,6 +71,7 @@ echo Початок збірки...
     --collect-submodules scripts.engine ^
     --collect-submodules scripts.ui ^
     --collect-all onnxruntime ^
+    %EXTRA_PYI_ARGS% ^
     --collect-all fast_alpr ^
     --collect-all fast_plate_ocr ^
     --collect-all imageio_ffmpeg ^
@@ -112,6 +117,11 @@ if exist "cuda\*.dll" (
     if not exist "dist\ANPR_Monitor\cuda" mkdir "dist\ANPR_Monitor\cuda"
     copy /y "cuda\*.dll" "dist\ANPR_Monitor\cuda\" >nul
     if exist "cuda\cuda_manifest.json" copy /y "cuda\cuda_manifest.json" "dist\ANPR_Monitor\cuda\" >nul
+)
+if exist "ort_backends" (
+    echo Копіювання ізольованих бекендів ONNX Runtime з ort_backends\...
+    if not exist "dist\ANPR_Monitor\ort_backends" mkdir "dist\ANPR_Monitor\ort_backends"
+    xcopy /e /y /i "ort_backends\*" "dist\ANPR_Monitor\ort_backends\" >nul
 )
 if exist "config.json" copy /y "config.json" "dist\ANPR_Monitor\config.json" >nul
 if exist "README.md" copy /y "README.md" "dist\ANPR_Monitor\" >nul

@@ -14,6 +14,7 @@ import hashlib
 import zipfile
 import tempfile
 import importlib
+import importlib.abc
 import importlib.machinery
 import subprocess
 import threading
@@ -132,8 +133,54 @@ def _get_normalized_disk_dists_map() -> dict:
     return out
 
 
+_ACTIVE_ORT_ROOT_DIR = ""
+
+
+class _OrtBackendMetaFinder(importlib.abc.MetaPathFinder):
+    """Перенаправляє імпорт onnxruntime у вибрану папку ort_backends/<mode>/ навіть у PyInstaller EXE."""
+    def __init__(self, root_dir: str):
+        self.root_dir = os.path.abspath(root_dir)
+        self._pkg_dir_norm = os.path.normcase(os.path.normpath(os.path.join(self.root_dir, "onnxruntime")))
+
+    def _is_under_root(self, p: str) -> bool:
+        try:
+            np = os.path.normcase(os.path.normpath(p))
+            return np == self._pkg_dir_norm or np.startswith(self._pkg_dir_norm + os.sep)
+        except Exception:
+            return False
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "onnxruntime" or fullname.startswith("onnxruntime."):
+            if path is not None and all(self._is_under_root(p) for p in path):
+                search_path = list(path)
+            elif fullname == "onnxruntime":
+                search_path = [self.root_dir]
+            else:
+                rel_parts = fullname.split(".")[1:-1]
+                sub_dir = os.path.join(self.root_dir, "onnxruntime", *rel_parts)
+                search_path = [sub_dir] if os.path.isdir(sub_dir) else [os.path.join(self.root_dir, "onnxruntime")]
+            return importlib.machinery.PathFinder.find_spec(fullname, search_path, target)
+        return None
+
+
 def _find_disk_ort_package_dir() -> str:
     """Знаходить каталог активного пакета onnxruntime на диску (без звернення до sys.modules)."""
+    if _ACTIVE_ORT_ROOT_DIR:
+        cand = os.path.join(_ACTIVE_ORT_ROOT_DIR, "onnxruntime")
+        if os.path.isdir(os.path.join(cand, "capi")):
+            return cand
+
+    for p in list(sys.path):
+        if not p:
+            continue
+        try:
+            if os.path.basename(os.path.dirname(os.path.normpath(p))).lower() == "ort_backends":
+                cand = os.path.join(p, "onnxruntime")
+                if os.path.isdir(os.path.join(cand, "capi")):
+                    return cand
+        except Exception:
+            pass
+
     if getattr(sys, "frozen", False):
         meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -382,6 +429,8 @@ def prepare_ort_backend_environment(base_dir: str = None, ai_backend: str = None
     activated = False
 
     if not already_loaded:
+        global _ACTIVE_ORT_ROOT_DIR
+        sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, _OrtBackendMetaFinder)]
         # Прибираємо будь-які інші ort_backends/* з sys.path, щоб завантажився саме вибраний варіант
         new_sys_path = []
         chosen_norm = os.path.normcase(os.path.normpath(chosen_dir)) if chosen_dir else ""
@@ -396,7 +445,9 @@ def prepare_ort_backend_environment(base_dir: str = None, ai_backend: str = None
                 pass
             new_sys_path.append(p)
         if chosen_dir:
+            _ACTIVE_ORT_ROOT_DIR = chosen_dir
             sys.path[:] = [chosen_dir] + new_sys_path
+            sys.meta_path.insert(0, _OrtBackendMetaFinder(chosen_dir))
             capi_dir = os.path.join(chosen_dir, "onnxruntime", "capi")
             if os.path.isdir(capi_dir):
                 norm_capi = os.path.normcase(os.path.normpath(capi_dir))
@@ -413,6 +464,7 @@ def prepare_ort_backend_environment(base_dir: str = None, ai_backend: str = None
                     os.environ["PATH"] = os.pathsep.join([capi_dir] + parts)
             activated = True
         else:
+            _ACTIVE_ORT_ROOT_DIR = ""
             sys.path[:] = new_sys_path
 
         importlib.invalidate_caches()
@@ -4888,6 +4940,74 @@ def ensure_ai_backend_dependencies(
     }
 
 
+def ensure_all_compatible_ort_backends(
+    base_dir: str,
+    hw_monitor: HardwareMonitor = None,
+    registry=None,
+    progress_cb=None,
+) -> dict:
+    """
+    Одноразово завантажує всі сумісні з цим ПК (і Windows EXE) бекенди ONNX Runtime у ort_backends/<mode>/,
+    щоб при перемиканні між ними нічого не доводилося довантажувати з інтернету.
+    """
+    if hw_monitor is not None:
+        caps = hw_monitor.probe_acceleration_capabilities(force=False)
+        live_metrics = hw_monitor.get_live_metrics()
+    else:
+        caps = {}
+        live_metrics = None
+
+    assessment = assess_ai_modes(base_dir, caps=caps, live_metrics=live_metrics)
+    modes_info = assessment.get("modes") or {}
+    best_mode = str(assessment.get("best_mode") or "cpu")
+
+    targets = []
+    if sys.platform == "win32":
+        if (modes_info.get("cuda") or {}).get("hw_supported"):
+            targets.append("cuda")
+        if (modes_info.get("directml") or {}).get("hw_supported"):
+            targets.append("directml")
+        if (modes_info.get("openvino") or {}).get("hw_supported"):
+            targets.append("openvino")
+    else:
+        for mk in ("cuda", "openvino"):
+            if (modes_info.get(mk) or {}).get("hw_supported"):
+                targets.append(mk)
+
+    if best_mode in targets:
+        targets = [best_mode] + [m for m in targets if m != best_mode]
+    if "cpu" not in targets:
+        targets.append("cpu")
+
+    installed_modes = []
+    failed_modes = []
+    last_msg = []
+    for mk in targets:
+        if progress_cb:
+            progress_cb(f"Preparing backend: {mk}...")
+        r = ensure_ai_backend_dependencies(
+            base_dir,
+            mode=mk,
+            hw_monitor=hw_monitor,
+            registry=registry,
+            progress_cb=progress_cb,
+        )
+        if r.get("ok"):
+            installed_modes.append(mk)
+        else:
+            failed_modes.append((mk, r.get("message", "")))
+        if r.get("message"):
+            last_msg.append(f"[{mk}] {r['message']}")
+
+    return {
+        "ok": len(installed_modes) > 0 and (best_mode in installed_modes or "cpu" in installed_modes),
+        "target_mode": best_mode,
+        "installed_modes": installed_modes,
+        "failed_modes": failed_modes,
+        "message": " | ".join(last_msg),
+    }
+
+
 if __name__ == "__main__":
     if "--ensure-cuda" in sys.argv:
         try:
@@ -4897,6 +5017,20 @@ if __name__ == "__main__":
             target_dir = "."
         ok = ensure_cuda_libraries_cli(target_dir)
         sys.exit(0 if ok else 1)
+    if "--ensure-all-ort" in sys.argv:
+        try:
+            idx = sys.argv.index("--ensure-all-ort")
+            target_dir = sys.argv[idx + 1] if (idx + 1) < len(sys.argv) and not sys.argv[idx + 1].startswith("-") else "."
+        except Exception:
+            target_dir = "."
+        hm = HardwareMonitor(target_dir)
+        res = ensure_all_compatible_ort_backends(
+            target_dir,
+            hw_monitor=hm,
+            progress_cb=lambda msg: print(f"  {msg}"),
+        )
+        print(f"[ONNX Runtime -> {', '.join(m.upper() for m in res.get('installed_modes', []))}] best={res.get('target_mode', 'cpu').upper()}")
+        sys.exit(0 if res.get("ok") else 1)
     if "--ensure-optimal-ort" in sys.argv:
         try:
             idx = sys.argv.index("--ensure-optimal-ort")

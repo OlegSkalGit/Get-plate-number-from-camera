@@ -87,8 +87,8 @@ echo.
 echo --------------------------------------------------------
 echo   Прискорення нейромереж (ONNX Runtime)
 echo --------------------------------------------------------
-echo Автоматична перевірка GPU та підготовка оптимального бекенду в ort_backends\...
-".venv\Scripts\python.exe" -m scripts.core.hardware_info --ensure-optimal-ort .
+echo Автоматична перевірка GPU та завантаження сумісних бекендів в ort_backends\...
+".venv\Scripts\python.exe" -m scripts.core.hardware_info --ensure-all-ort .
 if !ERRORLEVEL! neq 0 (
     echo [УВАГА] Використано базовий CPU-режим ONNX Runtime ^(перемикання також доступне у Налаштування - Залізо та графіка^).
 )
