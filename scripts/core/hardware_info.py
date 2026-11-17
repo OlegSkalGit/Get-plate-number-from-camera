@@ -3392,8 +3392,18 @@ def run_full_autosetup(
     cams = new_cfg.setdefault("cameras", [])
     active_cams = sum(1 for c in cams if c.get("enabled", True))
     cur_hw = copy.deepcopy(new_cfg.get("hardware") or {})
+    eff_caps = copy.deepcopy(caps)
+    disk_ort = str(caps.get("ort_package") or "").strip().lower()
+    has_nv_gpu = any(g.get("vendor") == "NVIDIA" for g in (live_metrics.get("gpus") or []))
+    if disk_ort == "onnxruntime-gpu" and has_nv_gpu:
+        eff_caps.setdefault("ai_backends", {}).setdefault("cuda", {})["supported"] = True
+    elif disk_ort == "onnxruntime-directml":
+        eff_caps.setdefault("ai_backends", {}).setdefault("directml", {})["supported"] = True
+    elif disk_ort == "onnxruntime-openvino":
+        eff_caps.setdefault("ai_backends", {}).setdefault("openvino", {})["supported"] = True
+
     opt_hw = compute_optimal_hardware_config(
-        caps,
+        eff_caps,
         live_metrics=live_metrics,
         current_hw=cur_hw,
         active_cameras_count=max(1, active_cams),
