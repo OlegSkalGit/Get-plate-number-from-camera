@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 chcp 65001 > nul
 title ANPR - NVR — Автоматичне встановлення
@@ -69,6 +70,24 @@ echo.
 echo ========================================================
 echo   Завантаження моделей для модулів...
 echo ========================================================
+if not exist "%~dp0models" mkdir "%~dp0models"
+for %%M in (best.onnx cct_xs_v2_global.onnx cct_xs_v2_global_plate_config.yaml scrfd_face_detector.onnx face_recognizer.onnx yolo11n.onnx) do (
+    set "NEED_DL=0"
+    if not exist "%~dp0models\%%M" (
+        set "NEED_DL=1"
+    ) else (
+        for %%A in ("%~dp0models\%%M") do if %%~zA LSS 512 set "NEED_DL=1"
+    )
+    if "!NEED_DL!"=="1" (
+        echo Завантаження %%M...
+        where curl.exe >nul 2>&1
+        if !errorlevel!==0 (
+            curl.exe -fL "https://media.githubusercontent.com/media/OlegSkalGit/Get-plate-number-from-camera/main/models/%%M" -o "%~dp0models\%%M"
+        ) else (
+            powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://media.githubusercontent.com/media/OlegSkalGit/Get-plate-number-from-camera/main/models/%%M' -OutFile '%~dp0models\%%M'"
+        )
+    )
+)
 "%~dp0.venv\Scripts\python.exe" -c "from scripts.core.module_registry import ModuleRegistry; r = ModuleRegistry('.'); [print(e['id'], '->', e['spec']['ensure_resources']('.', download=True).get('message', 'OK')) for e in r.list_modules() if callable(e['spec'].get('ensure_resources'))]"
 
 if not exist "%~dp03_RUN.bat" (
