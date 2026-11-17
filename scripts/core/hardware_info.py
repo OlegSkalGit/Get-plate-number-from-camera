@@ -162,14 +162,9 @@ def _find_disk_ort_package_dir() -> str:
     return ""
 
 
-def _read_disk_ort_package_info() -> tuple:
-    """
-    Читає фактичну назву варіанта та версію з активних файлів onnxruntime/ на диску
-    (capi/build_and_package_info.py або нативні маркери в capi/), не торкаючись sys.modules.
-    Повертає (pkg_name, version, cuda_version).
-    """
-    ort_dir = _find_disk_ort_package_dir()
-    if not ort_dir:
+def _read_ort_pkg_info_from_dir(ort_dir: str) -> tuple:
+    """Читає (pkg_name, version, cuda_version) з вказаного каталогу onnxruntime/."""
+    if not ort_dir or not os.path.isdir(ort_dir):
         return ("", "", "")
     capi_dir = os.path.join(ort_dir, "capi")
     pkg_name = ""
@@ -224,6 +219,15 @@ def _read_disk_ort_package_info() -> tuple:
             pkg_name = "onnxruntime"
 
     return (pkg_name, ver_str, cuda_ver)
+
+
+def _read_disk_ort_package_info() -> tuple:
+    """
+    Читає фактичну назву варіанта та версію з активних файлів onnxruntime/ на диску
+    (capi/build_and_package_info.py або нативні маркери в capi/), не торкаючись sys.modules.
+    Повертає (pkg_name, version, cuda_version).
+    """
+    return _read_ort_pkg_info_from_dir(_find_disk_ort_package_dir())
 
 
 ORT_PACKAGE_TO_BACKEND = {
@@ -290,12 +294,36 @@ def list_installed_ort_backends(base_dir: str = None) -> dict:
         if _is_ort_dir_valid(bdir, expected_pkg=pkg):
             found[pkg] = bdir
 
-    # Також враховуємо базовий пакет у site-packages / _internal
-    base_pkg = get_installed_ort_package()
-    if base_pkg and base_pkg not in found:
-        ort_dir = _find_disk_ort_package_dir()
-        if ort_dir and os.path.isdir(ort_dir):
-            found[base_pkg] = os.path.dirname(ort_dir)
+    # Також враховуємо базовий пакет у site-packages / _internal (ігноруючи ort_backends/*)
+    backends_root_norm = os.path.normcase(os.path.normpath(get_ort_backends_dir(root)))
+    cand_roots = []
+    if getattr(sys, "frozen", False):
+        meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        cand_roots.extend([meipass, os.path.join(exe_dir, "_internal"), exe_dir])
+    else:
+        cand_roots.extend([p for p in list(sys.path) if p])
+
+    seen_dirs = set()
+    for p in cand_roots:
+        if not p:
+            continue
+        try:
+            ap = os.path.abspath(p)
+            np = os.path.normcase(os.path.normpath(ap))
+            if np in seen_dirs:
+                continue
+            seen_dirs.add(np)
+            if np.startswith(backends_root_norm + os.sep) or np == backends_root_norm:
+                continue
+            cand_ort = os.path.join(ap, "onnxruntime")
+            if not os.path.isdir(os.path.join(cand_ort, "capi")):
+                continue
+            pkg_n, _v, _cv = _read_ort_pkg_info_from_dir(cand_ort)
+            if pkg_n and pkg_n not in found:
+                found[pkg_n] = ap
+        except Exception:
+            pass
     return found
 
 
@@ -335,47 +363,59 @@ def prepare_ort_backend_environment(base_dir: str = None, ai_backend: str = None
                 chosen_mode = cand_mode
                 chosen_dir = cand_dir
                 break
+            elif cand_pkg in installed_map:
+                chosen_mode = cand_mode
+                chosen_dir = installed_map[cand_pkg]
+                break
     else:
         cand_pkg = ORT_BACKEND_TO_PACKAGE.get(req_mode, "onnxruntime")
         cand_dir = get_ort_backend_dir(root, req_mode)
         if _is_ort_dir_valid(cand_dir, expected_pkg=cand_pkg):
             chosen_mode = req_mode
             chosen_dir = cand_dir
+        elif cand_pkg in installed_map:
+            chosen_mode = req_mode
+            chosen_dir = installed_map[cand_pkg]
 
     backends_root_norm = os.path.normcase(os.path.normpath(get_ort_backends_dir(root)))
     already_loaded = ("onnxruntime" in sys.modules)
     activated = False
 
-    if chosen_dir and not already_loaded:
+    if not already_loaded:
         # Прибираємо будь-які інші ort_backends/* з sys.path, щоб завантажився саме вибраний варіант
         new_sys_path = []
+        chosen_norm = os.path.normcase(os.path.normpath(chosen_dir)) if chosen_dir else ""
         for p in sys.path:
             try:
                 np = os.path.normcase(os.path.normpath(p))
                 if np.startswith(backends_root_norm + os.sep) or np == backends_root_norm:
                     continue
+                if chosen_norm and np == chosen_norm:
+                    continue
             except Exception:
                 pass
             new_sys_path.append(p)
-        sys.path[:] = [chosen_dir] + new_sys_path
-
-        capi_dir = os.path.join(chosen_dir, "onnxruntime", "capi")
-        if os.path.isdir(capi_dir):
-            norm_capi = os.path.normcase(os.path.normpath(capi_dir))
-            if norm_capi not in _CUDA_REGISTERED_DIRS:
-                _CUDA_REGISTERED_DIRS.add(norm_capi)
-                if hasattr(os, "add_dll_directory"):
-                    try:
-                        _CUDA_DLL_DIR_HANDLES.append(os.add_dll_directory(capi_dir))
-                    except Exception:
-                        pass
-            cur_p = os.environ.get("PATH") or ""
-            parts = [x for x in cur_p.split(os.pathsep) if x]
-            if norm_capi not in {os.path.normcase(os.path.normpath(x)) for x in parts}:
-                os.environ["PATH"] = os.pathsep.join([capi_dir] + parts)
+        if chosen_dir:
+            sys.path[:] = [chosen_dir] + new_sys_path
+            capi_dir = os.path.join(chosen_dir, "onnxruntime", "capi")
+            if os.path.isdir(capi_dir):
+                norm_capi = os.path.normcase(os.path.normpath(capi_dir))
+                if norm_capi not in _CUDA_REGISTERED_DIRS:
+                    _CUDA_REGISTERED_DIRS.add(norm_capi)
+                    if hasattr(os, "add_dll_directory"):
+                        try:
+                            _CUDA_DLL_DIR_HANDLES.append(os.add_dll_directory(capi_dir))
+                        except Exception:
+                            pass
+                cur_p = os.environ.get("PATH") or ""
+                parts = [x for x in cur_p.split(os.pathsep) if x]
+                if norm_capi not in {os.path.normcase(os.path.normpath(x)) for x in parts}:
+                    os.environ["PATH"] = os.pathsep.join([capi_dir] + parts)
+            activated = True
+        else:
+            sys.path[:] = new_sys_path
 
         importlib.invalidate_caches()
-        activated = True
 
     if (chosen_mode == "cuda") or (req_mode in ("cuda", "auto") and "onnxruntime-gpu" in installed_map):
         try:
