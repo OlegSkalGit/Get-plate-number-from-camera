@@ -2407,11 +2407,20 @@ class MainGridWindow(GridWindowBase):
             ram_used = float(m["ram"]["used_gb"])
             ram_tot = float(m["ram"]["total_gb"])
             ai_sum = self.inference_pool.get_active_summary()
-            gpu_bit = ""
+            gpu_parts = []
+            gb_unit = tr("ui.unit.gb", "GB")
             for g in (m.get("gpus") or []):
-                if g.get("live_metrics") and g.get("gpu_util_pct") is not None:
-                    gpu_bit = f" | GPU: {g['gpu_util_pct']:.0f}%"
+                if g.get("live_metrics") and (g.get("gpu_util_pct") is not None or g.get("vram_used_mb") is not None):
+                    if g.get("gpu_util_pct") is not None:
+                        gpu_parts.append(f"GPU: {float(g['gpu_util_pct']):.0f}%")
+                    v_used = g.get("vram_used_mb")
+                    v_tot = g.get("vram_total_mb")
+                    if v_used is not None and v_tot is not None and float(v_tot) > 0:
+                        gpu_parts.append(f"VRAM: {float(v_used) / 1024.0:.1f}/{float(v_tot) / 1024.0:.1f} {gb_unit}")
+                    elif v_used is not None:
+                        gpu_parts.append(f"VRAM: {float(v_used) / 1024.0:.1f} {gb_unit}")
                     break
+            gpu_bit = (" | " + " | ".join(gpu_parts)) if gpu_parts else ""
             self.lbl_hw_badge.configure(
                 text=tr(
                     "ui.main.hw_badge_fmt",
