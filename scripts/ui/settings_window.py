@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import uuid
 import copy
 import queue
 import threading
@@ -179,6 +180,7 @@ class SettingsWindow:
         self._autosetup_running = False
         self._autosetup_dlg = None
         self._autosetup_dlg_state = None
+        self._active_pwd_dlg = None
         self._last_caps = None
         self._last_cuda_status = None
         self._tree_syncing = False
@@ -348,7 +350,15 @@ class SettingsWindow:
 
         self.nav_tree = ttk.Treeview(nav_frame, style="SettingsNav.Treeview", show="tree", selectmode="browse")
         self.nav_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=6)
+        self._nav_drag = {"iid": None, "active": False, "x": 0, "y": 0}
         self.nav_tree.bind(EVT_TREE_SELECT, self._on_tree_select)
+        self.nav_tree.bind("<ButtonPress-1>", self._on_nav_drag_start, add="+")
+        self.nav_tree.bind("<B1-Motion>", self._on_nav_drag_motion, add="+")
+        self.nav_tree.bind("<ButtonRelease-1>", self._on_nav_drag_end, add="+")
+        self.nav_tree.bind("<Button-3>", self._on_nav_right_click, add="+")
+        self.nav_tree.bind("<F2>", lambda _e: self._rename_selected_camera_group(), add="+")
+        self.nav_tree.bind("<<TreeviewOpen>>", lambda _e: self._on_nav_toggle_open(True), add="+")
+        self.nav_tree.bind("<<TreeviewClose>>", lambda _e: self._on_nav_toggle_open(False), add="+")
 
         self.right_container = tk.Frame(body, bg="#161720")
         self.right_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -428,13 +438,45 @@ class SettingsWindow:
             self.nav_tree.insert("", "end", iid="modules", text=tr("ui.settings.nav.modules", "  🧩 Modules & Libraries"))
             cams_node = self.nav_tree.insert("", "end", iid="cameras_root", text=tr("ui.settings.nav.cameras", "  📹 Cameras"), open=True)
 
+            groups = [g for g in (self.draft.get("camera_groups") or []) if isinstance(g, dict) and g.get("id")]
+            grp_ids_set = {str(g["id"]) for g in groups}
+            cams_list = self.draft.get("cameras") or []
             disabled_suf = tr("ui.settings.nav.cam_disabled_suf", " (disabled)")
-            for idx, cam in enumerate(self.draft.get("cameras") or []):
-                uid = cam["uuid"]
-                name = str(cam.get("name") or tr("camera.default_numbered", "Camera {num}", num=idx + 1))
-                prefix = "●" if cam.get("enabled", True) else "⏸"
-                suffix = "" if cam.get("enabled", True) else disabled_suf
-                self.nav_tree.insert(cams_node, "end", iid=f"cam:{uid}", text=f"  {prefix} {name}{suffix}")
+
+            def _render_children(parent_gid: str, parent_iid: str, visited: set):
+                items = []
+                for g_idx, g in enumerate(groups):
+                    p_id = str(g.get("parent_id") or "")
+                    if p_id not in grp_ids_set:
+                        p_id = ""
+                    if p_id == parent_gid:
+                        items.append((int(g.get("tree_order", g_idx) or 0), 0, g_idx, "grp", g))
+                for c_idx, cam in enumerate(cams_list):
+                    c_gid = str(cam.get("group_id") or "")
+                    if c_gid not in grp_ids_set:
+                        c_gid = ""
+                    if c_gid == parent_gid:
+                        items.append((int(cam.get("tree_order", c_idx) or 0), 1, c_idx, "cam", cam))
+                items.sort(key=lambda x: (x[0], x[1], x[2]))
+
+                for _ord, _kord, idx, kind, obj in items:
+                    if kind == "grp":
+                        gid = str(obj["id"])
+                        if gid in visited:
+                            continue
+                        visited.add(gid)
+                        g_name = str(obj.get("name") or tr("ui.settings.cams.group_default", "Folder"))
+                        g_open = bool(obj.get("open", True))
+                        giid = self.nav_tree.insert(parent_iid, "end", iid=f"grp:{gid}", text=f"  📁 {g_name}", open=g_open)
+                        _render_children(gid, giid, visited)
+                    else:
+                        uid = obj["uuid"]
+                        name = str(obj.get("name") or tr("camera.default_numbered", "Camera {num}", num=idx + 1))
+                        prefix = "●" if obj.get("enabled", True) else "⏸"
+                        suffix = "" if obj.get("enabled", True) else disabled_suf
+                        self.nav_tree.insert(parent_iid, "end", iid=f"cam:{uid}", text=f"  {prefix} {name}{suffix}")
+
+            _render_children("", cams_node, set())
 
             target = select_id or self._current_node_id
             if target and self.nav_tree.exists(target):
@@ -460,6 +502,601 @@ class SettingsWindow:
         if node_id != self._current_node_id:
             self._commit_current_page()
             self._show_page(node_id)
+
+    # ------------------------------------------------------------------
+    # Дерево камер (групи / гілки, Drag & Drop, перейменування)
+    # ------------------------------------------------------------------
+    def _next_tree_order(self, parent_gid: str = "") -> int:
+        max_ord = -1
+        for g in (self.draft.get("camera_groups") or []):
+            if isinstance(g, dict) and str(g.get("parent_id") or "") == str(parent_gid or ""):
+                try:
+                    max_ord = max(max_ord, int(g.get("tree_order", 0) or 0))
+                except Exception:
+                    pass
+        for c in (self.draft.get("cameras") or []):
+            if str(c.get("group_id") or "") == str(parent_gid or ""):
+                try:
+                    max_ord = max(max_ord, int(c.get("tree_order", 0) or 0))
+                except Exception:
+                    pass
+        return max_ord + 1
+
+    def _on_nav_toggle_open(self, is_open: bool):
+        iid = str(self.nav_tree.focus() or "")
+        if not iid.startswith("grp:"):
+            return
+        gid = iid.split("grp:", 1)[1]
+        for g in (self.draft.get("camera_groups") or []):
+            if isinstance(g, dict) and str(g.get("id")) == gid:
+                g["open"] = bool(is_open)
+                break
+
+    def _ask_dark_string(self, title: str, prompt: str, initialvalue: str = ""):
+        res = {"val": None}
+        dlg = tk.Toplevel(self.win)
+        dlg.title(title)
+        dlg.configure(bg="#181818")
+        dlg.resizable(False, False)
+        dlg.transient(self.win)
+        dlg.grab_set()
+
+        w, h = 380, 155
+        try:
+            px, py = self.win.winfo_pointerxy()
+            sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+            x = max(8, min(sw - w - 8, px - w // 2))
+            y = max(8, min(sh - h - 40, py + 12))
+            dlg.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            dlg.geometry(f"{w}x{h}")
+
+        frm = tk.Frame(dlg, bg="#181818", padx=18, pady=16)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            frm, text=prompt, bg="#181818", fg="#f3f3f3",
+            font=("Segoe UI", 10, "bold"), anchor="w",
+        ).pack(fill=tk.X, pady=(0, 8))
+
+        var = tk.StringVar(value=str(initialvalue or ""))
+        ent = tk.Entry(
+            frm, textvariable=var, bg="#252836", fg="#ffffff",
+            insertbackground="#ffffff", relief=tk.FLAT,
+            highlightthickness=1, highlightbackground="#3a3f54", highlightcolor="#007acc",
+            font=("Segoe UI", 10),
+        )
+        ent.pack(fill=tk.X, ipady=5, pady=(0, 14))
+
+        btns = tk.Frame(frm, bg="#181818")
+        btns.pack(fill=tk.X)
+
+        def _ok(_e=None):
+            res["val"] = var.get()
+            dlg.destroy()
+
+        def _cancel(_e=None):
+            res["val"] = None
+            dlg.destroy()
+
+        tk.Button(
+            btns, text=tr("ui.common.cancel", "Cancel"), command=_cancel,
+            bg="#2d2d2d", fg="#e5e5e5", relief=tk.FLAT, font=("Segoe UI", 9), padx=12, pady=5, cursor="hand2",
+        ).pack(side=tk.RIGHT)
+        tk.Button(
+            btns, text="OK", command=_ok,
+            bg="#007acc", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=16, pady=5, cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        dlg.bind("<Return>", _ok)
+        dlg.bind("<Escape>", _cancel)
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+        ent.focus_set()
+        ent.selection_range(0, tk.END)
+        self.win.wait_window(dlg)
+        return res["val"]
+
+    def _create_camera_group(self, parent_gid: str = ""):
+        name = self._ask_dark_string(
+            tr("ui.settings.cams.group_new_title", "New Tree Branch"),
+            tr("ui.settings.cams.group_new_prompt", "Enter branch name:"),
+        )
+        if not name or not str(name).strip():
+            return
+        gid = uuid.uuid4().hex[:8]
+        pgid = str(parent_gid or "")
+        groups = self.draft.setdefault("camera_groups", [])
+        groups.append({
+            "id": gid,
+            "name": str(name).strip(),
+            "parent_id": pgid,
+            "open": True,
+            "tree_order": self._next_tree_order(pgid),
+        })
+        self._rebuild_nav_tree(select_id=f"grp:{gid}", preserve_scroll=True)
+
+    def _rename_camera_group(self, gid: str):
+        groups = self.draft.get("camera_groups") or []
+        grp = next((g for g in groups if isinstance(g, dict) and str(g.get("id")) == str(gid)), None)
+        if grp is None:
+            return
+        new_name = self._ask_dark_string(
+            tr("ui.settings.cams.group_ren_title", "Rename Branch"),
+            tr("ui.settings.cams.group_ren_prompt", "New branch name:"),
+            initialvalue=str(grp.get("name") or ""),
+        )
+        if not new_name or not str(new_name).strip():
+            return
+        grp["name"] = str(new_name).strip()
+        self._rebuild_nav_tree(select_id=f"grp:{gid}", preserve_scroll=True)
+
+    def _rename_camera(self, cam_uuid: str):
+        cam = next((c for c in (self.draft.get("cameras") or []) if c.get("uuid") == cam_uuid), None)
+        if cam is None:
+            return
+        new_name = self._ask_dark_string(
+            tr("ui.settings.cams.cam_ren_title", "Rename Camera"),
+            tr("ui.settings.cams.cam_ren_prompt", "New camera name:"),
+            initialvalue=str(cam.get("name") or ""),
+        )
+        if not new_name or not str(new_name).strip():
+            return
+        cam["name"] = str(new_name).strip()
+        self._rebuild_nav_tree(select_id=self._current_node_id or f"cam:{cam_uuid}", preserve_scroll=True)
+
+    def _delete_camera(self, cam_uuid: str):
+        clist = self.draft.get("cameras") or []
+        cam = next((c for c in clist if c.get("uuid") == cam_uuid), None)
+        if cam is None:
+            return
+        if len(clist) <= 1:
+            messagebox.showwarning(
+                tr("ui.common.warning", "Warning"),
+                tr("ui.settings.cams.min_one_warn", "At least 1 camera must remain in the system."),
+                parent=self.win,
+            )
+            return
+        cname = str(cam.get("name") or "")
+        if messagebox.askyesno(
+            tr("ui.settings.cams.del_title", "Delete Camera"),
+            tr(
+                "ui.settings.cams.del_confirm",
+                "Remove camera '{name}' from the list?\n(Archive files on disk will remain intact).",
+                name=cname,
+            ),
+            parent=self.win,
+        ):
+            self.draft["cameras"] = [c for c in clist if c.get("uuid") != cam_uuid]
+            self._sync_cameras_order_from_tree()
+            target = self._current_node_id
+            if target == f"cam:{cam_uuid}":
+                gid = str(cam.get("group_id") or "")
+                target = f"grp:{gid}" if gid else "cameras_root"
+            self._rebuild_nav_tree(select_id=target or "cameras_root", preserve_scroll=True)
+
+    def _delete_camera_group(self, gid: str):
+        groups = self.draft.get("camera_groups") or []
+        grp = next((g for g in groups if isinstance(g, dict) and str(g.get("id")) == str(gid)), None)
+        if grp is None:
+            return
+        parent_gid = str(grp.get("parent_id") or "")
+
+        children_map = {}
+        for g in groups:
+            if isinstance(g, dict) and g.get("id"):
+                children_map.setdefault(str(g.get("parent_id") or ""), []).append(str(g["id"]))
+        subtree_gids = set()
+        stack = [str(gid)]
+        while stack:
+            cur = stack.pop()
+            if cur in subtree_gids:
+                continue
+            subtree_gids.add(cur)
+            stack.extend(children_map.get(cur, []))
+
+        cams = self.draft.get("cameras") or []
+        cams_in_branch = [c for c in cams if str(c.get("group_id") or "") in subtree_gids]
+
+        action = "parent" if parent_gid else "root"
+        if cams_in_branch:
+            choice = {"val": None}
+            dlg = tk.Toplevel(self.win)
+            dlg.title(tr("ui.settings.cams.btn_del_group", "Delete branch"))
+            dlg.configure(bg="#181818")
+            dlg.resizable(False, False)
+            dlg.transient(self.win)
+            dlg.grab_set()
+            try:
+                px, py = self.win.winfo_pointerxy()
+                sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+                x = max(8, min(sw - 460, px - 140))
+                y = max(8, min(sh - 160, py + 12))
+                dlg.geometry(f"+{x}+{y}")
+            except Exception:
+                pass
+
+            frm = tk.Frame(dlg, bg="#181818", padx=18, pady=16)
+            frm.pack(fill=tk.BOTH, expand=True)
+            tk.Label(
+                frm,
+                text=tr(
+                    "ui.settings.cams.del_group_prompt",
+                    "Branch '{name}' contains {n} camera(s). What should be done with them?",
+                    name=str(grp.get("name") or ""),
+                    n=len(cams_in_branch),
+                ),
+                bg="#181818", fg="#f3f3f3", font=("Segoe UI", 10, "bold"), anchor="w",
+            ).pack(fill=tk.X, pady=(0, 12))
+
+            btns = tk.Frame(frm, bg="#181818")
+            btns.pack(fill=tk.X)
+
+            def _pick(val):
+                choice["val"] = val
+                dlg.destroy()
+
+            if parent_gid:
+                tk.Button(
+                    btns, text=tr("ui.settings.cams.del_group_move_parent", "Move to parent branch"),
+                    command=lambda: _pick("parent"),
+                    bg="#007acc", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=10, pady=5, cursor="hand2",
+                ).pack(side=tk.LEFT, padx=(0, 6))
+            tk.Button(
+                btns, text=tr("ui.settings.cams.del_group_move_root", "Move to root list"),
+                command=lambda: _pick("root"),
+                bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=10, pady=5, cursor="hand2",
+            ).pack(side=tk.LEFT, padx=(0, 6))
+            tk.Button(
+                btns, text=tr("ui.settings.cams.del_group_delete_cams", "Delete cameras"),
+                command=lambda: _pick("delete"),
+                bg="#64262b", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=10, pady=5, cursor="hand2",
+            ).pack(side=tk.LEFT, padx=(0, 6))
+            tk.Button(
+                btns, text=tr("ui.common.cancel", "Cancel"),
+                command=lambda: _pick(None),
+                bg="#2d2d2d", fg="#e5e5e5", relief=tk.FLAT, font=("Segoe UI", 9), padx=10, pady=5, cursor="hand2",
+            ).pack(side=tk.LEFT)
+
+            dlg.bind("<Escape>", lambda _e: _pick(None))
+            dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
+            self.win.wait_window(dlg)
+            if choice["val"] is None:
+                return
+            action = choice["val"]
+
+        if action == "delete":
+            remaining = [c for c in cams if str(c.get("group_id") or "") not in subtree_gids]
+            if not remaining:
+                messagebox.showwarning(
+                    tr("ui.common.warning", "Warning"),
+                    tr("ui.settings.cams.min_one_warn", "At least 1 camera must remain in the system."),
+                    parent=self.win,
+                )
+                return
+            self.draft["cameras"] = remaining
+            self.draft["camera_groups"] = [g for g in groups if not (isinstance(g, dict) and str(g.get("id")) in subtree_gids)]
+        else:
+            dest_gid = parent_gid if (action == "parent" and parent_gid) else ""
+            for g in groups:
+                if isinstance(g, dict) and str(g.get("parent_id") or "") == str(gid):
+                    g["parent_id"] = dest_gid
+            for c in cams:
+                if str(c.get("group_id") or "") == str(gid):
+                    c["group_id"] = dest_gid
+            self.draft["camera_groups"] = [g for g in groups if not (isinstance(g, dict) and str(g.get("id")) == str(gid))]
+
+        self._sync_cameras_order_from_tree()
+        target = f"grp:{parent_gid}" if parent_gid else "cameras_root"
+        self._rebuild_nav_tree(select_id=target, preserve_scroll=True)
+
+    def _rename_selected_camera_group(self):
+        sel = self.nav_tree.selection()
+        if not sel:
+            return
+        iid = str(sel[0])
+        if iid.startswith("grp:"):
+            self._rename_camera_group(iid.split("grp:", 1)[1])
+
+    def _set_cameras_enabled_in_group(self, gid: str, enabled: bool):
+        cams = self.draft.get("cameras") or []
+        if not gid:
+            for c in cams:
+                c["enabled"] = bool(enabled)
+        else:
+            groups = self.draft.get("camera_groups") or []
+            children_map = {}
+            for g in groups:
+                if isinstance(g, dict) and g.get("id"):
+                    children_map.setdefault(str(g.get("parent_id") or ""), []).append(str(g["id"]))
+            target_gids = set()
+            stack = [str(gid)]
+            while stack:
+                cur = stack.pop()
+                if cur in target_gids:
+                    continue
+                target_gids.add(cur)
+                stack.extend(children_map.get(cur, []))
+            for c in cams:
+                if str(c.get("group_id") or "") in target_gids:
+                    c["enabled"] = bool(enabled)
+        self._rebuild_nav_tree(select_id=self._current_node_id or "cameras_root", preserve_scroll=True)
+
+    def _on_nav_right_click(self, event):
+        iid = self.nav_tree.identify_row(event.y)
+        if not iid:
+            return
+        iid = str(iid)
+        if not (iid == "cameras_root" or iid.startswith("grp:") or iid.startswith("cam:")):
+            return
+        try:
+            self.nav_tree.selection_set(iid)
+        except Exception:
+            pass
+
+        menu = tk.Menu(self.win, tearoff=0, bg="#252836", fg="#ffffff", activebackground="#007acc", activeforeground="#ffffff")
+        if iid == "cameras_root":
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_start_all", "▶ Start all"),
+                command=lambda: self._set_cameras_enabled_in_group("", True),
+            )
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_stop_all", "⏹ Stop all"),
+                command=lambda: self._set_cameras_enabled_in_group("", False),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_new_group", "📁 New branch"),
+                command=lambda: self._create_camera_group(""),
+            )
+            if cam is not None:
+                menu.add_separator()
+                menu.add_command(
+                    label=tr("ui.settings.cams.btn_del_cam", "🗑 Delete camera"),
+                    command=lambda u=uid: self._delete_camera(u),
+                )
+        elif iid.startswith("grp:"):
+            gid = iid.split("grp:", 1)[1]
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_start_branch", "▶ Start all in branch"),
+                command=lambda g=gid: self._set_cameras_enabled_in_group(g, True),
+            )
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_stop_branch", "⏹ Stop all in branch"),
+                command=lambda g=gid: self._set_cameras_enabled_in_group(g, False),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_new_sub_group", "📁 New sub-branch"),
+                command=lambda g=gid: self._create_camera_group(g),
+            )
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_ren_group", "✏ Rename branch"),
+                command=lambda g=gid: self._rename_camera_group(g),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_del_group", "🗑 Delete branch"),
+                command=lambda g=gid: self._delete_camera_group(g),
+            )
+        elif iid.startswith("cam:"):
+            uid = iid.split("cam:", 1)[1]
+            cam = next((c for c in (self.draft.get("cameras") or []) if c.get("uuid") == uid), None)
+            if cam is not None:
+                is_on = bool(cam.get("enabled", True))
+                menu.add_command(
+                    label=tr("ui.settings.cams.btn_stop", "⏹ Stop") if is_on else tr("ui.settings.cams.btn_start", "▶ Start"),
+                    command=lambda c=cam: (c.__setitem__("enabled", not bool(c.get("enabled", True))), self._rebuild_nav_tree(select_id=f"cam:{c['uuid']}", preserve_scroll=True)),
+                )
+                menu.add_command(
+                    label=tr("ui.settings.cams.btn_rename_cam", "✏ Rename camera"),
+                    command=lambda u=uid: self._rename_camera(u),
+                )
+            if cam is not None and str(cam.get("group_id") or ""):
+                menu.add_command(
+                    label=tr("ui.settings.cams.btn_move_root", "⬆ Move to root list"),
+                    command=lambda c=cam: (c.__setitem__("group_id", ""), self._rebuild_nav_tree(select_id=f"cam:{c['uuid']}", preserve_scroll=True)),
+                )
+            menu.add_command(
+                label=tr("ui.settings.cams.btn_new_group", "📁 New branch"),
+                command=lambda: self._create_camera_group(""),
+            )
+            if cam is not None:
+                menu.add_separator()
+                menu.add_command(
+                    label=tr("ui.settings.cams.btn_del_cam", "🗑 Delete camera"),
+                    command=lambda u=uid: self._delete_camera(u),
+                )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_nav_drag_start(self, event):
+        iid = self.nav_tree.identify_row(event.y)
+        if iid and (str(iid).startswith("cam:") or str(iid).startswith("grp:")):
+            self._nav_drag = {"iid": str(iid), "active": False, "x": event.x, "y": event.y}
+        else:
+            self._nav_drag = {"iid": None, "active": False, "x": 0, "y": 0}
+
+    def _on_nav_drag_motion(self, event):
+        drag_iid = self._nav_drag.get("iid")
+        if not drag_iid:
+            return
+        if not self._nav_drag["active"]:
+            if abs(event.x - self._nav_drag["x"]) > 5 or abs(event.y - self._nav_drag["y"]) > 5:
+                self._nav_drag["active"] = True
+                try:
+                    self.nav_tree.configure(cursor="fleur")
+                except Exception:
+                    pass
+        if self._nav_drag["active"]:
+            target = self.nav_tree.identify_row(event.y)
+            if target:
+                try:
+                    self.nav_tree.see(target)
+                except Exception:
+                    pass
+
+    def _sync_cameras_order_from_tree(self):
+        """Оновлює порядок self.draft['cameras'] у точному порядку обходу дерева (DFS) зверху вниз."""
+        groups = [g for g in (self.draft.get("camera_groups") or []) if isinstance(g, dict) and g.get("id")]
+        grp_ids_set = {str(g["id"]) for g in groups}
+        cams_list = list(self.draft.get("cameras") or [])
+        ordered_cams = []
+        seen_uids = set()
+
+        def _walk(parent_gid: str, visited_g: set):
+            items = []
+            for g_idx, g in enumerate(groups):
+                p_id = str(g.get("parent_id") or "")
+                if p_id not in grp_ids_set:
+                    p_id = ""
+                if p_id == parent_gid:
+                    items.append((int(g.get("tree_order", g_idx) or 0), 0, g_idx, "grp", g))
+            for c_idx, cam in enumerate(cams_list):
+                c_gid = str(cam.get("group_id") or "")
+                if c_gid not in grp_ids_set:
+                    c_gid = ""
+                if c_gid == parent_gid:
+                    items.append((int(cam.get("tree_order", c_idx) or 0), 1, c_idx, "cam", cam))
+            items.sort(key=lambda x: (x[0], x[1], x[2]))
+            for _ord, _kord, _idx, kind, obj in items:
+                if kind == "grp":
+                    gid = str(obj["id"])
+                    if gid in visited_g:
+                        continue
+                    visited_g.add(gid)
+                    _walk(gid, visited_g)
+                else:
+                    uid = obj.get("uuid")
+                    if uid not in seen_uids:
+                        seen_uids.add(uid)
+                        ordered_cams.append(obj)
+
+        _walk("", set())
+        for c in cams_list:
+            if c.get("uuid") not in seen_uids:
+                ordered_cams.append(c)
+        self.draft["cameras"] = ordered_cams
+
+    def _reorder_tree_children(self, parent_gid: str, drag_kind: str, drag_obj: dict, before_obj=None):
+        groups = [g for g in (self.draft.get("camera_groups") or []) if isinstance(g, dict) and g.get("id")]
+        grp_ids_set = {str(g["id"]) for g in groups}
+        cams_list = self.draft.get("cameras") or []
+
+        if drag_kind == "cam":
+            drag_obj["group_id"] = parent_gid
+        else:
+            drag_obj["parent_id"] = parent_gid
+
+        siblings = []
+        for g_idx, g in enumerate(groups):
+            if g is drag_obj:
+                continue
+            p_id = str(g.get("parent_id") or "")
+            if p_id not in grp_ids_set:
+                p_id = ""
+            if p_id == parent_gid:
+                siblings.append((int(g.get("tree_order", g_idx) or 0), 0, g_idx, g))
+        for c_idx, cam in enumerate(cams_list):
+            if cam is drag_obj:
+                continue
+            c_gid = str(cam.get("group_id") or "")
+            if c_gid not in grp_ids_set:
+                c_gid = ""
+            if c_gid == parent_gid:
+                siblings.append((int(cam.get("tree_order", c_idx) or 0), 1, c_idx, cam))
+        siblings.sort(key=lambda x: (x[0], x[1], x[2]))
+
+        ordered_objs = [x[3] for x in siblings]
+        if before_obj is not None and before_obj in ordered_objs:
+            idx = ordered_objs.index(before_obj)
+            ordered_objs.insert(idx, drag_obj)
+        else:
+            ordered_objs.append(drag_obj)
+
+        for idx, obj in enumerate(ordered_objs):
+            obj["tree_order"] = idx
+
+        self._sync_cameras_order_from_tree()
+
+    def _on_nav_drag_end(self, event):
+        drag_iid = self._nav_drag.get("iid")
+        was_active = bool(self._nav_drag.get("active"))
+        self._nav_drag = {"iid": None, "active": False, "x": 0, "y": 0}
+        try:
+            self.nav_tree.configure(cursor="")
+        except Exception:
+            pass
+        if not drag_iid or not was_active:
+            return
+
+        target_iid = self.nav_tree.identify_row(event.y)
+        if not target_iid or target_iid == drag_iid:
+            return
+        target_iid = str(target_iid)
+
+        cams = self.draft.get("cameras") or []
+        groups = self.draft.get("camera_groups") or []
+
+        if drag_iid.startswith("cam:"):
+            src_uid = drag_iid.split("cam:", 1)[1]
+            src_cam = next((c for c in cams if c.get("uuid") == src_uid), None)
+            if src_cam is None:
+                return
+            if target_iid == "cameras_root":
+                self._reorder_tree_children("", "cam", src_cam, before_obj=None)
+            elif target_iid.startswith("grp:"):
+                tgt_gid = target_iid.split("grp:", 1)[1]
+                self._reorder_tree_children(tgt_gid, "cam", src_cam, before_obj=None)
+            elif target_iid.startswith("cam:"):
+                tgt_uid = target_iid.split("cam:", 1)[1]
+                tgt_cam = next((c for c in cams if c.get("uuid") == tgt_uid), None)
+                if tgt_cam is not None:
+                    self._reorder_tree_children(str(tgt_cam.get("group_id") or ""), "cam", src_cam, before_obj=tgt_cam)
+            else:
+                return
+            self._rebuild_nav_tree(select_id=drag_iid, preserve_scroll=True)
+
+        elif drag_iid.startswith("grp:"):
+            src_gid = drag_iid.split("grp:", 1)[1]
+            src_grp = next((g for g in groups if isinstance(g, dict) and str(g.get("id")) == src_gid), None)
+            if src_grp is None:
+                return
+            if target_iid == "cameras_root":
+                self._reorder_tree_children("", "grp", src_grp, before_obj=None)
+            elif target_iid.startswith("grp:"):
+                tgt_gid = target_iid.split("grp:", 1)[1]
+                grp_map = {str(g.get("id")): str(g.get("parent_id") or "") for g in groups if isinstance(g, dict) and g.get("id")}
+                cur = tgt_gid
+                is_cycle = False
+                while cur:
+                    if cur == src_gid:
+                        is_cycle = True
+                        break
+                    cur = grp_map.get(cur, "")
+                if is_cycle:
+                    return
+                self._reorder_tree_children(tgt_gid, "grp", src_grp, before_obj=None)
+            elif target_iid.startswith("cam:"):
+                tgt_uid = target_iid.split("cam:", 1)[1]
+                tgt_cam = next((c for c in cams if c.get("uuid") == tgt_uid), None)
+                if tgt_cam is not None:
+                    tgt_parent_gid = str(tgt_cam.get("group_id") or "")
+                    grp_map = {str(g.get("id")): str(g.get("parent_id") or "") for g in groups if isinstance(g, dict) and g.get("id")}
+                    cur = tgt_parent_gid
+                    is_cycle = False
+                    while cur:
+                        if cur == src_gid:
+                            is_cycle = True
+                            break
+                        cur = grp_map.get(cur, "")
+                    if is_cycle:
+                        return
+                    self._reorder_tree_children(tgt_parent_gid, "grp", src_grp, before_obj=tgt_cam)
+            else:
+                return
+            self._rebuild_nav_tree(select_id=drag_iid, preserve_scroll=True)
 
     def _commit_current_page(self):
         for fn in list(self._page_committers):
@@ -511,7 +1148,9 @@ class SettingsWindow:
             elif node_id == "modules":
                 self._build_page_modules(pad)
             elif node_id == "cameras_root":
-                self._build_page_cameras_root(pad)
+                self._build_page_cameras_root(pad, filter_group_id=None)
+            elif node_id.startswith("grp:"):
+                self._build_page_cameras_root(pad, filter_group_id=node_id.split("grp:", 1)[1])
             elif node_id.startswith("cam:"):
                 uid = node_id.split("cam:", 1)[1]
                 self._build_page_single_camera(pad, uid)
@@ -784,7 +1423,7 @@ class SettingsWindow:
             tr("ui.settings.general.title", "⚙ General Settings"),
             tr(
                 "ui.settings.general.subtitle",
-                "Interface language, operation mode, root archive folder, Windows autostart, kiosk mode, and window layout.",
+                "Interface language, access password & link encryption, operation mode, root archive folder, Windows autostart, kiosk mode, and window layout.",
             ),
         )
         gen = self.draft.setdefault("general", {})
@@ -882,6 +1521,137 @@ class SettingsWindow:
             return cb
 
         self._add_row(card, tr("ui.settings.general.lang_label", "Application language:"), "general.language", _w_lang)
+
+        def _w_password(box, bg):
+            pwd_wrap = tk.Frame(box, bg=bg)
+            pwd_wrap.pack(fill=tk.X, expand=True)
+
+            pwd_status_lbl = tk.Label(
+                pwd_wrap,
+                text="",
+                fg="#9ee8ff",
+                bg=bg,
+                font=("Segoe UI", 9, "bold"),
+                justify=tk.LEFT,
+                wraplength=420,
+                anchor=tk.W,
+            )
+            pwd_status_lbl.pack(fill=tk.X, anchor=tk.W)
+            self._bind_auto_wrap(pwd_status_lbl, initial=420, min_wrap=200)
+
+            pwd_btn_row = tk.Frame(pwd_wrap, bg=bg)
+            pwd_btn_row.pack(fill=tk.X, pady=(6, 0))
+
+            def _refresh_pwd_ui():
+                if not pwd_wrap.winfo_exists():
+                    return
+                for ch in list(pwd_btn_row.winfo_children()):
+                    try:
+                        ch.destroy()
+                    except Exception:
+                        pass
+
+                has_pwd = bool(self.cfg_mgr.has_password())
+                if has_pwd:
+                    pwd_status_lbl.configure(
+                        text=tr(
+                            "ui.settings.general.pwd_status_on",
+                            "🔒 Password enabled — requested at startup, video links are encrypted",
+                        ),
+                        fg="#75e08b",
+                    )
+                    tk.Button(
+                        pwd_btn_row,
+                        text=tr("ui.settings.general.pwd_btn_change", "🔑 Change password..."),
+                        command=lambda: self._open_password_dialog("change", on_done=_on_pwd_updated),
+                        bg="#007acc",
+                        fg="#ffffff",
+                        activebackground="#0066ad",
+                        activeforeground="#ffffff",
+                        relief=tk.FLAT,
+                        font=("Segoe UI", 8, "bold"),
+                        padx=10,
+                        pady=4,
+                        cursor="hand2",
+                    ).pack(side=tk.LEFT, padx=(0, 6))
+                    tk.Button(
+                        pwd_btn_row,
+                        text=tr("ui.settings.general.pwd_btn_remove", "🔓 Remove password..."),
+                        command=lambda: self._open_password_dialog("remove", on_done=_on_pwd_updated),
+                        bg="#44252a",
+                        fg="#ff8888",
+                        activebackground="#5a3037",
+                        activeforeground="#ffffff",
+                        relief=tk.FLAT,
+                        font=("Segoe UI", 8, "bold"),
+                        padx=10,
+                        pady=4,
+                        cursor="hand2",
+                    ).pack(side=tk.LEFT)
+                else:
+                    pwd_status_lbl.configure(
+                        text=tr(
+                            "ui.settings.general.pwd_status_off",
+                            "🔓 Password not set — immediate login, video links are unencrypted",
+                        ),
+                        fg="#9ee8ff",
+                    )
+                    tk.Button(
+                        pwd_btn_row,
+                        text=tr("ui.settings.general.pwd_btn_set", "🔑 Set password..."),
+                        command=lambda: self._open_password_dialog("set", on_done=_on_pwd_updated),
+                        bg="#233b56",
+                        fg="#00e5ff",
+                        activebackground="#2c4a6b",
+                        activeforeground="#ffffff",
+                        relief=tk.FLAT,
+                        font=("Segoe UI", 8, "bold"),
+                        padx=10,
+                        pady=4,
+                        cursor="hand2",
+                    ).pack(side=tk.LEFT)
+
+            def _on_pwd_updated(mode_done: str):
+                try:
+                    snap_auth = (self.cfg_mgr.get_snapshot().get("general") or {}).get("auth") or {"enabled": False}
+                    self.draft.setdefault("general", {})["auth"] = copy.deepcopy(snap_auth)
+                except Exception:
+                    pass
+                if self.camera_manager is not None:
+                    try:
+                        self.camera_manager.refresh_camera_meta()
+                    except Exception:
+                        pass
+                _refresh_pwd_ui()
+                if mode_done == "set":
+                    self._set_footer_status(
+                        tr(
+                            "ui.settings.general.pwd_footer_set",
+                            "✔ Access password set and video source links encrypted!",
+                        ),
+                        fg="#75e08b",
+                    )
+                elif mode_done == "change":
+                    self._set_footer_status(
+                        tr(
+                            "ui.settings.general.pwd_footer_changed",
+                            "✔ Password changed and video source links re-encrypted!",
+                        ),
+                        fg="#75e08b",
+                    )
+                elif mode_done == "remove":
+                    self._set_footer_status(
+                        tr(
+                            "ui.settings.general.pwd_footer_removed",
+                            "✔ Password removed and video source links decrypted.",
+                        ),
+                        fg="#ffcc00",
+                    )
+
+            _refresh_pwd_ui()
+            return pwd_wrap
+
+        self._add_row(card, tr("ui.settings.general.pwd_label", "Access password:"), "general.password", _w_password)
 
         def _w_mode(box, bg):
             rb_srv = tk.Radiobutton(
@@ -4898,10 +5668,29 @@ class SettingsWindow:
                     merged[mid] = copy.deepcopy(sec)
         return merged
 
-    def _build_page_cameras_root(self, parent):
+    def _build_page_cameras_root(self, parent, filter_group_id: str = None):
+        target_gids = set()
+        title_txt = tr("ui.settings.cams.title", "📹 Camera Management")
+        if filter_group_id:
+            groups = self.draft.get("camera_groups") or []
+            grp_obj = next((g for g in groups if isinstance(g, dict) and str(g.get("id")) == str(filter_group_id)), None)
+            if grp_obj and grp_obj.get("name"):
+                title_txt = f"📁 {grp_obj['name']}"
+            children_map = {}
+            for g in groups:
+                if isinstance(g, dict) and g.get("id"):
+                    children_map.setdefault(str(g.get("parent_id") or ""), []).append(str(g["id"]))
+            stack = [str(filter_group_id)]
+            while stack:
+                cur = stack.pop()
+                if cur in target_gids:
+                    continue
+                target_gids.add(cur)
+                stack.extend(children_map.get(cur, []))
+
         self._section_header(
             parent,
-            tr("ui.settings.cams.title", "📹 Camera Management"),
+            title_txt,
             tr(
                 "ui.settings.cams.subtitle",
                 "Add any number of cameras. Each gets a unique UUID, its own archive folder, and an independent module set.",
@@ -4922,14 +5711,40 @@ class SettingsWindow:
                 enabled=True,
                 modules=tpl,
                 registry=self.registry,
+                group_id=filter_group_id or "",
             )
+            new_cam["tree_order"] = self._next_tree_order(filter_group_id or "")
             cams.append(new_cam)
+            self._sync_cameras_order_from_tree()
             self._rebuild_nav_tree(select_id=f"cam:{new_cam['uuid']}")
 
         tk.Button(
             bar, text=tr("ui.settings.cams.btn_add", "➕ Add New Camera (auto UUID)"), command=_add_cam,
             bg="#28a745", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2"
-        ).pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            bar, text=tr("ui.settings.cams.btn_new_group", "📁 New branch"), command=lambda: self._create_camera_group(filter_group_id or ""),
+            bg="#2f3346", fg="#00e5ff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            bar, text=tr("ui.settings.cams.btn_start_all", "▶ Start all"), command=lambda: self._set_cameras_enabled_in_group(filter_group_id or "", True),
+            bg="#1f4d36", fg="#75e08b", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(
+            bar, text=tr("ui.settings.cams.btn_stop_all", "⏹ Stop all"), command=lambda: self._set_cameras_enabled_in_group(filter_group_id or "", False),
+            bg="#64262b", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        if filter_group_id:
+            tk.Button(
+                bar, text=tr("ui.settings.cams.btn_ren_group", "✏ Rename branch"),
+                command=lambda gid=filter_group_id: self._rename_camera_group(gid),
+                bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2"
+            ).pack(side=tk.LEFT)
+        tk.Label(
+            bar,
+            text=tr("ui.settings.cams.tree_hint", "Drag cameras/branches in the left tree; right-click a camera or branch for actions."),
+            fg="#8b94a8", bg="#1c1e2a", font=("Segoe UI", 8),
+        ).pack(side=tk.RIGHT, padx=(10, 0))
 
         reg_entries = self.registry.list_modules() if self.registry is not None else []
         rec_entries = self.registry.list_modules(kind="recorder") if self.registry is not None else []
@@ -4937,6 +5752,8 @@ class SettingsWindow:
         cams = self.draft.get("cameras") or []
         cam_def_single = tr("camera.default_single", "Camera")
         for idx, cam in enumerate(cams):
+            if filter_group_id and str(cam.get("group_id") or "") not in target_gids:
+                continue
             uid = cam["uuid"]
             mods = cam.get("modules") or {}
 
@@ -4993,6 +5810,23 @@ class SettingsWindow:
             actions = tk.Frame(card, bg="#1c1e2a")
             actions.pack(fill=tk.X)
 
+            is_cam_on = bool(cam.get("enabled", True))
+            def _toggle_cam_stream(c_ref=cam):
+                c_ref["enabled"] = not bool(c_ref.get("enabled", True))
+                self._rebuild_nav_tree(select_id=self._current_node_id or "cameras_root", preserve_scroll=True)
+
+            tk.Button(
+                actions,
+                text=tr("ui.settings.cams.btn_stop", "⏹ Stop") if is_cam_on else tr("ui.settings.cams.btn_start", "▶ Start"),
+                command=_toggle_cam_stream,
+                bg="#64262b" if is_cam_on else "#1f4d36",
+                fg="#ffffff" if is_cam_on else "#75e08b",
+                relief=tk.FLAT,
+                font=("Segoe UI", 8, "bold"),
+                padx=10,
+                pady=4,
+                cursor="hand2",
+            ).pack(side=tk.LEFT, padx=(0, 6))
             tk.Button(
                 actions, text=tr("ui.settings.cams.btn_configure", "⚙ Configure"),
                 command=lambda u=uid: self._select_nav_node(f"cam:{u}"),
@@ -5009,16 +5843,12 @@ class SettingsWindow:
                     enabled=c_src.get("enabled", True),
                     modules=dup_mods,
                     registry=self.registry,
+                    group_id=c_src.get("group_id", ""),
                 )
+                dup_cam["tree_order"] = self._next_tree_order(c_src.get("group_id", ""))
                 self.draft.setdefault("cameras", []).append(dup_cam)
-                self._rebuild_nav_tree(select_id="cameras_root")
-
-            def _move(pos, delta):
-                clist = self.draft.get("cameras") or []
-                new_pos = pos + delta
-                if 0 <= new_pos < len(clist):
-                    clist[pos], clist[new_pos] = clist[new_pos], clist[pos]
-                    self._rebuild_nav_tree(select_id="cameras_root")
+                self._sync_cameras_order_from_tree()
+                self._rebuild_nav_tree(select_id=self._current_node_id or "cameras_root", preserve_scroll=True)
 
             def _delete(cname, u_del):
                 clist = self.draft.get("cameras") or []
@@ -5039,12 +5869,17 @@ class SettingsWindow:
                     parent=self.win,
                 ):
                     self.draft["cameras"] = [c for c in clist if c.get("uuid") != u_del]
-                    self._rebuild_nav_tree(select_id="cameras_root")
+                    self._sync_cameras_order_from_tree()
+                    self._rebuild_nav_tree(select_id=self._current_node_id or "cameras_root", preserve_scroll=True)
 
-            tk.Button(actions, text=tr("ui.settings.cams.btn_dup", "📋 Duplicate"), command=_dup, bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
-            tk.Button(actions, text="⬆", command=lambda i=idx: _move(i, -1), state=tk.NORMAL if idx > 0 else tk.DISABLED, bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), width=3, cursor="hand2").pack(side=tk.LEFT, padx=(0, 2))
-            tk.Button(actions, text="⬇", command=lambda i=idx: _move(i, 1), state=tk.NORMAL if idx < len(cams) - 1 else tk.DISABLED, bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), width=3, cursor="hand2").pack(side=tk.LEFT, padx=(0, 6))
+            tk.Button(actions, text=tr("ui.settings.cams.btn_dup", "📋 Duplicate"), command=_dup, bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(
+                actions,
+                text=tr("ui.settings.cams.drag_order_hint", "To reorder cameras, drag with the mouse in the list"),
+                fg="#767c90", bg="#1c1e2a", font=("Segoe UI", 8),
+            ).pack(side=tk.LEFT, padx=(0, 8))
             tk.Button(actions, text=tr("ui.settings.cams.btn_del", "🗑 Delete"), command=lambda cn=cam.get("name", ""), u=uid: _delete(cn, u), bg="#44252a", fg="#ff7777", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor="hand2").pack(side=tk.RIGHT)
+            tk.Button(actions, text=tr("ui.settings.cams.btn_rename", "✏ Rename"), command=lambda u=uid: self._rename_camera(u), bg="#2f3346", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=8, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=(0, 6))
 
     def _select_nav_node(self, node_id: str):
         if self.nav_tree.exists(node_id):
@@ -5311,6 +6146,109 @@ class SettingsWindow:
                 ),
             )
 
+        def _apply_to_all_cameras():
+            self._commit_current_page()
+            others = [c for c in (self.draft.get("cameras") or []) if c.get("uuid") != cam_uuid]
+            if not others:
+                messagebox.showinfo(
+                    tr("ui.settings.cam.btn_apply_all_cams", "Apply to all cameras"),
+                    tr("ui.settings.cam.copy_no_others", "No other cameras available to copy to."),
+                    parent=self.win,
+                )
+                return
+
+            cam_gid = str(cam.get("group_id") or "")
+            branch_others = []
+            if cam_gid:
+                groups = self.draft.get("camera_groups") or []
+                children_map = {}
+                for g in groups:
+                    if isinstance(g, dict) and g.get("id"):
+                        children_map.setdefault(str(g.get("parent_id") or ""), []).append(str(g["id"]))
+                target_gids = set()
+                stack = [cam_gid]
+                while stack:
+                    cur = stack.pop()
+                    if cur in target_gids:
+                        continue
+                    target_gids.add(cur)
+                    stack.extend(children_map.get(cur, []))
+                branch_others = [c for c in others if str(c.get("group_id") or "") in target_gids]
+
+            targets = others
+            if branch_others:
+                choice = {"val": None}
+                dlg = tk.Toplevel(self.win)
+                dlg.title(tr("ui.settings.cam.btn_apply_all_cams", "Apply to all cameras"))
+                dlg.configure(bg="#181818")
+                dlg.resizable(False, False)
+                dlg.transient(self.win)
+                dlg.grab_set()
+                try:
+                    px, py = self.win.winfo_pointerxy()
+                    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+                    x = max(8, min(sw - 420, px - 120))
+                    y = max(8, min(sh - 150, py + 12))
+                    dlg.geometry(f"+{x}+{y}")
+                except Exception:
+                    pass
+                frm = tk.Frame(dlg, bg="#181818", padx=18, pady=16)
+                frm.pack(fill=tk.BOTH, expand=True)
+                tk.Label(
+                    frm,
+                    text=tr(
+                        "ui.settings.cam.apply_scope_prompt",
+                        "Apply current camera settings to:",
+                    ),
+                    bg="#181818", fg="#f3f3f3", font=("Segoe UI", 10, "bold"), anchor="w",
+                ).pack(fill=tk.X, pady=(0, 12))
+
+                btns = tk.Frame(frm, bg="#181818")
+                btns.pack(fill=tk.X)
+
+                def _pick(val):
+                    choice["val"] = val
+                    dlg.destroy()
+
+                tk.Button(
+                    btns,
+                    text=tr("ui.settings.cam.apply_scope_branch", "All in current branch ({n})", n=len(branch_others)),
+                    command=lambda: _pick("branch"),
+                    bg="#1f4d36", fg="#75e08b", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2",
+                ).pack(side=tk.LEFT, padx=(0, 8))
+                tk.Button(
+                    btns,
+                    text=tr("ui.settings.cam.apply_scope_all", "All cameras ({n})", n=len(others)),
+                    command=lambda: _pick("all"),
+                    bg="#007acc", fg="#ffffff", relief=tk.FLAT, font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2",
+                ).pack(side=tk.LEFT, padx=(0, 8))
+                tk.Button(
+                    btns,
+                    text=tr("ui.common.cancel", "Cancel"),
+                    command=lambda: _pick(None),
+                    bg="#2d2d2d", fg="#e5e5e5", relief=tk.FLAT, font=("Segoe UI", 9), padx=12, pady=6, cursor="hand2",
+                ).pack(side=tk.LEFT)
+
+                dlg.bind("<Escape>", lambda _e: _pick(None))
+                dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
+                self.win.wait_window(dlg)
+                if choice["val"] is None:
+                    return
+                if choice["val"] == "branch":
+                    targets = branch_others
+
+            src_mods = copy.deepcopy(cam.get("modules") or mods)
+            for tc in targets:
+                tc["modules"] = copy.deepcopy(src_mods)
+            self._set_footer_status(
+                tr(
+                    "ui.settings.cam.apply_all_done",
+                    "Current camera settings applied to {n} camera(s) (click 'Apply').",
+                    n=len(targets),
+                ),
+                fg="#75e08b",
+            )
+
         def _save_as_template():
             self._commit_current_page()
             self.draft["default_camera_modules"] = copy.deepcopy(mods)
@@ -5319,6 +6257,11 @@ class SettingsWindow:
                 fg="#75e08b",
             )
 
+        tk.Button(
+            tools_row, text=tr("ui.settings.cam.btn_apply_all_cams", "✨ Apply to all cameras"),
+            command=_apply_to_all_cameras, bg="#1f4d36", fg="#75e08b",
+            relief=tk.FLAT, font=("Segoe UI", 8, "bold"), padx=10, pady=4, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(
             tools_row, text=tr("ui.settings.cam.btn_copy_mods", "📋 Copy module settings to other cameras..."),
             command=_copy_modules_to_others, bg="#2f3346", fg="#00e5ff",
@@ -5525,7 +6468,9 @@ class SettingsWindow:
                 def _fn_num(box, bg_c, v=var, fr=min_v, to_=max_v, inc=step_v):
                     sp = tk.Spinbox(
                         box, from_=fr, to=to_, increment=inc, textvariable=v, width=12,
-                        bg="#252836", fg="#ffffff", buttonbackground="#2f3346", relief=tk.FLAT,
+                        bg="#252836", fg="#ffffff",
+                        disabledbackground="#1a1c26", disabledforeground="#7d8499",
+                        buttonbackground="#2f3346", relief=tk.FLAT,
                         font=("Segoe UI", 9), command=_sync_dynamic_states,
                     )
                     sp.pack(side=tk.LEFT)
@@ -5581,10 +6526,10 @@ class SettingsWindow:
 
                 def _fn_dates(box, bg_c, var1=v1, var2=v2):
                     tk.Label(box, text=tr("ui.settings.mod_card.date_from", "From:"), fg="#9ba3b8", bg=bg_c, font=("Segoe UI", 8)).pack(side=tk.LEFT)
-                    e1 = tk.Entry(box, textvariable=var1, width=12, bg="#252836", fg="#ffffff", insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
+                    e1 = tk.Entry(box, textvariable=var1, width=12, bg="#252836", fg="#ffffff", disabledbackground="#1a1c26", disabledforeground="#7d8499", insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
                     e1.pack(side=tk.LEFT, ipady=3, padx=(4, 10))
                     tk.Label(box, text=tr("ui.settings.mod_card.date_to", "To:"), fg="#9ba3b8", bg=bg_c, font=("Segoe UI", 8)).pack(side=tk.LEFT)
-                    e2 = tk.Entry(box, textvariable=var2, width=12, bg="#252836", fg="#ffffff", insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
+                    e2 = tk.Entry(box, textvariable=var2, width=12, bg="#252836", fg="#ffffff", disabledbackground="#1a1c26", disabledforeground="#7d8499", insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
                     e2.pack(side=tk.LEFT, ipady=3, padx=(4, 8))
                     tk.Label(box, text=tr("ui.settings.mod_card.date_hint", "(YYYY-MM-DD or empty)"), fg="#767c90", bg=bg_c, font=("Segoe UI", 8)).pack(side=tk.LEFT)
                     created_widgets.extend([e1, e2])
@@ -5598,7 +6543,7 @@ class SettingsWindow:
                 var.trace_add("write", lambda *_: _commit())
 
                 def _fn_str(box, bg_c, v=var):
-                    e = tk.Entry(box, textvariable=v, bg="#252836", fg="#ffffff", insertbackground="white", relief=tk.FLAT, font=("Segoe UI", 9))
+                    e = tk.Entry(box, textvariable=v, bg="#252836", fg="#ffffff", disabledbackground="#1a1c26", disabledforeground="#7d8499", insertbackground="white", relief=tk.FLAT, font=("Segoe UI", 9))
                     e.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
                     created_widgets.append(e)
                     return e
@@ -5653,6 +6598,284 @@ class SettingsWindow:
     # ------------------------------------------------------------------
     # Збереження і застосування
     # ------------------------------------------------------------------
+    def _open_password_dialog(self, mode: str, on_done=None):
+        if mode not in ("set", "change", "remove"):
+            return
+
+        dlg = tk.Toplevel(self.win)
+        try:
+            dlg.withdraw()
+        except Exception:
+            pass
+        dlg.configure(bg="#141620")
+        dlg.resizable(False, False)
+        dlg.transient(self.win)
+
+        if mode == "set":
+            dlg.title(tr("ui.settings.general.pwd_dlg_title_set", "🔑 Set Access Password"))
+            desc_txt = tr(
+                "ui.settings.general.pwd_desc_set",
+                "When set, the password is requested on launch and all camera video source links in config.json are encrypted.",
+            )
+            submit_txt = tr("ui.settings.general.pwd_btn_save_set", "🔒 Set Password")
+            submit_bg = "#007acc"
+        elif mode == "change":
+            dlg.title(tr("ui.settings.general.pwd_dlg_title_change", "🔑 Change Access Password"))
+            desc_txt = tr(
+                "ui.settings.general.pwd_desc_change",
+                "Enter the current password and a new password. All saved video source links will be re-encrypted immediately.",
+            )
+            submit_txt = tr("ui.settings.general.pwd_btn_save_change", "🔑 Change Password")
+            submit_bg = "#007acc"
+        else:
+            dlg.title(tr("ui.settings.general.pwd_dlg_title_remove", "🔓 Remove Access Password"))
+            desc_txt = tr(
+                "ui.settings.general.pwd_desc_remove",
+                "Enter the current password to remove login protection and store video source links unencrypted in config.json.",
+            )
+            submit_txt = tr("ui.settings.general.pwd_btn_save_remove", "🔓 Remove Password")
+            submit_bg = "#7a2c32"
+
+        card = tk.Frame(
+            dlg,
+            bg="#1c1f2b",
+            padx=20,
+            pady=16,
+            highlightthickness=1,
+            highlightbackground="#2b3042",
+        )
+        card.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        tk.Label(
+            card,
+            text=desc_txt,
+            fg="#c8d0e4",
+            bg="#1c1f2b",
+            font=("Segoe UI", 9),
+            justify=tk.LEFT,
+            wraplength=390,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 12))
+
+        entries = []
+        cur_var = tk.StringVar(value="")
+        new_var = tk.StringVar(value="")
+        conf_var = tk.StringVar(value="")
+        cur_entry = None
+        new_entry = None
+
+        def _add_pwd_field(label_txt: str, var: tk.StringVar):
+            tk.Label(
+                card,
+                text=label_txt,
+                fg="#d8deef",
+                bg="#1c1f2b",
+                font=("Segoe UI", 9, "bold"),
+                anchor=tk.W,
+            ).pack(fill=tk.X, pady=(0, 3))
+            ent = tk.Entry(
+                card,
+                textvariable=var,
+                show="•",
+                bg="#252836",
+                fg="#ffffff",
+                insertbackground="#ffffff",
+                relief=tk.FLAT,
+                font=("Segoe UI", 10),
+                width=36,
+            )
+            ent.pack(fill=tk.X, ipady=5, pady=(0, 9))
+            entries.append(ent)
+            return ent
+
+        if mode in ("change", "remove"):
+            cur_entry = _add_pwd_field(tr("ui.auth.pwd_current_label", "Current password:"), cur_var)
+        if mode in ("set", "change"):
+            new_entry = _add_pwd_field(tr("ui.auth.pwd_new_label", "New password:"), new_var)
+            _add_pwd_field(tr("ui.auth.pwd_confirm_label", "Confirm password:"), conf_var)
+
+        show_var = tk.BooleanVar(value=False)
+
+        def _toggle_show():
+            ch = "" if show_var.get() else "•"
+            for ent in entries:
+                try:
+                    ent.configure(show=ch)
+                except Exception:
+                    pass
+
+        tk.Checkbutton(
+            card,
+            text=tr("ui.auth.show_pwd", "Show passwords"),
+            variable=show_var,
+            command=_toggle_show,
+            bg="#1c1f2b",
+            fg="#c8d0e4",
+            selectcolor="#252836",
+            activebackground="#1c1f2b",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 8),
+            anchor=tk.W,
+            cursor="hand2",
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        err_var = tk.StringVar(value="")
+        tk.Label(
+            card,
+            textvariable=err_var,
+            fg="#ff6b6b",
+            bg="#1c1f2b",
+            font=("Segoe UI", 9, "bold"),
+            justify=tk.LEFT,
+            wraplength=390,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 8))
+
+        btn_row = tk.Frame(card, bg="#1c1f2b")
+        btn_row.pack(fill=tk.X)
+
+        state = {"busy": False}
+
+        def _close():
+            if state["busy"]:
+                return
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def _submit(event=None):
+            if state["busy"]:
+                return "break"
+            cur_pw = cur_var.get()
+            new_pw = new_var.get()
+            conf_pw = conf_var.get()
+
+            if mode in ("change", "remove") and not cur_pw:
+                err_var.set(tr("ui.auth.err_empty", "Please enter the password."))
+                if cur_entry is not None:
+                    cur_entry.focus_set()
+                return "break"
+
+            if mode in ("set", "change"):
+                if not new_pw:
+                    err_var.set(tr("ui.auth.err_empty", "Please enter the password."))
+                    if new_entry is not None:
+                        new_entry.focus_set()
+                    return "break"
+                if new_pw != conf_pw:
+                    err_var.set(tr("ui.auth.err_mismatch", "Passwords do not match."))
+                    if new_entry is not None:
+                        new_entry.selection_range(0, tk.END)
+                        new_entry.focus_set()
+                    return "break"
+
+            state["busy"] = True
+            btn_ok.configure(state=tk.DISABLED)
+            err_var.set("")
+            try:
+                dlg.update_idletasks()
+            except Exception:
+                pass
+
+            try:
+                if mode == "set":
+                    self.cfg_mgr.set_password(new_pw)
+                    ok = True
+                elif mode == "change":
+                    ok = self.cfg_mgr.change_password(cur_pw, new_pw)
+                else:
+                    ok = self.cfg_mgr.remove_password(cur_pw)
+            except Exception as e:
+                state["busy"] = False
+                try:
+                    btn_ok.configure(state=tk.NORMAL)
+                    err_var.set(str(e))
+                except Exception:
+                    pass
+                return "break"
+
+            state["busy"] = False
+            if not ok:
+                try:
+                    btn_ok.configure(state=tk.NORMAL)
+                    err_var.set(tr("ui.auth.err_wrong", "Incorrect password. Try again."))
+                    if cur_entry is not None:
+                        cur_entry.selection_range(0, tk.END)
+                        cur_entry.focus_set()
+                except Exception:
+                    pass
+                return "break"
+
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            if callable(on_done):
+                on_done(mode)
+            return "break"
+
+        tk.Button(
+            btn_row,
+            text=tr("ui.common.cancel", "Cancel"),
+            command=_close,
+            bg="#353849",
+            fg="#ffffff",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=5,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+
+        btn_ok = tk.Button(
+            btn_row,
+            text=submit_txt,
+            command=_submit,
+            bg=submit_bg,
+            fg="#ffffff",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=14,
+            pady=5,
+            cursor="hand2",
+        )
+        btn_ok.pack(side=tk.RIGHT)
+
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        dlg.bind("<Escape>", lambda e: _close())
+        for ent in entries:
+            ent.bind("<Return>", _submit)
+
+        self.win.update_idletasks()
+        dlg.update_idletasks()
+        dw = max(430, int(dlg.winfo_reqwidth()))
+        dh = max(210, int(dlg.winfo_reqheight()))
+        px = self.win.winfo_rootx() + max(20, (self.win.winfo_width() - dw) // 2)
+        py = self.win.winfo_rooty() + max(20, (self.win.winfo_height() - dh) // 2)
+        dlg.geometry(f"{dw}x{dh}+{px}+{py}")
+
+        try:
+            dlg.deiconify()
+            dlg.lift()
+            dlg.grab_set()
+        except Exception:
+            pass
+
+        first_ent = cur_entry or new_entry
+        if first_ent is not None:
+            try:
+                first_ent.focus_set()
+            except Exception:
+                pass
+
+        self._active_pwd_dlg = dlg
+        try:
+            dlg.wait_window()
+        finally:
+            if getattr(self, "_active_pwd_dlg", None) is dlg:
+                self._active_pwd_dlg = None
+
     def _apply_changes(self):
         self._commit_current_page()
         self.cfg_mgr.save_data(self.draft)
@@ -5742,6 +6965,16 @@ class SettingsWindow:
             except Exception:
                 pass
             self._autosetup_dlg = None
+        if self._active_pwd_dlg is not None:
+            try:
+                self._active_pwd_dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                self._active_pwd_dlg.destroy()
+            except Exception:
+                pass
+            self._active_pwd_dlg = None
         if getattr(self, "_ui_poll_after_id", None) is not None:
             try:
                 self.win.after_cancel(self._ui_poll_after_id)

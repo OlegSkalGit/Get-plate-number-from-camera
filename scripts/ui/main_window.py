@@ -5,7 +5,7 @@ import queue
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox
 from PIL import Image, ImageTk
 
 from scripts.core.i18n import (
@@ -13,9 +13,6 @@ from scripts.core.i18n import (
     tr,
     set_language,
     get_language,
-    list_languages,
-    get_language_label,
-    parse_language_code,
 )
 from scripts.core.module_registry import ModuleRegistry
 from scripts.core.config_manager import ConfigManager
@@ -32,9 +29,9 @@ from scripts.engine.inference_pool import InferencePool
 from scripts.engine.camera_manager import CameraManager
 from scripts.ui.helpers import (
     WindowGeometryTracker,
+    apply_borderless_window_style,
     compute_auto_grid,
-    configure_dark_combobox_style,
-    style_dark_combobox_popdown,
+    get_virtual_screen_bounds,
 )
 from scripts.ui.detail_window import CameraDetailWindow
 from scripts.ui.settings_window import SettingsWindow
@@ -75,7 +72,7 @@ class MainGridWindow:
     конкретної камери. Фоновий запис та AI-аналіз усіх камер працюють безперервно незалежно від вікон,
     а незалежні модулі автоматично підхоплюються через ModuleRegistry.
     """
-    def __init__(self, root: tk.Tk, base_dir: str = None):
+    def __init__(self, root: tk.Tk, base_dir: str = None, registry=None, cfg_mgr=None):
         self.root = root
         self._manage_os_startup = (base_dir is None)
         self.base_dir = os.path.abspath(base_dir or BASE_DIR)
@@ -95,8 +92,10 @@ class MainGridWindow:
             prepare_cuda_dll_environment(self.base_dir, preload=False)
         except Exception:
             pass
-        self.registry = ModuleRegistry(self.base_dir)
-        self.cfg_mgr = ConfigManager(self.base_dir, registry=self.registry)
+        self.registry = registry if registry is not None else ModuleRegistry(self.base_dir)
+        self.cfg_mgr = cfg_mgr if cfg_mgr is not None else ConfigManager(self.base_dir, registry=self.registry)
+        if self.cfg_mgr.is_locked():
+            raise PermissionError("Configuration is locked. Enter access password before starting MainGridWindow.")
         self.cfg_mgr.sync_with_registry(self.registry)
         init_i18n(self.base_dir, lang_code=self.cfg_mgr.get_language())
         self.root.title(tr("ui.main.window_title", "ANPR Multi-Cam NVR — Camera Grid"))
@@ -158,7 +157,6 @@ class MainGridWindow:
         self._ui_poll_after_id = None
         self._cuda_note_clear_after_id = None
         self._panel_visible = True
-        self._lang_menu_active = False
         self._last_total_cams = 0
         self._window_minimized = False
         self._visible_grid_uuids = set()
@@ -182,6 +180,14 @@ class MainGridWindow:
 
         self._build_ui()
 
+        # Прибираємо стандартний заголовок Windows лише для головного вікна (зі збереженням Taskbar і rcWork)
+        self._borderless_ctl = apply_borderless_window_style(self.root)
+        if self._borderless_ctl is not None:
+            self._borderless_ctl.bind_drag_widgets(
+                getattr(self, "_top_drag_widgets", ()),
+                on_interaction=self._on_top_bar_interact,
+            )
+
         # Відновлення й автозбереження позиції вікна на будь-якому моніторі
         self.geom_tracker = WindowGeometryTracker(
             self.root,
@@ -192,10 +198,10 @@ class MainGridWindow:
             default_geom={"left": 40, "top": 30, "width": 1280, "height": 760, "maximized": False},
         )
 
-        self.root.bind(EVT_MOTION, self._on_mouse_motion)
-        self.root.bind(EVT_CONFIGURE, self._on_root_configure)
-        self.root.bind("<Unmap>", self._on_root_unmap)
-        self.root.bind("<Map>", self._on_root_map)
+        self.root.bind(EVT_MOTION, self._on_mouse_motion, add="+")
+        self.root.bind(EVT_CONFIGURE, self._on_root_configure, add="+")
+        self.root.bind("<Unmap>", self._on_root_unmap, add="+")
+        self.root.bind("<Map>", self._on_root_map, add="+")
 
         self._drain_ui_queue()
         self._start_hw_poll_thread()
@@ -219,10 +225,11 @@ class MainGridWindow:
         left_box = tk.Frame(self.ctrl_frame, bg="#171923")
         left_box.pack(side=tk.LEFT)
 
-        tk.Label(
+        lbl_brand = tk.Label(
             left_box, text="📹 ANPR Multi-Cam NVR", fg="#ffffff", bg="#171923",
             font=("Segoe UI", 10, "bold")
-        ).pack(side=tk.LEFT, padx=(0, 10))
+        )
+        lbl_brand.pack(side=tk.LEFT, padx=(0, 10))
 
         self.lbl_cam_count = tk.Label(
             left_box, text=tr("ui.main.cam_count", "Cameras: {n}", n=0), fg="#00e5ff", bg="#222534",
@@ -280,46 +287,9 @@ class MainGridWindow:
         )
         self.btn_next_page.pack(side=tk.LEFT, padx=(4, 0))
 
-        # Правий блок: швидкий перемикач мови + телеметрія заліза + вихід
+        # Правий блок: телеметрія заліза + вихід
         right_box = tk.Frame(self.ctrl_frame, bg="#171923")
         right_box.pack(side=tk.RIGHT)
-
-        lang_box = tk.Frame(right_box, bg="#171923")
-        lang_box.pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(
-            lang_box, text="🌐", fg="#00e5ff", bg="#171923",
-            font=("Segoe UI", 10)
-        ).pack(side=tk.LEFT, padx=(0, 4))
-
-        configure_dark_combobox_style(
-            self.root,
-            style_name="MainLang.TCombobox",
-            field_bg="#222534",
-            hover_field_bg="#2a2f43",
-            btn_bg="#2b2f40",
-            btn_hover_bg="#353b52",
-            fg="#ffffff",
-            arrow_color="#00e5ff",
-            border_color="#2e3347",
-        )
-
-        lang_labels = [m["label"] for m in list_languages()]
-        self.top_lang_var = tk.StringVar(value=get_language_label())
-        self.cmb_top_lang = ttk.Combobox(
-            lang_box,
-            textvariable=self.top_lang_var,
-            values=lang_labels,
-            state="readonly",
-            width=21,
-            font=("Segoe UI", 8, "bold"),
-            style="MainLang.TCombobox",
-        )
-        self.cmb_top_lang.pack(side=tk.LEFT)
-        style_dark_combobox_popdown(self.cmb_top_lang)
-        self.cmb_top_lang.bind("<<ComboboxSelected>>", self._on_top_language_selected)
-        self.cmb_top_lang.bind("<Button-1>", self._on_top_lang_interact)
-        self.cmb_top_lang.bind("<FocusIn>", self._on_top_lang_interact)
-        self.cmb_top_lang.bind("<FocusOut>", self._on_top_lang_leave)
 
         self.lbl_hw_badge = tk.Label(
             right_box, text=tr("ui.main.hw_badge_init", "CPU: --% | RAM: -- | AI: CPU"),
@@ -335,6 +305,18 @@ class MainGridWindow:
         )
         self.btn_exit.pack(side=tk.LEFT)
         self._apply_exit_btn_text()
+
+        self._top_drag_widgets = (
+            self.ctrl_frame,
+            left_box,
+            lbl_brand,
+            self.lbl_cam_count,
+            self.lbl_mode_badge,
+            self.page_box,
+            self.lbl_page,
+            right_box,
+            self.lbl_hw_badge,
+        )
 
         self._show_top_bar()
 
@@ -682,39 +664,8 @@ class MainGridWindow:
         self.on_close()
 
     # ------------------------------------------------------------------
-    # Автоприховувана верхня панель і швидкий перемикач мови
+    # Автоприховувана верхня панель
     # ------------------------------------------------------------------
-    def _on_top_lang_interact(self, event=None):
-        self._lang_menu_active = True
-        self._show_top_bar()
-        self._schedule_hide_bar(6000)
-
-    def _on_top_lang_leave(self, event=None):
-        self._lang_menu_active = False
-        if self._panel_visible:
-            self._schedule_hide_bar(4500)
-
-    def _on_top_language_selected(self, event=None):
-        self._lang_menu_active = False
-        try:
-            selected = self.top_lang_var.get()
-        except Exception:
-            return
-        code = parse_language_code(selected, fallback=get_language())
-        if code:
-            self.change_language(code, source="topbar")
-        if self._panel_visible:
-            self._schedule_hide_bar(4500)
-
-    def _sync_top_lang_combo(self):
-        if not hasattr(self, "cmb_top_lang") or not hasattr(self, "top_lang_var"):
-            return
-        try:
-            self.cmb_top_lang.configure(values=[m["label"] for m in list_languages()])
-            self.top_lang_var.set(get_language_label(get_language()))
-        except Exception:
-            pass
-
     def apply_language(self):
         if self._is_closing:
             return
@@ -729,7 +680,6 @@ class MainGridWindow:
             self.lbl_page.configure(
                 text=tr("ui.main.page_fmt", "Page {cur} / {total}", cur=self._current_page + 1, total=self._total_pages)
             )
-            self._sync_top_lang_combo()
             if hasattr(self, "_empty_lbl") and self._empty_lbl.winfo_exists():
                 self._empty_lbl.configure(
                     text=tr(
@@ -748,7 +698,7 @@ class MainGridWindow:
         except Exception:
             pass
 
-    def change_language(self, lang_code: str, source: str = "topbar") -> str:
+    def change_language(self, lang_code: str, source: str = "settings") -> str:
         saved_code = self.cfg_mgr.set_language(lang_code)
         eff_code = set_language(saved_code)
         try:
@@ -761,7 +711,7 @@ class MainGridWindow:
         if self.settings_win is not None:
             try:
                 if self.settings_win.win.winfo_exists() and not getattr(self.settings_win, "_is_closing", False):
-                    if source == "topbar":
+                    if source != "settings":
                         self.settings_win.on_external_language_changed(eff_code)
                     else:
                         self.settings_win.apply_language()
@@ -804,16 +754,6 @@ class MainGridWindow:
         if self._is_closing:
             return
         try:
-            focused = self.root.focus_get()
-            if self._lang_menu_active or (
-                focused is not None
-                and (focused is getattr(self, "cmb_top_lang", None) or "popdown" in str(focused).lower())
-            ):
-                self._schedule_hide_bar(2500)
-                return
-        except Exception:
-            pass
-        try:
             px, py = self.root.winfo_pointerxy()
             rx = self.root.winfo_rootx()
             ry = self.root.winfo_rooty()
@@ -834,6 +774,12 @@ class MainGridWindow:
             except Exception:
                 pass
         self._hide_bar_after_id = self.root.after(ms, self._hide_top_bar)
+
+    def _on_top_bar_interact(self):
+        if self._is_closing:
+            return
+        self._show_top_bar()
+        self._schedule_hide_bar(5000)
 
     def _on_mouse_motion(self, event=None):
         if self._is_closing:
@@ -865,6 +811,9 @@ class MainGridWindow:
                 pass
             self.settings_win = None
 
+        if not self._prompt_settings_password():
+            return
+
         self.settings_win = SettingsWindow(
             self.root,
             cfg_mgr=self.cfg_mgr,
@@ -876,6 +825,160 @@ class MainGridWindow:
             on_refresh_modules_cb=self.refresh_modules_and_libraries,
             on_restart_app_cb=self.restart_application,
         )
+
+    def _prompt_settings_password(self) -> bool:
+        """Запитує пароль доступу перед відкриттям налаштувань, якщо пароль задано."""
+        try:
+            if not self.cfg_mgr.has_password():
+                return True
+        except Exception:
+            return True
+
+        result = {"ok": False}
+        dlg = tk.Toplevel(self.root)
+        dlg.title(tr("ui.main.btn_settings", "Settings"))
+        dlg.configure(bg="#181818")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        w, h = 380, 185
+        try:
+            self.root.update_idletasks()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            px = rx + max(0, (rw - w) // 2)
+            py = ry + max(0, (rh - h) // 2)
+        except Exception:
+            px = max(0, (dlg.winfo_screenwidth() - w) // 2)
+            py = max(0, (dlg.winfo_screenheight() - h) // 2)
+        dlg.geometry(f"{w}x{h}+{px}+{py}")
+
+        frm = tk.Frame(dlg, bg="#181818", padx=18, pady=16)
+        frm.pack(fill="both", expand=True)
+
+        tk.Label(
+            frm,
+            text=tr("ui.auth.pwd_label", "Password:"),
+            bg="#181818",
+            fg="#F3F3F3",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 6))
+
+        pwd_var = tk.StringVar()
+        err_var = tk.StringVar()
+
+        entry_row = tk.Frame(frm, bg="#181818")
+        entry_row.pack(fill="x")
+
+        ent = tk.Entry(
+            entry_row,
+            textvariable=pwd_var,
+            show="●",
+            bg="#242424",
+            fg="#F3F3F3",
+            insertbackground="#F3F3F3",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#3A3A3A",
+            highlightcolor="#0078D4",
+            font=("Segoe UI", 10),
+        )
+        ent.pack(side="left", fill="x", expand=True, ipady=5)
+
+        show_state = {"visible": False}
+
+        def _toggle_show():
+            show_state["visible"] = not show_state["visible"]
+            ent.configure(show="" if show_state["visible"] else "●")
+
+        tk.Button(
+            entry_row,
+            text="👁",
+            command=_toggle_show,
+            bg="#2A2A2A",
+            fg="#D8D8D8",
+            activebackground="#3A3A3A",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=8,
+            cursor="hand2",
+        ).pack(side="left", padx=(6, 0), ipady=3)
+
+        tk.Label(
+            frm,
+            textvariable=err_var,
+            bg="#181818",
+            fg="#F48771",
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(6, 8))
+
+        btn_row = tk.Frame(frm, bg="#181818")
+        btn_row.pack(fill="x")
+
+        def _submit(_evt=None):
+            pwd = pwd_var.get()
+            if not pwd:
+                err_var.set(tr("ui.auth.err_empty", "Please enter the password."))
+                ent.focus_set()
+                return
+            try:
+                if self.cfg_mgr.verify_password(pwd):
+                    result["ok"] = True
+                    dlg.destroy()
+                    return
+            except Exception:
+                pass
+            err_var.set(tr("ui.auth.err_wrong", "Incorrect password. Try again."))
+            ent.selection_range(0, "end")
+            ent.focus_set()
+
+        def _cancel(_evt=None):
+            result["ok"] = False
+            dlg.destroy()
+
+        tk.Button(
+            btn_row,
+            text=tr("ui.common.cancel", "Cancel"),
+            command=_cancel,
+            bg="#2D2D2D",
+            fg="#E5E5E5",
+            activebackground="#3D3D3D",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=5,
+            cursor="hand2",
+        ).pack(side="right")
+
+        tk.Button(
+            btn_row,
+            text="OK",
+            command=_submit,
+            bg="#0078D4",
+            fg="#FFFFFF",
+            activebackground="#1084DD",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=5,
+            cursor="hand2",
+        ).pack(side="right", padx=(0, 8))
+
+        dlg.bind("<Return>", _submit)
+        dlg.bind("<Escape>", _cancel)
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+        ent.focus_set()
+        self.root.wait_window(dlg)
+        return bool(result["ok"])
 
     def _on_settings_closed(self):
         self.settings_win = None
@@ -1191,7 +1294,7 @@ class MainGridWindow:
 
         snap = self._fast_cfg()
         grid_cfg = snap.get("grid") or {}
-        units = self.camera_manager.get_ordered_enabled_units()
+        units = self.camera_manager.get_ordered_units()
         total_cams = len(units)
         self._last_total_cams = total_cams
         self.lbl_cam_count.configure(text=tr("ui.main.cam_count", "Cameras: {n}", n=total_cams))
@@ -1449,7 +1552,7 @@ class MainGridWindow:
         if self._window_minimized:
             return 250
 
-        if not self._tiles and self.camera_manager.get_ordered_enabled_units():
+        if not self._tiles and self.camera_manager.get_ordered_units():
             self._relayout_grid(force=False)
 
         snap = self._fast_cfg()
@@ -1492,33 +1595,46 @@ class MainGridWindow:
                 border_changed = True
 
             # 2. Кадр субпотоку
-            rgb = gs.get("rgb")
+            is_cam_enabled = bool(gs.get("enabled", True))
+            rgb = gs.get("rgb") if is_cam_enabled else None
             seq = int(gs.get("seq", 0))
+            layer_dirty = False
             if rgb is not None:
                 if seq != t["last_seq"] or t["photo_tk"] is None:
                     t["last_seq"] = seq
+                    t["last_ph_key"] = None
                     try:
                         tk_img = ImageTk.PhotoImage(Image.fromarray(rgb))
                         t["photo_tk"] = tk_img
                         cv.itemconfigure(t["img_id"], image=tk_img, state=tk.NORMAL)
                         cv.coords(t["img_id"], iw // 2, ih // 2)
                         cv.itemconfigure(t["ph_id"], state=tk.HIDDEN)
+                        layer_dirty = True
                     except Exception:
                         pass
             else:
-                cv.itemconfigure(t["img_id"], state=tk.HIDDEN)
-                st_map = {
-                    "offline": (tr("ui.main.tile.offline", "No signal (offline)"), "#ff6666"),
-                    "reconnecting": (tr("ui.main.tile.reconnecting", "Reconnecting sub-stream..."), "#ffcc00"),
-                    "connecting": (tr("ui.main.tile.connecting_sub", "Connecting sub-stream..."), "#ffcc00"),
-                    "fallback_main": (tr("ui.main.tile.waiting_main", "Waiting for main stream..."), "#ffcc00"),
-                }
-                p_txt, p_col = st_map.get(
-                    gs.get("sub_status", ""),
-                    (tr("ui.main.tile.starting", "Starting..."), "#9ba3b8"),
-                )
-                cv.itemconfigure(t["ph_id"], text=p_txt, fill=p_col, state=tk.NORMAL)
-                cv.coords(t["ph_id"], iw // 2, ih // 2)
+                if not is_cam_enabled:
+                    sub_s = "stopped"
+                    p_txt, p_col = tr("ui.main.tile.stopped", "Stopped"), "#9ba3b8"
+                else:
+                    st_map = {
+                        "offline": (tr("ui.main.tile.offline", "No signal (offline)"), "#ff6666"),
+                        "reconnecting": (tr("ui.main.tile.reconnecting", "Reconnecting sub-stream..."), "#ffcc00"),
+                        "connecting": (tr("ui.main.tile.connecting_sub", "Connecting sub-stream..."), "#ffcc00"),
+                        "fallback_main": (tr("ui.main.tile.waiting_main", "Waiting for main stream..."), "#ffcc00"),
+                    }
+                    sub_s = gs.get("sub_status", "")
+                    p_txt, p_col = st_map.get(
+                        sub_s,
+                        (tr("ui.main.tile.starting", "Starting..."), "#9ba3b8"),
+                    )
+                ph_key = (sub_s, p_txt, p_col, iw, ih)
+                if t.get("last_ph_key") != ph_key:
+                    t["last_ph_key"] = ph_key
+                    cv.itemconfigure(t["img_id"], state=tk.HIDDEN)
+                    cv.itemconfigure(t["ph_id"], text=p_txt, fill=p_col, state=tk.NORMAL)
+                    cv.coords(t["ph_id"], iw // 2, ih // 2)
+                    layer_dirty = True
 
             # 3. Оверлей назви камери (верхній лівий кут)
             if show_labels:
@@ -1534,6 +1650,7 @@ class MainGridWindow:
                     if bbox:
                         cv.coords(t["lbl_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
                         cv.itemconfigure(t["lbl_bg_id"], state=tk.NORMAL)
+                    layer_dirty = True
             else:
                 if t["last_lbl_text"] != "__HIDDEN__":
                     t["last_lbl_text"] = "__HIDDEN__"
@@ -1579,6 +1696,7 @@ class MainGridWindow:
                         if bbox:
                             cv.coords(t["st_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
                             cv.itemconfigure(t["st_bg_id"], state=tk.NORMAL)
+                        layer_dirty = True
                 else:
                     if t["last_st_key"] != ("__HIDDEN__",):
                         t["last_st_key"] = ("__HIDDEN__",)
@@ -1603,13 +1721,15 @@ class MainGridWindow:
                     if bbox:
                         cv.coords(t["warn_bg_id"], bbox[0] - 5, bbox[1] - 3, bbox[2] + 5, bbox[3] + 3)
                         cv.itemconfigure(t["warn_bg_id"], state=tk.NORMAL)
+                    layer_dirty = True
                 else:
                     cv.itemconfigure(t["warn_txt_id"], text="", state=tk.HIDDEN)
                     cv.itemconfigure(t["warn_bg_id"], state=tk.HIDDEN)
 
-            cv.tag_raise("ov_lbl")
-            cv.tag_raise("ov_st")
-            cv.tag_raise("ov_warn")
+            if layer_dirty:
+                cv.tag_raise("ov_lbl")
+                cv.tag_raise("ov_st")
+                cv.tag_raise("ov_warn")
 
         if border_changed:
             self._restack_grid_highlights()
@@ -1629,10 +1749,16 @@ class MainGridWindow:
     def _start_hw_poll_thread(self):
         def _loop():
             while self._hw_poll_running and not self._is_closing:
-                try:
-                    self._cached_hw_metrics = self.hw_monitor.get_live_metrics()
-                except Exception:
-                    pass
+                if (not self._window_minimized) or (self._cached_hw_metrics is None):
+                    try:
+                        self._cached_hw_metrics = self.hw_monitor.get_live_metrics(include_disks=False)
+                    except TypeError:
+                        try:
+                            self._cached_hw_metrics = self.hw_monitor.get_live_metrics()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                 for _ in range(15):
                     if not self._hw_poll_running or self._is_closing:
                         break
@@ -1762,6 +1888,13 @@ class MainGridWindow:
             pass
 
         try:
+            borderless = getattr(self, "_borderless_ctl", None)
+            if borderless is not None:
+                borderless.detach()
+        except Exception:
+            pass
+
+        try:
             self.root.destroy()
         except Exception:
             pass
@@ -1770,14 +1903,320 @@ class MainGridWindow:
             sys.exit(0)
 
 
-def main():
-    if not getattr(sys, "frozen", False):
+def _get_pointer_monitor_work_area(widget) -> tuple[int, int, int, int]:
+    if sys.platform == "win32":
         try:
-            os.chdir(BASE_DIR)
+            import ctypes
+            from ctypes import wintypes
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            u32 = ctypes.windll.user32
+            pt = POINT()
+            u32.GetCursorPos(ctypes.byref(pt))
+            hmon = u32.MonitorFromPoint(pt, 2)  # MONITOR_DEFAULTTONEAREST
+            if hmon:
+                mi = MONITORINFO()
+                mi.cbSize = ctypes.sizeof(MONITORINFO)
+                if u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    rc = mi.rcWork
+                    mw = rc.right - rc.left
+                    mh = rc.bottom - rc.top
+                    if mw > 0 and mh > 0:
+                        return int(rc.left), int(rc.top), int(mw), int(mh)
         except Exception:
             pass
+    return get_virtual_screen_bounds(widget)
+
+
+def prompt_startup_login(root: tk.Tk, cfg_mgr: ConfigManager) -> bool:
+    if not cfg_mgr.is_locked():
+        return True
+
+    result = {"unlocked": False, "checking": False}
+
+    dlg = tk.Toplevel(root)
+    try:
+        dlg.withdraw()
+    except Exception:
+        pass
+    dlg.title(tr("ui.auth.login_title", "ANPR Multi-Cam NVR — Sign In"))
+    dlg.configure(bg="#141620")
+    dlg.resizable(False, False)
+
+    card = tk.Frame(
+        dlg,
+        bg="#1c1f2b",
+        padx=24,
+        pady=20,
+        highlightthickness=1,
+        highlightbackground="#2b3042",
+    )
+    card.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+    tk.Label(
+        card,
+        text="🔒 ANPR Multi-Cam NVR",
+        fg="#00e5ff",
+        bg="#1c1f2b",
+        font=("Segoe UI", 13, "bold"),
+        anchor=tk.W,
+    ).pack(fill=tk.X)
+
+    tk.Label(
+        card,
+        text=tr(
+            "ui.auth.login_prompt",
+            "Enter your access password to decrypt video sources and start monitoring.",
+        ),
+        fg="#c8d0e4",
+        bg="#1c1f2b",
+        font=("Segoe UI", 9),
+        justify=tk.LEFT,
+        wraplength=360,
+        anchor=tk.W,
+    ).pack(fill=tk.X, pady=(6, 14))
+
+    tk.Label(
+        card,
+        text=tr("ui.auth.pwd_label", "Password:"),
+        fg="#d8deef",
+        bg="#1c1f2b",
+        font=("Segoe UI", 9, "bold"),
+        anchor=tk.W,
+    ).pack(fill=tk.X, pady=(0, 4))
+
+    entry_row = tk.Frame(card, bg="#1c1f2b")
+    entry_row.pack(fill=tk.X)
+
+    pwd_var = tk.StringVar(value="")
+    entry = tk.Entry(
+        entry_row,
+        textvariable=pwd_var,
+        show="•",
+        bg="#252836",
+        fg="#ffffff",
+        insertbackground="#ffffff",
+        relief=tk.FLAT,
+        font=("Segoe UI", 11),
+        width=28,
+    )
+    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 6))
+
+    show_flag = [False]
+
+    def _toggle_show():
+        show_flag[0] = not show_flag[0]
+        entry.configure(show="" if show_flag[0] else "•")
+        btn_eye.configure(fg="#00e5ff" if show_flag[0] else "#c8d0e4")
+        entry.focus_set()
+
+    btn_eye = tk.Button(
+        entry_row,
+        text="👁",
+        command=_toggle_show,
+        bg="#2a2e3f",
+        fg="#c8d0e4",
+        activebackground="#353b50",
+        activeforeground="#ffffff",
+        relief=tk.FLAT,
+        font=("Segoe UI", 10),
+        width=3,
+        pady=3,
+        cursor="hand2",
+    )
+    btn_eye.pack(side=tk.LEFT)
+
+    err_var = tk.StringVar(value="")
+    tk.Label(
+        card,
+        textvariable=err_var,
+        fg="#ff6b6b",
+        bg="#1c1f2b",
+        font=("Segoe UI", 9, "bold"),
+        wraplength=360,
+        justify=tk.LEFT,
+        anchor=tk.W,
+    ).pack(fill=tk.X, pady=(8, 6))
+
+    btn_row = tk.Frame(card, bg="#1c1f2b")
+    btn_row.pack(fill=tk.X, pady=(6, 0))
+
+    def _cancel():
+        if result["checking"]:
+            return
+        result["unlocked"] = False
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+
+    def _try_unlock(event=None):
+        if result["checking"]:
+            return "break"
+        pw = pwd_var.get()
+        if not pw:
+            err_var.set(tr("ui.auth.err_empty", "Please enter the password."))
+            entry.focus_set()
+            return "break"
+
+        result["checking"] = True
+        btn_unlock.configure(state=tk.DISABLED)
+        err_var.set("")
+        try:
+            dlg.update_idletasks()
+        except Exception:
+            pass
+
+        try:
+            ok, err_code = cfg_mgr.unlock_with_error(pw)
+        except Exception:
+            ok, err_code = False, "corrupt_data"
+        finally:
+            result["checking"] = False
+
+        if ok:
+            result["unlocked"] = True
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            return "break"
+
+        try:
+            btn_unlock.configure(state=tk.NORMAL)
+            if err_code == "corrupt_data":
+                err_var.set(
+                    tr(
+                        "ui.auth.err_corrupt",
+                        "Failed to decrypt saved camera source links in config.json.",
+                    )
+                )
+            else:
+                err_var.set(tr("ui.auth.err_wrong", "Incorrect password. Try again."))
+            entry.selection_range(0, tk.END)
+            entry.focus_set()
+        except Exception:
+            pass
+        return "break"
+
+    btn_exit = tk.Button(
+        btn_row,
+        text=tr("ui.auth.btn_exit", "🚪 Exit"),
+        command=_cancel,
+        bg="#353849",
+        fg="#ffffff",
+        activebackground="#44485d",
+        activeforeground="#ffffff",
+        relief=tk.FLAT,
+        font=("Segoe UI", 9, "bold"),
+        padx=14,
+        pady=6,
+        cursor="hand2",
+    )
+    btn_exit.pack(side=tk.RIGHT, padx=(8, 0))
+
+    btn_unlock = tk.Button(
+        btn_row,
+        text=tr("ui.auth.btn_unlock", "🔓 Unlock"),
+        command=_try_unlock,
+        bg="#007acc",
+        fg="#ffffff",
+        activebackground="#0066ad",
+        activeforeground="#ffffff",
+        relief=tk.FLAT,
+        font=("Segoe UI", 9, "bold"),
+        padx=16,
+        pady=6,
+        cursor="hand2",
+    )
+    btn_unlock.pack(side=tk.RIGHT)
+
+    dlg.protocol("WM_DELETE_WINDOW", _cancel)
+    dlg.bind("<Return>", _try_unlock)
+    dlg.bind("<Escape>", lambda e: _cancel())
+    entry.bind("<Return>", _try_unlock)
+
+    try:
+        dlg.update_idletasks()
+        dw = max(410, int(dlg.winfo_reqwidth()))
+        dh = max(230, int(dlg.winfo_reqheight()))
+        mx, my, mw, mh = _get_pointer_monitor_work_area(dlg)
+        x = mx + max(0, (mw - dw) // 2)
+        y = my + max(0, (mh - dh) // 2)
+        dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+        dlg.deiconify()
+        dlg.lift()
+        dlg.focus_force()
+        entry.focus_set()
+        dlg.grab_set()
+    except Exception:
+        pass
+
+    root._startup_login_dlg = dlg
+    try:
+        root.wait_window(dlg)
+    finally:
+        try:
+            delattr(root, "_startup_login_dlg")
+        except Exception:
+            pass
+    return bool(result["unlocked"])
+
+
+def main(base_dir: str = None):
+    target_dir = os.path.abspath(base_dir or BASE_DIR)
+    if base_dir is None and not getattr(sys, "frozen", False):
+        try:
+            os.chdir(target_dir)
+        except Exception:
+            pass
+    try:
+        prepare_cuda_dll_environment(target_dir, preload=False)
+    except Exception:
+        pass
+
+    registry = ModuleRegistry(target_dir)
+    cfg_mgr = ConfigManager(target_dir, registry=registry)
+    init_i18n(target_dir, lang_code=cfg_mgr.get_language())
+
     root = tk.Tk()
-    MainGridWindow(root)
+    if cfg_mgr.is_locked():
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+        unlocked = prompt_startup_login(root, cfg_mgr)
+        if not unlocked or cfg_mgr.is_locked():
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return
+        try:
+            root.deiconify()
+        except Exception:
+            pass
+
+    cfg_mgr.sync_with_registry(registry)
+    MainGridWindow(root, base_dir=base_dir, registry=registry, cfg_mgr=cfg_mgr)
     root.mainloop()
 
 

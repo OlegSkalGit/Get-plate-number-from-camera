@@ -171,6 +171,7 @@ class CameraUnit:
         hardware_cfg: dict,
         on_saved_event=None,
         allow_disk_write: bool = True,
+        source_disk_formatter=None,
     ):
         self.cam_cfg = dict(cam_cfg)
         self.uuid = str(cam_cfg["uuid"])
@@ -180,6 +181,7 @@ class CameraUnit:
         self.hardware_cfg = dict(hardware_cfg or {})
         self.on_saved_event = on_saved_event
         self.allow_disk_write = bool(allow_disk_write)
+        self.source_disk_formatter = source_disk_formatter
 
         self._write_camera_meta()
 
@@ -220,6 +222,7 @@ class CameraUnit:
         self.engines = {}
         self._engine_sigs = {}
         self._engine_specs = {}  # mod_id -> spec (для безпечної зупинки видалених модулів)
+        self._known_mod_ids = []
         self._module_runtime_errors = {}
 
         self._sub_thread = None
@@ -235,13 +238,22 @@ class CameraUnit:
         if not self._effective_allow_disk_write():
             return
         try:
+            main_raw = str(self.cam_cfg.get("main_source", "") or "")
+            sub_raw = str(self.cam_cfg.get("sub_source", "") or "")
+            fmt = getattr(self, "source_disk_formatter", None)
+            if callable(fmt):
+                main_disk = fmt(main_raw)
+                sub_disk = fmt(sub_raw)
+            else:
+                main_disk = main_raw
+                sub_disk = sub_raw
             os.makedirs(self.archive_dir, exist_ok=True)
             meta_path = os.path.join(self.archive_dir, "camera_info.txt")
             with open(meta_path, "w", encoding="utf-8") as f:
                 f.write(f"UUID: {self.uuid}\n")
                 f.write(f"Name: {self.cam_cfg.get('name', '')}\n")
-                f.write(f"Main: {self.cam_cfg.get('main_source', '')}\n")
-                f.write(f"Sub: {self.cam_cfg.get('sub_source', '')}\n")
+                f.write(f"Main: {main_disk}\n")
+                f.write(f"Sub: {sub_disk}\n")
         except Exception:
             pass
 
@@ -301,6 +313,7 @@ class CameraUnit:
         active_ids = {e["id"] for e in entries}
 
         with self._engines_lock:
+            self._known_mod_ids = [(e["id"], bool(e["spec"].get("default_enabled", True))) for e in entries]
             # 1. Прибираємо двигуни модулів, яких більше немає в реєстрі або які вимкнені
             for old_mid in list(self.engines.keys()):
                 if old_mid not in active_ids:
@@ -435,8 +448,9 @@ class CameraUnit:
         new_hw_dec = str(self.hardware_cfg.get("video_decode_mode", "cpu"))
 
         sources_changed = (old_main != new_main) or (old_sub != new_sub) or (old_enabled != new_enabled) or (old_hw_dec != new_hw_dec)
-        if sources_changed and self.running:
-            self.stop()
+        if sources_changed and (self.running or (not old_enabled and new_enabled)):
+            if self.running:
+                self.stop()
             self._init_engines()
             if new_enabled:
                 self.start()
@@ -594,10 +608,18 @@ class CameraUnit:
             sub_fps = self._sub_fps
             subs = self.detail_subscribers
         mods = self.cam_cfg.get("modules") or {}
-        modules_on = {
-            ent["id"]: bool((mods.get(ent["id"]) or {}).get("on", False))
-            for ent in self.registry.list_modules()
-        }
+        with self._engines_lock:
+            mod_defs = list(self._known_mod_ids)
+        if mod_defs:
+            modules_on = {
+                mid: bool((mods.get(mid) or {}).get("on", False))
+                for mid, _def in mod_defs
+            }
+        else:
+            modules_on = {
+                ent["id"]: bool((mods.get(ent["id"]) or {}).get("on", False))
+                for ent in self.registry.list_modules()
+            }
         eff_allow_write = self._effective_allow_disk_write()
         rec_on, rec_enc = self._get_recorder_status()
         return {
@@ -1142,7 +1164,7 @@ class CameraUnit:
                 or self._motion_frames_done < 3
                 or any_active_tracks
                 or any_prev_boxes
-                or (now - self._last_full_ai_ts) >= 1.0
+                or (now - self._last_full_ai_ts) >= 3.0
                 or self._motion_ref_gray is None
                 or self._motion_ref_gray.shape != small_gray.shape
             )
@@ -1326,10 +1348,12 @@ class CameraManager:
                     unit = self.units.pop(uid)
                     unit.stop()
 
+            src_fmt = getattr(self.cfg_mgr, "format_source_for_disk", None)
             for c in cams:
                 uid = c["uuid"]
                 arch_dir = self.cfg_mgr.get_camera_archive_dir(uid)
                 if uid in self.units:
+                    self.units[uid].source_disk_formatter = src_fmt
                     self.units[uid].update_config(c, hw_cfg_eff, allow_disk_write=allow_write)
                 else:
                     unit = CameraUnit(
@@ -1340,6 +1364,7 @@ class CameraManager:
                         hardware_cfg=hw_cfg_eff,
                         on_saved_event=self.on_saved_event,
                         allow_disk_write=allow_write,
+                        source_disk_formatter=src_fmt,
                     )
                     if self._visible_grid_uuids is not None:
                         unit.set_visible_to_grid(uid in self._visible_grid_uuids)
@@ -1347,8 +1372,30 @@ class CameraManager:
                     if self._running and c.get("enabled", True):
                         unit.start()
 
+            used_mod_ids = set()
+            for c in cams:
+                if not c.get("enabled", True):
+                    continue
+                unit = self.units.get(c["uuid"])
+                if unit is not None:
+                    with unit._engines_lock:
+                        used_mod_ids.update(unit.engines.keys())
+
+        try:
+            self.inference_pool.prune_unused_modules(used_mod_ids)
+        except Exception:
+            pass
+
         if self._running:
             self._ensure_ai_workers()
+
+    def refresh_camera_meta(self):
+        src_fmt = getattr(self.cfg_mgr, "format_source_for_disk", None)
+        with self._lock:
+            units_list = list(self.units.values())
+        for u in units_list:
+            u.source_disk_formatter = src_fmt
+            u._write_camera_meta()
 
     def reload_from_registry(self, changed_mod_ids=None, removed_mod_ids=None, force_all: bool = False):
         """Підхоплює додані/оновлені/видалені файли модулів на льоту без зайвого рестарту інших модулів."""
@@ -1566,6 +1613,15 @@ class CameraManager:
             res = []
             for c in cams:
                 if c.get("enabled", True) and c["uuid"] in self.units:
+                    res.append(self.units[c["uuid"]])
+            return res
+
+    def get_ordered_units(self):
+        cams = self.cfg_mgr.get_cameras()
+        with self._lock:
+            res = []
+            for c in cams:
+                if c["uuid"] in self.units:
                     res.append(self.units[c["uuid"]])
             return res
 

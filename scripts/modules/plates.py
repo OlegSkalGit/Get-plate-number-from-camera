@@ -7,7 +7,7 @@ import math
 import inspect
 import importlib
 import threading
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 import numpy as np
 
@@ -387,7 +387,7 @@ def rectify_and_enhance(plate_crop):
 
 class PlateTrack:
     """Об'єкт трекінгу номера із захистом від UNKNOWN і збереженням найрізкішого кадру на кожен варіант тексту."""
-    def __init__(self, track_id, bbox, plate_img, frame, text, conf, sharpness, frame_ts=None, seen_ts=None):
+    def __init__(self, track_id, bbox, plate_img, frame, text, conf, sharpness, frame_ts=None, seen_ts=None, keep_full_frame: bool = True):
         self.track_id = track_id
         self.bbox = bbox
         s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
@@ -395,17 +395,18 @@ class PlateTrack:
         self.last_seen = s_ts
         self.first_seen = s_ts
         self.saved = False
+        self.keep_full_frame = bool(keep_full_frame)
 
         self.best_plate_img = plate_img
-        self.best_frame = frame
+        self.best_frame = frame if self.keep_full_frame else None
         self.best_frame_ts = ev_ts
         self.best_sharpness = sharpness
         self.best_conf = conf if text != "UNKNOWN" else 0.0
         self.best_text = text
 
-        self.history_records = []
-        self.text_history = []
-        self.conf_history = []
+        self.history_records = deque(maxlen=400)
+        self.text_history = deque(maxlen=400)
+        self.conf_history = deque(maxlen=400)
 
         initial_score = evaluate_plate_quality(plate_img, text, conf, sharpness)
         self.best_score = initial_score
@@ -413,6 +414,12 @@ class PlateTrack:
         self.best_candidates_by_text = {}
 
         self.append_record(bbox, plate_img, frame, text, conf, sharpness, initial_score, frame_ts=ev_ts, seen_ts=s_ts)
+
+    def release_frames(self):
+        self.keep_full_frame = False
+        self.best_frame = None
+        for cand in self.best_candidates_by_text.values():
+            cand["frame"] = None
 
     def append_record(self, bbox, plate_img, frame, text, conf, sharpness, score, frame_ts=None, seen_ts=None):
         self.frames_tracked += 1
@@ -432,9 +439,18 @@ class PlateTrack:
             self.conf_history.append(conf)
             existing = self.best_candidates_by_text.get(text)
             if existing is None or sharpness > existing["sharpness"]:
+                if existing is None and len(self.best_candidates_by_text) >= 10:
+                    worst_key = min(
+                        self.best_candidates_by_text.keys(),
+                        key=lambda k: self.best_candidates_by_text[k].get("score", 0.0),
+                    )
+                    if score > self.best_candidates_by_text[worst_key].get("score", 0.0):
+                        self.best_candidates_by_text.pop(worst_key, None)
+                    else:
+                        return
                 self.best_candidates_by_text[text] = {
                     "plate_img": plate_img,
-                    "frame": frame,
+                    "frame": frame if self.keep_full_frame else None,
                     "frame_ts": float(ev_ts),
                     "text": text,
                     "conf": conf,
@@ -454,7 +470,8 @@ class PlateTrack:
         if current_score > self.best_score and text != "UNKNOWN":
             self.best_score = current_score
             self.best_plate_img = plate_img
-            self.best_frame = frame
+            if self.keep_full_frame:
+                self.best_frame = frame
             self.best_frame_ts = ev_ts
             self.best_sharpness = sharpness
             self.best_conf = conf
@@ -543,6 +560,11 @@ class ONNXDetector:
             opts.inter_op_num_threads = 1
             opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            try:
+                opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+            except Exception:
+                pass
 
             req_providers = list(providers) if providers else ["CPUExecutionProvider"]
             opt_providers = _expand_cuda_provider(req_providers)
@@ -719,18 +741,18 @@ class ONNXDetector:
 
 class ThreadSafePlateOCR:
     """Обгортка навколо DefaultOCR з підтримкою GPU-провайдерів і потокобезпечним викликом."""
-    def __init__(self, model_path: str, config_path: str, providers=None):
+    def __init__(self, model_path: str, config_path: str, providers=None, intra_op_threads: int = 2):
         _ensure_deps()
         if DefaultOCR is None:
             raise ImportError("Package 'fast-alpr' / DefaultOCR is not installed")
         self.model_path = model_path
         self.config_path = config_path
         self._lock = threading.Lock()
-        self.ocr = self._create_ocr(model_path, config_path, providers=providers)
+        self.ocr = self._create_ocr(model_path, config_path, providers=providers, intra_op_threads=intra_op_threads)
         self.active_providers = self._detect_active_providers()
 
     @staticmethod
-    def _create_ocr(model_path: str, config_path: str, providers=None):
+    def _create_ocr(model_path: str, config_path: str, providers=None, intra_op_threads: int = 2):
         req_providers = list(providers) if providers else ["CPUExecutionProvider"]
         opt_providers = _expand_cuda_provider(req_providers)
         use_cuda = any("CUDA" in p for p in req_providers)
@@ -746,7 +768,16 @@ class ThreadSafePlateOCR:
                 pass
             opts = ort.SessionOptions()
             opts.log_severity_level = 3
+            cpu_cnt = os.cpu_count() or 4
+            opts.intra_op_num_threads = max(1, min(int(intra_op_threads), max(1, cpu_cnt - 1)))
+            opts.inter_op_num_threads = 1
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            try:
+                opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+            except Exception:
+                pass
         except Exception:
             opts = None
 
@@ -1715,6 +1746,8 @@ class PlateEngine:
 
                         self._save_tracked_plate_locked(track, reason="high_confidence_peak")
                         track.saved = True
+                        if hasattr(track, "release_frames"):
+                            track.release_frames()
 
             for idx in unmatched_detections:
                 det = current_detections[idx]
@@ -1730,6 +1763,7 @@ class PlateEngine:
                     sharpness=det["sharpness"],
                     frame_ts=ev_ts,
                     seen_ts=now,
+                    keep_full_frame=self.allow_disk_write,
                 )
 
             for t_id, track in list(self.active_tracks.items()):
@@ -1915,6 +1949,8 @@ class PlateEngine:
 
         print(f"[BEST-SHOT НОМЕР] {text} ({conf_pct}%), різкість: {track.best_sharpness:.1f}, кадрів: {track.frames_tracked}")
         submit_io(_persist_plate)
+        if hasattr(track, "release_frames"):
+            track.release_frames()
 
 
 # ------------------------------------------------------------------
@@ -1940,7 +1976,7 @@ def _create_shared_resources(base_dir: str, providers: list, ai_threads: int, ap
     db_path = _resolve_db_path(base_dir, app_context)
     allow_write = _parse_allow_disk_write(app_context)
     det = ONNXDetector(det_path, providers=providers, intra_op_threads=ai_threads)
-    ocr = ThreadSafePlateOCR(ocr_path, cfg_path, providers=providers)
+    ocr = ThreadSafePlateOCR(ocr_path, cfg_path, providers=providers, intra_op_threads=ai_threads)
     db = PlateDBAccessor(db_path, base_dir=base_dir, ocr=ocr, allow_disk_write=allow_write)
     return {
         "detector": det,

@@ -1,4 +1,5 @@
 import os
+import gc
 import copy
 import threading
 
@@ -124,7 +125,21 @@ class InferencePool:
 
     def invalidate_module(self, mod_id: str):
         with self._lock:
-            self._module_resources.pop(str(mod_id), None)
+            removed = self._module_resources.pop(str(mod_id), None)
+        if removed is not None:
+            gc.collect()
+
+    def prune_unused_modules(self, active_mod_ids: set):
+        """Вивантажує ONNX-сесії та кеші для AI-модулів, не увімкнених на жодній активній камері."""
+        active_set = {str(x) for x in (active_mod_ids or ())}
+        removed = False
+        with self._lock:
+            for mid in list(self._module_resources.keys()):
+                if mid not in active_set:
+                    if self._module_resources.pop(mid, None) is not None:
+                        removed = True
+        if removed:
+            gc.collect()
 
     def invalidate_all(self):
         with self._lock:
@@ -132,7 +147,10 @@ class InferencePool:
             self.providers = resolve_ort_providers(self.ai_backend, base_dir=self.base_dir)
             if self.ai_backend in ("cuda", "auto"):
                 self._cuda_env_prepared = True
+            had = bool(self._module_resources)
             self._module_resources.clear()
+        if had:
+            gc.collect()
 
     def get_module_resources(self, mod_id: str):
         """Повертає або ініціалізує спільні ресурси (напр. ONNX-сесії) для вказаного модуля."""

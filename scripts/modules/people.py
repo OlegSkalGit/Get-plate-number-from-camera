@@ -152,6 +152,11 @@ class PersonDetector:
             opts.inter_op_num_threads = 1
             opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            try:
+                opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+            except Exception:
+                pass
 
             req_providers = list(providers) if providers else ["CPUExecutionProvider"]
             opt_providers = _expand_cuda_provider(req_providers)

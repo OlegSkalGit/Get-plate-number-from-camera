@@ -6,6 +6,7 @@ import copy
 import json
 import glob
 import time
+import atexit
 import ctypes
 import shutil
 import string
@@ -572,7 +573,168 @@ def _detect_disk_media_map_windows() -> dict:
     return {k: v.get("media", "Disk") for k, v in _detect_disk_info_map_windows().items()}
 
 
+_NVML_LOCK = threading.Lock()
+_NVML_STATE = {
+    "lib": None,
+    "inited": False,
+    "failed": False,
+    "driver": "",
+    "mem_struct": None,
+    "util_struct": None,
+    "smi_missing_until": 0.0,
+}
+
+
+def _shutdown_nvml():
+    with _NVML_LOCK:
+        lib = _NVML_STATE.get("lib")
+        inited = _NVML_STATE.get("inited")
+        _NVML_STATE["inited"] = False
+        _NVML_STATE["lib"] = None
+    if lib is not None and inited:
+        try:
+            lib.nvmlShutdown()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_nvml)
+
+
+def _detect_gpus_nvml():
+    if sys.platform != "win32":
+        return None
+    with _NVML_LOCK:
+        if _NVML_STATE["failed"]:
+            return None
+        lib = _NVML_STATE["lib"]
+        if lib is None:
+            candidates = [
+                "nvml.dll",
+                os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvml.dll"),
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "NVIDIA Corporation", "NVSMI", "nvml.dll"),
+            ]
+            loaded = None
+            for cand in candidates:
+                try:
+                    loaded = ctypes.WinDLL(cand)
+                    break
+                except Exception:
+                    continue
+            if loaded is None:
+                _NVML_STATE["failed"] = True
+                return None
+
+            try:
+                if loaded.nvmlInit_v2() != 0:
+                    _NVML_STATE["failed"] = True
+                    return None
+            except Exception:
+                _NVML_STATE["failed"] = True
+                return None
+
+            class _NvmlMemory(ctypes.Structure):
+                _fields_ = [
+                    ("total", ctypes.c_ulonglong),
+                    ("free", ctypes.c_ulonglong),
+                    ("used", ctypes.c_ulonglong),
+                ]
+
+            class _NvmlUtil(ctypes.Structure):
+                _fields_ = [
+                    ("gpu", ctypes.c_uint),
+                    ("memory", ctypes.c_uint),
+                ]
+
+            drv = ""
+            try:
+                drv_buf = ctypes.create_string_buffer(96)
+                if loaded.nvmlSystemGetDriverVersion(drv_buf, 96) == 0:
+                    drv = drv_buf.value.decode("utf-8", errors="replace").strip()
+            except Exception:
+                drv = ""
+
+            _NVML_STATE["lib"] = loaded
+            _NVML_STATE["inited"] = True
+            _NVML_STATE["driver"] = drv
+            _NVML_STATE["mem_struct"] = _NvmlMemory
+            _NVML_STATE["util_struct"] = _NvmlUtil
+            lib = loaded
+
+        MemCls = _NVML_STATE["mem_struct"]
+        UtilCls = _NVML_STATE["util_struct"]
+        drv = _NVML_STATE["driver"]
+
+        try:
+            cnt = ctypes.c_uint(0)
+            if lib.nvmlDeviceGetCount_v2(ctypes.byref(cnt)) != 0:
+                return None
+            gpus = []
+            for i in range(int(cnt.value)):
+                dev = ctypes.c_void_p()
+                if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(dev)) != 0:
+                    continue
+                nbuf = ctypes.create_string_buffer(128)
+                name = f"NVIDIA GPU {i}"
+                try:
+                    if lib.nvmlDeviceGetName(dev, nbuf, 128) == 0:
+                        name = nbuf.value.decode("utf-8", errors="replace").strip() or name
+                except Exception:
+                    pass
+                m = MemCls()
+                v_tot = v_used = v_free = 0.0
+                if lib.nvmlDeviceGetMemoryInfo(dev, ctypes.byref(m)) == 0:
+                    v_tot = float(m.total) / (1024.0 * 1024.0)
+                    v_used = float(m.used) / (1024.0 * 1024.0)
+                    v_free = float(m.free) / (1024.0 * 1024.0)
+                u = UtilCls()
+                gpu_u = None
+                if lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u)) == 0:
+                    gpu_u = float(u.gpu)
+                enc_pct = None
+                dec_pct = None
+                try:
+                    eu, esp = ctypes.c_uint(0), ctypes.c_uint(0)
+                    if lib.nvmlDeviceGetEncoderUtilization(dev, ctypes.byref(eu), ctypes.byref(esp)) == 0:
+                        enc_pct = float(eu.value)
+                except Exception:
+                    pass
+                try:
+                    du, dsp = ctypes.c_uint(0), ctypes.c_uint(0)
+                    if lib.nvmlDeviceGetDecoderUtilization(dev, ctypes.byref(du), ctypes.byref(dsp)) == 0:
+                        dec_pct = float(du.value)
+                except Exception:
+                    pass
+                gpus.append({
+                    "index": str(i),
+                    "name": name,
+                    "vendor": "NVIDIA",
+                    "driver": drv,
+                    "vram_total_mb": v_tot,
+                    "vram_used_mb": v_used,
+                    "vram_free_mb": v_free,
+                    "gpu_util_pct": gpu_u,
+                    "enc_util_pct": enc_pct,
+                    "dec_util_pct": dec_pct,
+                    "live_metrics": True,
+                })
+            return gpus
+        except Exception:
+            return None
+
+
 def _detect_gpus_nvidia_smi():
+    nvml_gpus = _detect_gpus_nvml()
+    if nvml_gpus is not None:
+        return nvml_gpus
+
+    now = time.time()
+    if now < float(_NVML_STATE.get("smi_missing_until", 0.0)):
+        return []
+    if shutil.which("nvidia-smi") is None:
+        _NVML_STATE["smi_missing_until"] = now + 60.0
+        return []
+
     gpus = []
     try:
         res = subprocess.run(
@@ -587,6 +749,7 @@ def _detect_gpus_nvidia_smi():
             creationflags=_creation_flags(),
         )
         if res.returncode != 0 or not res.stdout.strip():
+            _NVML_STATE["smi_missing_until"] = now + 30.0
             return []
 
         def _num(s):
@@ -619,7 +782,9 @@ def _detect_gpus_nvidia_smi():
                 "live_metrics": True,
             })
     except Exception:
-        pass
+        _NVML_STATE["smi_missing_until"] = now + 60.0
+    if not gpus:
+        _NVML_STATE["smi_missing_until"] = now + 30.0
     return gpus
 
 
@@ -1928,7 +2093,7 @@ class HardwareMonitor:
         self.refresh_static()
         return self.probe_acceleration_capabilities(force=force)
 
-    def get_live_metrics(self) -> dict:
+    def get_live_metrics(self, include_disks: bool = True) -> dict:
         with self._lock:
             dmap = dict(self._disk_media_map)
             dinfo_map = dict(self._disk_info_map)
@@ -1983,7 +2148,7 @@ class HardwareMonitor:
 
         # Диски
         disks = []
-        if psutil is not None:
+        if include_disks and psutil is not None:
             try:
                 parts = psutil.disk_partitions(all=False)
                 seen_mounts = set()
@@ -2015,7 +2180,7 @@ class HardwareMonitor:
             except Exception:
                 pass
 
-        if not disks and sys.platform == "win32":
+        if include_disks and not disks and sys.platform == "win32":
             for letter in string.ascii_uppercase:
                 drive = f"{letter}:\\"
                 if os.path.exists(drive):

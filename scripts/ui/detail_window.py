@@ -156,7 +156,7 @@ class CameraDetailWindow:
 
         self.roi_visible = False
         self.roi_crop_mode = False
-        self.roi_maximized = False
+        self.roi_maximized = bool(roi_g.get("maximized", False))
         self.roi_scale_x = 1.0
         self.roi_scale_y = 1.0
         self.roi_img_offset_x = 0
@@ -179,6 +179,9 @@ class CameraDetailWindow:
             min_h=420,
             default_geom={"left": 80, "top": 60, "width": 1160, "height": 720, "maximized": False},
         )
+        self.win.geom_tracker = self.geom_tracker
+        self._sync_fullscreen_btn_icon()
+        self.win.bind("<Configure>", lambda e: self._sync_fullscreen_btn_icon(), add="+")
 
         # Повідомляємо CameraUnit, що основний потік потрібен для живого перегляду
         if self.camera_unit is not None:
@@ -747,15 +750,22 @@ class CameraDetailWindow:
                 else:
                     btn.configure(bg="#3a3a46" if is_on else "#282832")
 
+    def _sync_fullscreen_btn_icon(self):
+        if hasattr(self, "btn_fullscreen") and hasattr(self, "geom_tracker"):
+            try:
+                is_max = self.geom_tracker._is_zoomed()
+                self.btn_fullscreen.configure(text="🗗" if is_max else "⛶")
+            except Exception:
+                pass
+
     def _toggle_fullscreen_window(self):
         try:
             st = str(self.win.state()).lower()
             if st == "zoomed":
                 self.win.state("normal")
-                self.btn_fullscreen.configure(text="⛶")
             else:
                 self.win.state("zoomed")
-                self.btn_fullscreen.configure(text="🗗")
+            self._sync_fullscreen_btn_icon()
         except Exception:
             pass
 
@@ -950,7 +960,7 @@ class CameraDetailWindow:
                     self._live_last_raw_frame = frame_ref
                     self._live_last_overlay = overlay
                     self._live_last_now = float(now)
-                    self._draw_overlays_and_present(frame_ref.copy(), overlay, now, cache_raw=False)
+                    self._draw_overlays_and_present(frame_ref, overlay, now, cache_raw=False, copy_on_draw=True)
                 elif frame_ref is None and st in ("offline", "reconnecting"):
                     self.img_main_tk = None
                     self._live_last_raw_frame = None
@@ -962,7 +972,14 @@ class CameraDetailWindow:
         if not self._is_closing:
             self._render_after_id = self.win.after(interval_ms, self._render_tick)
 
-    def _draw_overlays_and_present(self, frame: np.ndarray, overlay: dict, now: float, cache_raw: bool = True):
+    def _draw_overlays_and_present(
+        self,
+        frame: np.ndarray,
+        overlay: dict,
+        now: float,
+        cache_raw: bool = True,
+        copy_on_draw: bool = False,
+    ):
         if frame is None or getattr(frame, "size", 0) == 0:
             return
 
@@ -979,6 +996,7 @@ class CameraDetailWindow:
 
         mods = (self.cam_cfg or {}).get("modules") or {}
 
+        draw_tasks = []
         if cv2 is not None and self.registry is not None:
             for ent in self.registry.list_modules(kind="ai"):
                 mid = ent["id"]
@@ -986,14 +1004,34 @@ class CameraDetailWindow:
                 m_cfg = mods.get(mid) or {}
                 if not m_cfg.get("on", False):
                     continue
+                if not m_cfg.get("show_boxes", True):
+                    continue
                 if not is_date_range_active(m_cfg.get("date_from", ""), m_cfg.get("date_to", "")):
                     continue
+                st = (overlay or {}).get(mid) or {}
+                if not st:
+                    continue
+                if mid in ("people", "faces") and not st.get("boxes"):
+                    continue
+                if mid == "plates":
+                    has_boxes = bool(st.get("boxes"))
+                    p_img = st.get("last_plate_img")
+                    p_ts = float(st.get("last_plate_time", 0.0) or 0.0)
+                    v_sec = float(m_cfg.get("view_time", 30))
+                    if (not has_boxes) and (p_img is None or (now - p_ts) >= v_sec):
+                        continue
                 draw_fn = spec.get("draw_overlays")
                 if callable(draw_fn):
-                    try:
-                        draw_fn(frame, (overlay or {}).get(mid) or {}, m_cfg, now)
-                    except Exception:
-                        pass
+                    draw_tasks.append((draw_fn, st, m_cfg))
+
+        if draw_tasks:
+            if copy_on_draw:
+                frame = frame.copy()
+            for draw_fn, st, m_cfg in draw_tasks:
+                try:
+                    draw_fn(frame, st, m_cfg, now)
+                except Exception:
+                    pass
 
         view_frame = frame
         crop_norm = self._live_crop_norm
@@ -1099,10 +1137,11 @@ class CameraDetailWindow:
             return
         if self._live_last_raw_frame is not None:
             self._draw_overlays_and_present(
-                self._live_last_raw_frame.copy(),
+                self._live_last_raw_frame,
                 self._live_last_overlay,
                 self._live_last_now,
                 cache_raw=False,
+                copy_on_draw=True,
             )
         else:
             self._update_main_video_placeholder()
@@ -1395,7 +1434,7 @@ class CameraDetailWindow:
                 "top": int(self.roi_user_top),
                 "width": int(self.roi_user_width),
                 "height": int(self.roi_user_height),
-                "maximized": False,
+                "maximized": bool(self.roi_maximized),
             },
         )
 
@@ -2454,6 +2493,7 @@ class CameraDetailWindow:
         self._render_current_roi_view()
         if not self.roi_maximized:
             self.roi_resize_grip.lift()
+        self._save_roi_geometry_to_config()
 
     def _update_roi_toolbar_labels(self, panel_width=None):
         w = int(panel_width) if panel_width is not None else max(self.roi_user_width, int(self.roi_panel.winfo_width() or 0))
@@ -2517,6 +2557,7 @@ class CameraDetailWindow:
 
         if not self.roi_maximized:
             self.roi_resize_grip.lift()
+        self._save_roi_geometry_to_config()
 
     def _render_current_roi_view(self):
         if not (self.roi_visible or self.roi_panel.winfo_ismapped()):
@@ -2644,11 +2685,13 @@ class CameraDetailWindow:
         self._render_current_roi_view()
         if not self.roi_maximized:
             self.roi_resize_grip.lift()
+        self._save_roi_geometry_to_config()
 
     def _hide_roi_panel(self, clear_coords=True):
         self._cancel_single_click_play_toggle()
         self.roi_visible = False
-        self.roi_maximized = False
+        if clear_coords:
+            self.roi_maximized = False
         self.roi_crop_mode = False
         try:
             self.roi_panel.withdraw()

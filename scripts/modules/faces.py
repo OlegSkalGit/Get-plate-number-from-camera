@@ -430,6 +430,11 @@ def _build_ort_session(model_path: str, providers=None, intra_op_threads: int = 
     opts.inter_op_num_threads = 1
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    try:
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    except Exception:
+        pass
 
     req_providers = list(providers) if providers else ["CPUExecutionProvider"]
     opt_providers = _expand_cuda_provider(req_providers)
@@ -1854,7 +1859,7 @@ class FallbackFaceDB(_BaseFaceDB):
 
 
 class FaceTrack:
-    def __init__(self, track_id, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0, max_pool_size=5, frame_ts=None, seen_ts=None):
+    def __init__(self, track_id, bbox, face_crop, frame, sharpness, yaw=0.0, pitch=0.0, max_pool_size=5, frame_ts=None, seen_ts=None, keep_full_frame: bool = True):
         self.track_id = track_id
         self.bbox = bbox
         s_ts = float(seen_ts) if (seen_ts is not None and float(seen_ts) > 0) else time.time()
@@ -1863,10 +1868,11 @@ class FaceTrack:
         self.first_seen = s_ts
         self.saved = False
         self.max_pool_size = max_pool_size
+        self.keep_full_frame = bool(keep_full_frame)
 
         self.face_pool = [(face_crop, sharpness)]
         self.best_face_img = face_crop
-        self.best_frame = frame
+        self.best_frame = frame if self.keep_full_frame else None
         self.best_frame_ts = ev_ts
         self.best_sharpness = sharpness
         self.best_yaw = abs(float(yaw))
@@ -1879,6 +1885,10 @@ class FaceTrack:
         self.is_ignored = False
         self.last_preview_ts = 0.0
         self._crop_emb_cache = {}
+
+    def release_frames(self):
+        self.keep_full_frame = False
+        self.best_frame = None
 
     def set_cached_embedding(self, crop, emb):
         if crop is None or emb is None:
@@ -1910,7 +1920,8 @@ class FaceTrack:
         if sharpness > self.best_sharpness:
             self.best_sharpness = sharpness
             self.best_face_img = face_crop
-            self.best_frame = frame
+            if self.keep_full_frame:
+                self.best_frame = frame
             self.best_frame_ts = ev_ts
             self.best_yaw = abs(float(yaw))
             self.best_pitch = abs(float(pitch))
@@ -2118,6 +2129,7 @@ class FaceEngine:
                 f_tid, det["box"], det["crop"], frame, det["sharpness"],
                 yaw=det["yaw"], pitch=det["pitch"],
                 frame_ts=ev_ts, seen_ts=now,
+                keep_full_frame=self.allow_disk_write,
             )
 
         for f_id, f_track in list(self.active_tracks.items()):
@@ -2147,6 +2159,8 @@ class FaceEngine:
             if not f_track.saved:
                 self._save_verified_face_locked(f_track, is_flush=is_flush)
                 f_track.saved = True
+                if hasattr(f_track, "release_frames"):
+                    f_track.release_frames()
 
         return [(t.bbox, t.face_name, t.status_tag) for t in self.active_tracks.values()]
 

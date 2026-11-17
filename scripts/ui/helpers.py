@@ -133,6 +133,411 @@ def format_geometry_str(left, top, width, height) -> str:
     return f"{int(width)}x{int(height)}{x_s}{y_s}"
 
 
+class BorderlessWindowController:
+    """
+    Контролер безрамкового головного вікна (без стандартного заголовка ОС Windows):
+    - зберігає іконку на панелі завдань та в Alt+Tab (`WS_EX_APPWINDOW`, без `WS_EX_TOOLWINDOW`);
+    - обмежує максимізацію (`state('zoomed')`) робочою областю монітора `rcWork`, щоб не перекривати Taskbar;
+    - прибирає стандартні non-client відступи через `WM_NCCALCSIZE`, підтримує зміну розміру по краях у звичайному режимі
+      та надає перетягування/подвійний клік для наявної верхньої панелі.
+    """
+
+    def __init__(self, window, allow_resize: bool = True, resize_border: int = 5):
+        self.win = window
+        self.allow_resize = bool(allow_resize)
+        self.resize_border = max(3, int(resize_border or 5))
+        self._hwnd = 0
+        self._orig_proc = 0
+        self._wndproc_cb = None
+        self._detached = False
+        self._user32 = None
+        self._GetWindowLongPtr = None
+        self._SetWindowLongPtr = None
+        self._CallWindowProc = None
+
+        self._drag_state = {
+            "active": False,
+            "moved": False,
+            "start_rx": 0,
+            "start_ry": 0,
+            "win_x": 0,
+            "win_y": 0,
+            "win_w": 0,
+            "was_zoomed": False,
+        }
+
+        self._install()
+
+    def _install(self):
+        if self.win is None:
+            return
+        try:
+            self.win.overrideredirect(True)
+        except Exception:
+            pass
+
+        if sys.platform != "win32":
+            return
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            self._user32 = user32
+
+            GWL_STYLE = -16
+            GWL_EXSTYLE = -20
+            GWLP_WNDPROC = -4
+            WS_THICKFRAME = 0x00040000
+            WS_MINIMIZEBOX = 0x00020000
+            WS_MAXIMIZEBOX = 0x00010000
+            WS_SYSMENU = 0x00080000
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+
+            WM_NCDESTROY = 0x0082
+            WM_NCCALCSIZE = 0x0083
+            WM_NCHITTEST = 0x0084
+            WM_NCPAINT = 0x0085
+            WM_NCACTIVATE = 0x0086
+            WM_GETMINMAXINFO = 0x0024
+
+            HTCLIENT = 1
+            HTLEFT = 10
+            HTRIGHT = 11
+            HTTOP = 12
+            HTTOPLEFT = 13
+            HTTOPRIGHT = 14
+            HTBOTTOM = 15
+            HTBOTTOMLEFT = 16
+            HTBOTTOMRIGHT = 17
+
+            MONITOR_DEFAULTTONEAREST = 2
+            LONG_PTR = ctypes.c_ssize_t
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+            class MINMAXINFO(ctypes.Structure):
+                _fields_ = [
+                    ("ptReserved", POINT),
+                    ("ptMaxSize", POINT),
+                    ("ptMaxPosition", POINT),
+                    ("ptMinTrackSize", POINT),
+                    ("ptMaxTrackSize", POINT),
+                ]
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            WNDPROC = ctypes.WINFUNCTYPE(LONG_PTR, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+            if ctypes.sizeof(ctypes.c_void_p) == 8:
+                GetWindowLongPtr = user32.GetWindowLongPtrW
+                SetWindowLongPtr = user32.SetWindowLongPtrW
+            else:
+                GetWindowLongPtr = user32.GetWindowLongW
+                SetWindowLongPtr = user32.SetWindowLongW
+            CallWindowProc = user32.CallWindowProcW
+
+            GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+            GetWindowLongPtr.restype = LONG_PTR
+            SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
+            SetWindowLongPtr.restype = LONG_PTR
+            CallWindowProc.argtypes = [LONG_PTR, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            CallWindowProc.restype = LONG_PTR
+            user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.DefWindowProcW.restype = LONG_PTR
+
+            self._GetWindowLongPtr = GetWindowLongPtr
+            self._SetWindowLongPtr = SetWindowLongPtr
+            self._CallWindowProc = CallWindowProc
+
+            try:
+                prev_state = str(self.win.state()).lower()
+            except Exception:
+                prev_state = "normal"
+
+            self.win.update_idletasks()
+            hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+            if not hwnd:
+                return
+            self._hwnd = hwnd
+
+            cur_style = int(GetWindowLongPtr(hwnd, GWL_STYLE))
+            add_style = WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+            if self.allow_resize:
+                add_style |= WS_THICKFRAME
+            SetWindowLongPtr(hwnd, GWL_STYLE, cur_style | add_style)
+
+            cur_ex = int(GetWindowLongPtr(hwnd, GWL_EXSTYLE))
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, (cur_ex & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
+
+            border = self.resize_border
+            allow_resize = self.allow_resize
+
+            def _wnd_proc(h, msg, wp, lp):
+                orig = self._orig_proc
+                try:
+                    if msg == WM_NCCALCSIZE and wp:
+                        return 0
+
+                    if msg == WM_NCPAINT:
+                        return 0
+
+                    if msg == WM_NCACTIVATE:
+                        return 1
+
+                    if msg == WM_NCHITTEST and allow_resize:
+                        if not user32.IsZoomed(h):
+                            px = ctypes.c_short(lp & 0xFFFF).value
+                            py = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                            wr = RECT()
+                            if user32.GetWindowRect(h, ctypes.byref(wr)):
+                                left = px < (wr.left + border)
+                                right = px >= (wr.right - border)
+                                top = py < (wr.top + border)
+                                bottom = py >= (wr.bottom - border)
+                                if top and left:
+                                    return HTTOPLEFT
+                                if top and right:
+                                    return HTTOPRIGHT
+                                if bottom and left:
+                                    return HTBOTTOMLEFT
+                                if bottom and right:
+                                    return HTBOTTOMRIGHT
+                                if left:
+                                    return HTLEFT
+                                if right:
+                                    return HTRIGHT
+                                if top:
+                                    return HTTOP
+                                if bottom:
+                                    return HTBOTTOM
+                        return HTCLIENT
+
+                    if msg == WM_GETMINMAXINFO and lp:
+                        res = CallWindowProc(orig, h, msg, wp, lp) if orig else 0
+                        hmon = user32.MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)
+                        if hmon:
+                            mi = MONITORINFO()
+                            mi.cbSize = ctypes.sizeof(MONITORINFO)
+                            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                                mmi = ctypes.cast(lp, ctypes.POINTER(MINMAXINFO)).contents
+                                rc_m = mi.rcMonitor
+                                rc_w = mi.rcWork
+                                max_w = max(320, rc_w.right - rc_w.left)
+                                max_h = max(240, rc_w.bottom - rc_w.top)
+                                mmi.ptMaxPosition.x = rc_w.left - rc_m.left
+                                mmi.ptMaxPosition.y = rc_w.top - rc_m.top
+                                mmi.ptMaxSize.x = max_w
+                                mmi.ptMaxSize.y = max_h
+                                mmi.ptMaxTrackSize.x = max(mmi.ptMaxTrackSize.x, max_w)
+                                mmi.ptMaxTrackSize.y = max(mmi.ptMaxTrackSize.y, max_h)
+                        return res
+
+                    if msg == WM_NCDESTROY:
+                        self._detached = True
+                        if orig:
+                            try:
+                                if user32.IsWindow(h):
+                                    SetWindowLongPtr(h, GWLP_WNDPROC, orig)
+                            except Exception:
+                                pass
+                            self._orig_proc = 0
+                            return CallWindowProc(orig, h, msg, wp, lp)
+                except Exception:
+                    pass
+
+                if orig:
+                    return CallWindowProc(orig, h, msg, wp, lp)
+                return user32.DefWindowProcW(h, msg, wp, lp)
+
+            self._wndproc_cb = WNDPROC(_wnd_proc)
+            cb_ptr = ctypes.cast(self._wndproc_cb, ctypes.c_void_p).value
+            self._orig_proc = int(SetWindowLongPtr(hwnd, GWLP_WNDPROC, cb_ptr))
+
+            # withdraw/SetWindowPos/deiconify гарантує появу кнопки в Taskbar із WS_EX_APPWINDOW
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            if prev_state != "iconic":
+                try:
+                    self.win.deiconify()
+                    if prev_state == "zoomed":
+                        self.win.state("zoomed")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def is_zoomed(self) -> bool:
+        try:
+            if str(self.win.state()).lower() == "zoomed":
+                return True
+        except Exception:
+            pass
+        if sys.platform == "win32" and self._user32 is not None and self._hwnd:
+            try:
+                return bool(self._user32.IsZoomed(self._hwnd))
+            except Exception:
+                pass
+        return False
+
+    def toggle_maximize(self):
+        if self.win is None:
+            return
+        try:
+            if self.is_zoomed():
+                self.win.state("normal")
+            else:
+                if sys.platform == "win32":
+                    self.win.state("zoomed")
+                else:
+                    cur = bool(self.win.attributes("-zoomed"))
+                    self.win.attributes("-zoomed", not cur)
+        except Exception:
+            pass
+
+    def bind_drag_widgets(self, widgets, on_interaction=None):
+        """Додає перетягування вікна та подвійний клік (макс./відновл.) до наявних неінтерактивних елементів панелі."""
+        if not widgets or self.win is None:
+            return
+
+        def _notify():
+            if callable(on_interaction):
+                try:
+                    on_interaction()
+                except Exception:
+                    pass
+
+        def _on_press(event):
+            try:
+                self._drag_state["active"] = True
+                self._drag_state["moved"] = False
+                self._drag_state["start_rx"] = int(event.x_root)
+                self._drag_state["start_ry"] = int(event.y_root)
+                self._drag_state["win_x"] = int(self.win.winfo_x())
+                self._drag_state["win_y"] = int(self.win.winfo_y())
+                self._drag_state["win_w"] = max(1, int(self.win.winfo_width()))
+                self._drag_state["was_zoomed"] = self.is_zoomed()
+            except Exception:
+                self._drag_state["active"] = False
+            _notify()
+
+        def _on_motion(event):
+            st = self._drag_state
+            if not st.get("active"):
+                return
+            try:
+                dx = int(event.x_root) - int(st["start_rx"])
+                dy = int(event.y_root) - int(st["start_ry"])
+                if not st.get("moved"):
+                    if abs(dx) < 5 and abs(dy) < 5:
+                        return
+                    st["moved"] = True
+
+                if st.get("was_zoomed"):
+                    rel_x = (int(st["start_rx"]) - int(st["win_x"])) / float(max(1, int(st["win_w"])))
+                    rel_x = max(0.05, min(0.95, rel_x))
+                    try:
+                        self.win.state("normal")
+                        self.win.update_idletasks()
+                    except Exception:
+                        pass
+                    trk = getattr(self.win, "geom_tracker", None)
+                    if trk is not None and getattr(trk, "_normal_geom", None):
+                        nw = int(trk._normal_geom.get("width", self.win.winfo_width()))
+                    else:
+                        nw = max(320, int(self.win.winfo_width()))
+                    off_y = max(4, min(36, int(st["start_ry"]) - int(st["win_y"])))
+                    st["win_x"] = int(round(int(st["start_rx"]) - rel_x * nw))
+                    st["win_y"] = int(round(int(st["start_ry"]) - off_y))
+                    st["win_w"] = nw
+                    st["was_zoomed"] = False
+
+                nx = int(st["win_x"]) + dx
+                ny = int(st["win_y"]) + dy
+                _, vy, _, _ = get_virtual_screen_bounds(self.win)
+                ny = max(int(vy), ny)
+                self.win.geometry(f"{nx:+d}{ny:+d}")
+                _notify()
+            except Exception:
+                pass
+
+        def _on_release(_event=None):
+            was_moved = bool(self._drag_state.get("moved"))
+            self._drag_state["active"] = False
+            self._drag_state["moved"] = False
+            if was_moved:
+                _notify()
+
+        def _on_double_click(_event=None):
+            self._drag_state["active"] = False
+            self._drag_state["moved"] = False
+            self.toggle_maximize()
+            _notify()
+
+        for w in widgets:
+            if w is None:
+                continue
+            try:
+                w.bind("<ButtonPress-1>", _on_press, add="+")
+                w.bind("<B1-Motion>", _on_motion, add="+")
+                w.bind("<ButtonRelease-1>", _on_release, add="+")
+                w.bind("<Double-Button-1>", _on_double_click, add="+")
+            except Exception:
+                pass
+
+    def detach(self):
+        if self._detached:
+            return
+        self._detached = True
+        if sys.platform == "win32" and self._user32 is not None and self._hwnd and self._orig_proc and self._SetWindowLongPtr:
+            try:
+                if self._user32.IsWindow(self._hwnd):
+                    self._SetWindowLongPtr(self._hwnd, -4, self._orig_proc)  # GWLP_WNDPROC
+            except Exception:
+                pass
+        self._orig_proc = 0
+        self._wndproc_cb = None
+
+
+def apply_borderless_window_style(window, allow_resize: bool = True, resize_border: int = 5):
+    """Застосовує безрамковий режим (без стандартного заголовка вікна ОС) та зберігає контролер на вікні."""
+    ctl = BorderlessWindowController(window, allow_resize=allow_resize, resize_border=resize_border)
+    try:
+        window._borderless_controller = ctl
+    except Exception:
+        pass
+    return ctl
+
+
 class WindowGeometryTracker:
     """
     Автоматично відновлює та зберігає координати, розмір і стан максимізації вікна
@@ -161,6 +566,10 @@ class WindowGeometryTracker:
 
         self.restore()
         self.win.bind(EVT_CONFIGURE, self._on_configure, add="+")
+        try:
+            self.win.geom_tracker = self
+        except Exception:
+            pass
 
     def restore(self):
         self._restoring = True
@@ -181,20 +590,33 @@ class WindowGeometryTracker:
         except Exception:
             pass
 
-        def _finish_restore():
-            self._restore_after_id = None
-            if self._closed:
-                return
-            if self._maximized and sys.platform == "win32":
+        if self._maximized:
+            if sys.platform == "win32":
                 try:
                     self.win.state("zoomed")
                 except Exception:
                     pass
-            elif self._maximized:
+            else:
                 try:
                     self.win.attributes("-zoomed", True)
                 except Exception:
                     pass
+
+        def _finish_restore():
+            self._restore_after_id = None
+            if self._closed:
+                return
+            if self._maximized:
+                if sys.platform == "win32":
+                    try:
+                        self.win.state("zoomed")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.win.attributes("-zoomed", True)
+                    except Exception:
+                        pass
             try:
                 self._restore_after_id = self.win.after(150, self._end_restore)
             except Exception:
@@ -206,11 +628,27 @@ class WindowGeometryTracker:
         self._restoring = False
 
     def _is_zoomed(self) -> bool:
+        ctl = getattr(self.win, "_borderless_controller", None)
+        if ctl is not None and hasattr(ctl, "is_zoomed"):
+            try:
+                if ctl.is_zoomed():
+                    return True
+            except Exception:
+                pass
         try:
             if str(self.win.state()).lower() == "zoomed":
                 return True
         except Exception:
             pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                u32 = ctypes.windll.user32
+                hwnd = u32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+                if hwnd and u32.IsZoomed(hwnd):
+                    return True
+            except Exception:
+                pass
         try:
             if bool(self.win.attributes("-zoomed")):
                 return True
@@ -218,14 +656,12 @@ class WindowGeometryTracker:
             pass
         return False
 
-    def _on_configure(self, event=None):
+    def _update_from_window(self):
         if self._restoring or self._closed:
-            return
-        if event is not None and event.widget is not self.win:
             return
         try:
             st = str(self.win.state()).lower()
-            if st == "iconic" or st == "withdrawn":
+            if st in ("iconic", "withdrawn"):
                 return
         except Exception:
             pass
@@ -243,17 +679,32 @@ class WindowGeometryTracker:
             except Exception:
                 pass
 
+    def _on_configure(self, event=None):
+        if self._restoring or self._closed:
+            return
+        if event is not None and event.widget is not self.win:
+            return
+        try:
+            st = str(self.win.state()).lower()
+            if st in ("iconic", "withdrawn"):
+                return
+        except Exception:
+            pass
+
+        self._update_from_window()
+
         if self._save_after_id is not None:
             try:
                 self.win.after_cancel(self._save_after_id)
             except Exception:
                 pass
-        self._save_after_id = self.win.after(350, self.flush)
+        self._save_after_id = self.win.after(200, self.flush)
 
     def flush(self):
         self._save_after_id = None
         if self._closed:
             return
+        self._update_from_window()
         payload = {
             "left": int(self._normal_geom["left"]),
             "top": int(self._normal_geom["top"]),

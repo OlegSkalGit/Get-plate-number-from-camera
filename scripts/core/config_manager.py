@@ -7,6 +7,14 @@ import threading
 import configparser
 
 from scripts.core.i18n import tr, normalize_language_code, DEFAULT_LANGUAGE
+from scripts.core.security import (
+    create_auth_material,
+    decrypt_source,
+    encrypt_source,
+    is_encrypted_source,
+    normalize_auth_cfg,
+    verify_and_derive,
+)
 
 
 def make_default_camera_modules(registry=None) -> dict:
@@ -24,6 +32,7 @@ def make_camera_entry(
     cam_uuid=None,
     modules=None,
     registry=None,
+    group_id="",
 ):
     if modules is not None:
         mods = copy.deepcopy(modules)
@@ -40,6 +49,8 @@ def make_camera_entry(
         "enabled": bool(enabled),
         "main_source": str(main_source or "").strip(),
         "sub_source": str(sub_source or "").strip(),
+        "group_id": str(group_id or "").strip(),
+        "tree_order": 0,
         "window": {
             "left": 80,
             "top": 60,
@@ -75,7 +86,13 @@ SETTINGS_HELP = {
     "general.language": (
         "Interface Language\n"
         "Selects the application language loaded from JSON files in the lang/ folder (<code>.json).\n"
-        "Default on first launch is English (en). You can also switch language from the top bar in the main window."
+        "Default on first launch is English (en). Language changes apply across all open windows once saved."
+    ),
+    "general.password": (
+        "Access Password & Link Encryption\n"
+        "• When no password is set (default): the application enters immediately on startup and camera video source links (main_source, sub_source) are stored unencrypted in config.json.\n"
+        "• When a password is set: the application requires it at startup and encrypts all camera video source links with AES-256-GCM derived from your password.\n"
+        "• Changing or removing the password immediately re-encrypts (or decrypts) all saved video source links on disk."
     ),
     "general.operation_mode": (
         "System Operation Mode\n"
@@ -178,6 +195,9 @@ class ConfigManager:
         self._version = 0
         self._fast_cache_ver = -1
         self._fast_cache_snap = None
+        self._auth_cfg = {"enabled": False}
+        self._enc_key = None
+        self._is_locked = False
         self.data = self._load_or_migrate()
 
     def _get_registry_default_modules(self) -> dict:
@@ -195,6 +215,7 @@ class ConfigManager:
                 "archive_root": os.path.join(self.base_dir, "archive"),
                 "autostart_os_and_play": False,
                 "kiosk_mode": False,
+                "auth": {"enabled": False},
             },
             "windows": {
                 "grid": {"left": 40, "top": 30, "width": 1280, "height": 760, "maximized": False},
@@ -374,6 +395,7 @@ class ConfigManager:
         gen["language"] = raw_lang
         raw_mode = str(gen.get("operation_mode", "server") or "server").strip().lower()
         gen["operation_mode"] = "operator" if raw_mode == "operator" else "server"
+        gen["auth"] = normalize_auth_cfg(gen.get("auth"))
         if not gen.get("archive_root"):
             gen["archive_root"] = defaults["general"]["archive_root"]
 
@@ -405,6 +427,11 @@ class ConfigManager:
             )
             base_cam["window"] = _deep_merge(base_cam["window"], c.get("window") or {})
             base_cam["roi_window"] = _deep_merge(base_cam["roi_window"], c.get("roi_window") or {})
+            base_cam["group_id"] = str(c.get("group_id") or "").strip()
+            try:
+                base_cam["tree_order"] = int(c.get("tree_order", 0) or 0)
+            except Exception:
+                base_cam["tree_order"] = 0
             norm_cams.append(base_cam)
 
         if not norm_cams:
@@ -420,8 +447,11 @@ class ConfigManager:
         if registry is not None:
             self.registry = registry
         with self._lock:
+            if self._is_locked:
+                return False
             before = json.dumps(self.data, sort_keys=True, ensure_ascii=False)
             norm = self._normalize_loaded_config(self.data)
+            norm.setdefault("general", {})["auth"] = copy.deepcopy(self._auth_cfg)
             after = json.dumps(norm, sort_keys=True, ensure_ascii=False)
             if after != before:
                 self.data = norm
@@ -436,25 +466,218 @@ class ConfigManager:
             try:
                 with open(self.config_json_path, "r", encoding="utf-8-sig") as f:
                     raw = json.load(f)
-                return self._normalize_loaded_config(raw)
+                norm = self._normalize_loaded_config(raw)
+                auth_cfg = normalize_auth_cfg((norm.get("general") or {}).get("auth"))
+                norm.setdefault("general", {})["auth"] = copy.deepcopy(auth_cfg)
+                self._auth_cfg = copy.deepcopy(auth_cfg)
+                self._enc_key = None
+                self._is_locked = bool(auth_cfg.get("enabled", False))
+                return norm
             except Exception as e:
                 print(f"[ConfigManager] Помилка читання config.json ({e}), перестворення...")
 
+        self._auth_cfg = {"enabled": False}
+        self._enc_key = None
+        self._is_locked = False
         cfg = self._make_defaults()
         cfg = self._migrate_from_ini(cfg)
         self._save_dict_atomic(cfg)
         return cfg
 
+    def _format_source_for_disk_locked(self, raw_src: str) -> str:
+        s = str(raw_src or "").strip()
+        if not s:
+            return ""
+        if self._auth_cfg.get("enabled"):
+            if self._enc_key is None or self._is_locked:
+                raise PermissionError("Encryption key unavailable while configuration is locked")
+            return encrypt_source(s, self._enc_key)
+        return s
+
+    def format_source_for_disk(self, raw_src: str) -> str:
+        with self._lock:
+            return self._format_source_for_disk_locked(raw_src)
+
+    def _sync_camera_meta_files_locked(self):
+        if self._is_locked or self._is_operator_mode_locked():
+            return
+        arch_root = os.path.abspath(
+            (self.data.get("general") or {}).get("archive_root")
+            or os.path.join(self.base_dir, "archive")
+        )
+        for cam in self.data.get("cameras") or []:
+            if not isinstance(cam, dict):
+                continue
+            uid = str(cam.get("uuid") or "").strip()
+            if not uid:
+                continue
+            meta_path = os.path.join(arch_root, "cameras", uid, "camera_info.txt")
+            if not os.path.isfile(meta_path):
+                continue
+            try:
+                main_disk = self._format_source_for_disk_locked(cam.get("main_source", ""))
+                sub_disk = self._format_source_for_disk_locked(cam.get("sub_source", ""))
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    f.write(f"UUID: {uid}\n")
+                    f.write(f"Name: {cam.get('name', '')}\n")
+                    f.write(f"Main: {main_disk}\n")
+                    f.write(f"Sub: {sub_disk}\n")
+            except Exception:
+                pass
+
     def _save_dict_atomic(self, cfg_dict: dict):
+        if self._is_locked:
+            raise PermissionError("Refusing to write locked configuration to disk")
+
+        disk_cfg = copy.deepcopy(cfg_dict)
+        disk_cfg.setdefault("general", {})["auth"] = copy.deepcopy(self._auth_cfg)
+        if self._auth_cfg.get("enabled"):
+            if self._enc_key is None:
+                raise RuntimeError("Encryption key missing while password protection is enabled")
+            for cam in disk_cfg.get("cameras") or []:
+                if not isinstance(cam, dict):
+                    continue
+                for field in ("main_source", "sub_source"):
+                    val = str(cam.get(field) or "").strip()
+                    cam[field] = encrypt_source(val, self._enc_key) if val else ""
+
         tmp_path = f"{self.config_json_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(cfg_dict, f, ensure_ascii=False, indent=2)
+            json.dump(disk_cfg, f, ensure_ascii=False, indent=2)
             f.flush()
             try:
                 os.fsync(f.fileno())
             except Exception:
                 pass
         os.replace(tmp_path, self.config_json_path)
+
+    def has_password(self) -> bool:
+        with self._lock:
+            return bool((self._auth_cfg or {}).get("enabled", False))
+
+    def is_locked(self) -> bool:
+        with self._lock:
+            return bool(self._is_locked)
+
+    def verify_password(self, password: str) -> bool:
+        with self._lock:
+            if not (self._auth_cfg or {}).get("enabled", False):
+                return False
+            ok, _ = verify_and_derive(password, self._auth_cfg)
+            return bool(ok)
+
+    def unlock_with_error(self, password: str) -> tuple[bool, str]:
+        with self._lock:
+            if not (self._auth_cfg or {}).get("enabled", False):
+                self._is_locked = False
+                return True, ""
+            ok, enc_key = verify_and_derive(password, self._auth_cfg)
+            if not ok or enc_key is None:
+                return False, "wrong_password"
+
+            decrypted_data = copy.deepcopy(self.data)
+            for cam in decrypted_data.get("cameras") or []:
+                if not isinstance(cam, dict):
+                    continue
+                for field in ("main_source", "sub_source"):
+                    raw_val = str(cam.get(field) or "").strip()
+                    if raw_val and is_encrypted_source(raw_val):
+                        try:
+                            cam[field] = decrypt_source(raw_val, enc_key)
+                        except Exception:
+                            return False, "corrupt_data"
+
+            self.data = decrypted_data
+            self._enc_key = enc_key
+            self._is_locked = False
+            self._version += 1
+            return True, ""
+
+    def unlock(self, password: str) -> bool:
+        ok, _ = self.unlock_with_error(password)
+        return ok
+
+    def set_password(self, new_password: str):
+        with self._lock:
+            if self._is_locked:
+                raise PermissionError("Configuration is locked")
+            if (self._auth_cfg or {}).get("enabled", False):
+                raise ValueError("Password is already set; use change_password()")
+
+            new_auth, new_key = create_auth_material(new_password)
+            old_auth = copy.deepcopy(self._auth_cfg)
+            old_key = self._enc_key
+            old_data_auth = copy.deepcopy((self.data.get("general") or {}).get("auth"))
+            try:
+                self._auth_cfg = new_auth
+                self._enc_key = new_key
+                self.data.setdefault("general", {})["auth"] = copy.deepcopy(new_auth)
+                self._save_dict_atomic(self.data)
+                self._version += 1
+            except Exception:
+                self._auth_cfg = old_auth
+                self._enc_key = old_key
+                if old_data_auth is not None:
+                    self.data.setdefault("general", {})["auth"] = old_data_auth
+                raise
+            self._sync_camera_meta_files_locked()
+
+    def change_password(self, current_password: str, new_password: str) -> bool:
+        with self._lock:
+            if self._is_locked:
+                raise PermissionError("Configuration is locked")
+            if not (self._auth_cfg or {}).get("enabled", False):
+                raise ValueError("Password is not set")
+            ok, _ = verify_and_derive(current_password, self._auth_cfg)
+            if not ok:
+                return False
+
+            new_auth, new_key = create_auth_material(new_password)
+            old_auth = copy.deepcopy(self._auth_cfg)
+            old_key = self._enc_key
+            old_data_auth = copy.deepcopy((self.data.get("general") or {}).get("auth"))
+            try:
+                self._auth_cfg = new_auth
+                self._enc_key = new_key
+                self.data.setdefault("general", {})["auth"] = copy.deepcopy(new_auth)
+                self._save_dict_atomic(self.data)
+                self._version += 1
+            except Exception:
+                self._auth_cfg = old_auth
+                self._enc_key = old_key
+                if old_data_auth is not None:
+                    self.data.setdefault("general", {})["auth"] = old_data_auth
+                raise
+            self._sync_camera_meta_files_locked()
+            return True
+
+    def remove_password(self, current_password: str) -> bool:
+        with self._lock:
+            if self._is_locked:
+                raise PermissionError("Configuration is locked")
+            if not (self._auth_cfg or {}).get("enabled", False):
+                return True
+            ok, _ = verify_and_derive(current_password, self._auth_cfg)
+            if not ok:
+                return False
+
+            old_auth = copy.deepcopy(self._auth_cfg)
+            old_key = self._enc_key
+            old_data_auth = copy.deepcopy((self.data.get("general") or {}).get("auth"))
+            try:
+                self._auth_cfg = {"enabled": False}
+                self._enc_key = None
+                self.data.setdefault("general", {})["auth"] = {"enabled": False}
+                self._save_dict_atomic(self.data)
+                self._version += 1
+            except Exception:
+                self._auth_cfg = old_auth
+                self._enc_key = old_key
+                if old_data_auth is not None:
+                    self.data.setdefault("general", {})["auth"] = old_data_auth
+                raise
+            self._sync_camera_meta_files_locked()
+            return True
 
     def get_snapshot(self) -> dict:
         with self._lock:
@@ -470,13 +693,18 @@ class ConfigManager:
 
     def save_data(self, new_data: dict):
         with self._lock:
+            if self._is_locked:
+                raise PermissionError("Configuration is locked")
             norm = self._normalize_loaded_config(new_data)
+            norm.setdefault("general", {})["auth"] = copy.deepcopy(self._auth_cfg)
             self.data = norm
             self._version += 1
             self._save_dict_atomic(norm)
 
     def save(self):
         with self._lock:
+            if self._is_locked:
+                raise PermissionError("Configuration is locked")
             self._version += 1
             self._save_dict_atomic(self.data)
 
@@ -488,6 +716,8 @@ class ConfigManager:
     def set_language(self, lang_code: str) -> str:
         norm = normalize_language_code(lang_code) or DEFAULT_LANGUAGE
         with self._lock:
+            if self._is_locked:
+                raise PermissionError("Configuration is locked")
             self.data.setdefault("general", {})["language"] = norm
             self._version += 1
             self._save_dict_atomic(self.data)
@@ -556,7 +786,7 @@ class ConfigManager:
 
     def set_window_geometry(self, win_key: str, geom: dict):
         with self._lock:
-            if self._is_operator_mode_locked():
+            if self._is_locked or self._is_operator_mode_locked():
                 return
             self.data.setdefault("windows", {})[win_key] = copy.deepcopy(geom)
             self._version += 1
@@ -571,7 +801,7 @@ class ConfigManager:
 
     def set_camera_window_geometry(self, cam_uuid: str, kind: str, geom: dict):
         with self._lock:
-            if self._is_operator_mode_locked():
+            if self._is_locked or self._is_operator_mode_locked():
                 return
             for c in self.data.get("cameras", []):
                 if c.get("uuid") == cam_uuid:
