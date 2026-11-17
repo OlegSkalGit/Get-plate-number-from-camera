@@ -5823,20 +5823,6 @@ class SettingsWindow:
             bg=act_bg,
         ).pack(side=tk.LEFT)
 
-        if self.on_restart_app_cb is not None:
-            tk.Button(
-                btn_bar2,
-                text=tr("ui.settings.hw.btn_restart_app", "♻ Restart Application"),
-                command=self._request_app_restart,
-                bg="#3a2f22",
-                fg="#ffcc00",
-                relief=tk.FLAT,
-                font=("Segoe UI", 8, "bold"),
-                padx=10,
-                pady=5,
-                cursor="hand2",
-            ).pack(side=tk.RIGHT)
-
         # Картка 1: Завантажені й проблемні модулі
         mods_card = self._make_card(parent, tr("ui.settings.mods.card_list", "Detected Modules (scripts/modules/)"))
         m_bg = str(mods_card.cget("bg"))
@@ -5955,6 +5941,23 @@ class SettingsWindow:
             )
             l_bg = str(libs_card.cget("bg"))
             lib_rows = get_library_versions(extra_pkgs=extra_pkgs)
+            need_restart_ui = any(lr.get("needs_restart") for lr in lib_rows) or bool(
+                (self._last_caps or {}).get("ort_restart_required")
+            )
+
+            if need_restart_ui and self.on_restart_app_cb is not None:
+                tk.Button(
+                    btn_bar2,
+                    text=tr("ui.settings.hw.btn_restart_app", "♻ Restart Application"),
+                    command=self._request_app_restart,
+                    bg="#3a2f22",
+                    fg="#ffcc00",
+                    relief=tk.FLAT,
+                    font=("Segoe UI", 8, "bold"),
+                    padx=10,
+                    pady=5,
+                    cursor="hand2",
+                ).pack(side=tk.RIGHT)
 
             if any(lr.get("needs_restart") for lr in lib_rows):
                 alert = tk.Frame(libs_card, bg="#3b2814", padx=10, pady=8, highlightthickness=1, highlightbackground="#ffcc00")

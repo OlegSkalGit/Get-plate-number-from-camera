@@ -16,6 +16,7 @@ import tempfile
 import importlib
 import importlib.abc
 import importlib.machinery
+import importlib.util
 import subprocess
 import threading
 import urllib.request
@@ -651,7 +652,7 @@ def observe_loaded_libraries():
                         break
                 if not matched_ver:
                     matched_ver = getattr(sys.modules[imp_name], "__version__", "") or ""
-                _LOADED_MEM_STATE[imp_name] = (matched_pkg or imp_name, str(matched_ver))
+                _LOADED_MEM_STATE[imp_name] = (matched_pkg or dist_cands[0], str(matched_ver))
 
 
 observe_loaded_libraries()
@@ -704,6 +705,21 @@ def get_library_versions(extra_pkgs=None) -> list:
                     cur_pkg = dc
                     cur_ver = norm_dists[ndc]
                     break
+            if not cur_pkg and getattr(sys, "frozen", False):
+                spec_found = False
+                if imp_name in sys.modules:
+                    spec_found = True
+                else:
+                    try:
+                        spec_found = importlib.util.find_spec(imp_name) is not None
+                    except Exception:
+                        spec_found = False
+                if spec_found:
+                    cur_pkg = mem_snap.get(imp_name, ("", ""))[0] or dist_cands[0]
+                    mod_obj = sys.modules.get(imp_name)
+                    cur_ver = str(getattr(mod_obj, "__version__", "") or mem_snap.get(imp_name, ("", ""))[1] or "")
+                    if not cur_ver:
+                        cur_ver = "—"
 
         in_mem = imp_name in sys.modules
         l_pkg, l_ver = mem_snap.get(imp_name, ("", ""))
@@ -735,10 +751,11 @@ def get_library_versions(extra_pkgs=None) -> list:
             )
         elif in_mem:
             status_kind = "active"
-            status = tr("hw.lib.status.active", "Active (v{ver})", ver=cur_ver or l_ver)
+            v_disp = (cur_ver if cur_ver != "—" else "") or l_ver
+            status = tr("hw.lib.status.active", "Active (v{ver})", ver=v_disp) if v_disp else tr("hw.lib.loaded.active_fallback", "active")
         else:
             status_kind = "disk_only"
-            status = tr("hw.lib.status.disk_only", "On disk (v{ver})", ver=cur_ver)
+            status = tr("hw.lib.status.disk_only", "On disk (v{ver})", ver=cur_ver) if cur_ver != "—" else "EXE"
 
         rows.append({
             "import_name": imp_name,
@@ -762,6 +779,16 @@ def get_library_versions(extra_pkgs=None) -> list:
         cur_ver = norm_dists.get(low, "")
         imp_guess = low.replace("-", "_")
         in_mem = imp_guess in sys.modules
+        if not cur_ver and getattr(sys, "frozen", False):
+            spec_ok = in_mem
+            if not spec_ok:
+                try:
+                    spec_ok = importlib.util.find_spec(imp_guess) is not None
+                except Exception:
+                    spec_ok = False
+            if spec_ok:
+                mod_obj = sys.modules.get(imp_guess)
+                cur_ver = str(getattr(mod_obj, "__version__", "") or "—")
         if not cur_ver:
             sk = "missing"
             st = tr("hw.lib.status.missing", "Not installed")
